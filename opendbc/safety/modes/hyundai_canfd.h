@@ -333,6 +333,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CANFD_ANGLE_STEERING = 1024;
   const uint16_t HYUNDAI_PARAM_CCNC = 2048;
   const uint16_t HYUNDAI_PARAM_CANFD_LFA_ALT_STEERING = 4096;
+  const uint16_t HYUNDAI_PARAM_LONG_MAIN_BUTTON_ENGAGE = 8192;
 
   static const CanMsg HYUNDAI_CANFD_LKA_STEER_MSG_TX_MSGS[] = {
     HYUNDAI_CANFD_LKA_STEER_MSG_COMMON_TX_MSGS(0, 1)
@@ -429,6 +430,9 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_ccnc = GET_FLAG(param, HYUNDAI_PARAM_CCNC);
   // only meaningful for camera SCC, LFA angle steering (see the LFA steering checks below, with and without longitudinal)
   const bool lfa_alt_steering = hyundai_canfd_angle_steering && GET_FLAG(param, HYUNDAI_PARAM_CANFD_LFA_ALT_STEERING);
+  // main cruise button engages/disengages openpilot longitudinal; only valid with the CCNC LFA_ALT camera-SCC long config
+  hyundai_long_main_button_engage = GET_FLAG(param, HYUNDAI_PARAM_LONG_MAIN_BUTTON_ENGAGE) && lfa_alt_steering && hyundai_ccnc &&
+                                    hyundai_camera_scc && hyundai_longitudinal && !hyundai_canfd_alt_buttons && !hyundai_canfd_lka_steer_msg;
 
   safety_config ret;
   if (hyundai_longitudinal) {

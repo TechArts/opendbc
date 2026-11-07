@@ -7,6 +7,7 @@ from opendbc.car import ACCELERATION_DUE_TO_GRAVITY
 from opendbc.car.hyundai.carcontroller import ANGLE_SAFETY_BASELINE_MODEL
 from opendbc.car.hyundai.values import HyundaiSafetyFlags, CAR, HyundaiFlags, CarControllerParams
 from opendbc.car.structs import CarParams
+from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
 from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
@@ -904,6 +905,132 @@ class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
         self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1A0))
         self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 1.0, "aReqValue": 1.0})))
         self.assertEqual(ccnc, self._tx_zero(0xEA, 2, 24))
+
+
+class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
+  """CCNC LFA_ALT camera-SCC longitudinal: a cruise main button press engages (main on) / disengages (main off) openpilot longitudinal."""
+
+  # superset of the CCNC LFA_ALT long variants; read by common.test_tx_hook_on_wrong_safety_mode
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
+
+  BASE = (HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING |
+          HyundaiSafetyFlags.CCNC | HyundaiSafetyFlags.LONG)
+  FLAG = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
+  SET, RESUME, CANCEL = 2, 1, 4
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def _init(self, param=None, toggleable=True):
+    param = self.BASE | self.FLAG if param is None else param
+    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.LONG_MAIN_CRUISE_TOGGLEABLE if toggleable else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+
+  def _button(self, buttons=0, main=0):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
+
+  def _press_main(self, frames=3):
+    for _ in range(frames):
+      self._button(main=1)
+    self._button(main=0)
+
+  def _brake(self, pressed):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
+
+  def test_main_press_engages(self):
+    self._init()
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(main=1)  # rising edge, like the main toggle
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_second_main_press_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(main=1)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._press_main()  # and again: engage
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_long_press_is_one_transition(self):
+    self._init()
+    self._press_main(frames=200)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())
+
+  def test_main_press_engages_at_standstill_and_moving(self):
+    for speed in (0, 20):
+      with self.subTest(speed=speed):
+        self._init()
+        self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": speed * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+        self._press_main()
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_without_flag_main_never_engages(self):
+    self._init(self.BASE)
+    self._press_main()
+    self.assertTrue(self.safety.get_acc_main_on())  # main still toggles (MADS)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_flag_requires_ccnc_lfa_alt_long(self):
+    # flag alone, without the rest of the config, is ignored
+    for param in (self.BASE & ~HyundaiSafetyFlags.LONG, self.BASE & ~HyundaiSafetyFlags.CCNC, self.BASE & ~HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING,
+                  self.BASE & ~HyundaiSafetyFlags.CAMERA_SCC, self.BASE & ~HyundaiSafetyFlags.CANFD_ANGLE_STEERING):
+      with self.subTest(param=int(param)):
+        self._init(param | self.FLAG)
+        self._press_main()
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_requires_main_toggleable(self):
+    self._init(toggleable=False)
+    self._press_main()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_cancel_still_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())  # pause: main stays on
+
+  def test_cancel_wins_over_simultaneous_main(self):
+    self._init()
+    self._button(self.CANCEL, main=1)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_brake_still_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._brake(1)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_set_resume_unchanged(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        for param in (self.BASE | self.FLAG, self.BASE):
+          self._init(param)
+          self._button(btn)
+          self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
+          self._button(0)
+          self.assertTrue(self.safety.get_controls_allowed())
+          self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_init_resets_flag(self):
+    self._init()
+    self._init(self.BASE)
+    self._press_main()
+    self.assertFalse(self.safety.get_controls_allowed())
 
 
 if __name__ == "__main__":

@@ -59,6 +59,9 @@ bool hyundai_longitudinal_main_cruise_toggleable = false;
 extern bool hyundai_has_lda_button;
 bool hyundai_has_lda_button = false;
 
+extern bool hyundai_long_main_button_engage;
+bool hyundai_long_main_button_engage = false;  // main button press engages/disengages openpilot longitudinal (set by the CAN FD init)
+
 extern bool hyundai_non_scc;
 bool hyundai_non_scc = false;
 
@@ -93,6 +96,7 @@ void hyundai_common_init(uint16_t param) {
 
   hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
 
+  hyundai_long_main_button_engage = false;
   main_button_prev = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
@@ -146,6 +150,12 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
     // toggle main cruise state on rising edge of main cruise button
     if (main_button && !main_button_prev && hyundai_longitudinal_main_cruise_toggleable) {
       acc_main_on = !acc_main_on;
+
+      // main-button engage: the press that turns main on also enters controls (like a set release), the press that turns it off exits.
+      // acting on the rising edge keeps this the same edge as the main toggle, so a long press cannot produce a second transition
+      if (hyundai_long_main_button_engage) {
+        controls_allowed = acc_main_on && (cruise_button != HYUNDAI_BTN_CANCEL);
+      }
     }
 
     cruise_button_prev = cruise_button;
