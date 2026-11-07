@@ -148,6 +148,12 @@ class CarControlSP:
   leadOne: 'LeadData' = field(default_factory=lambda: LeadData())
   leadTwo: 'LeadData' = field(default_factory=lambda: LeadData())
   intelligentCruiseButtonManagement: 'IntelligentCruiseButtonManagement' = field(default_factory=lambda: IntelligentCruiseButtonManagement())
+  clusterAlert: 'CarControlSP.ClusterAlert' = field(default_factory=lambda: CarControlSP.ClusterAlert.none)
+
+  class ClusterAlert(StrEnum):
+    none = auto()
+    red = auto()
+    green = auto()
 
   @auto_dataclass
   class Param:

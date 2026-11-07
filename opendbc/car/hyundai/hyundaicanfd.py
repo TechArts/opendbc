@@ -159,8 +159,34 @@ def create_ccnc_mdps(packer, CAN, mdps):
   return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_LkaToiActvSta": 0, "MDPS_LkaToiUnblSta": 1})
 
 
+# ALERTS_2 values that are collision / emergency alerts (CCNC_0x161 value table, research/fork-features-and-cluster.md)
+CCNC_COLLISION_ALERTS_2 = (7, 8, 9, 14, 21)
+# cluster text/chime pairs for the red/green-light cues: (alert field, text, sound field, chime)
+CCNC_CLUSTER_ALERTS = {
+  "red": ("ALERTS_3", 18, "SOUNDS_3", 5),     # "Check surroundings" + single chime
+  "green": ("ALERTS_5", 11, "SOUNDS_2", 2),   # "Leading vehicle is driving away" + single chime
+}
+
+
+def apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert, stock_161):
+  """Put our red/green-light cue on the cluster. A stock car alert always wins: stock_161 is the camera's ORIGINAL frame (before any
+  sunnypilot suppression); nothing is written if its ALERTS_1 is set, a collision ALERTS_2 is showing, or the target text/chime field
+  is in use. Returns True if the cue was written."""
+  if cluster_alert not in CCNC_CLUSTER_ALERTS:
+    return False
+  alert_field, alert, sound_field, sound = CCNC_CLUSTER_ALERTS[cluster_alert]
+  if stock_161["ALERTS_1"] != 0 or stock_161["ALERTS_2"] in CCNC_COLLISION_ALERTS_2:
+    return False
+  if stock_161[alert_field] != 0 or stock_161[sound_field] != 0:
+    return False
+  msg_161.update({alert_field: alert, sound_field: sound})
+  msg_162["VIBRATE"] = 1
+  return True
+
+
 def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
-                is_metric, out, main_cruise_enabled, lfa_icon):
+                is_metric, out, main_cruise_enabled, lfa_icon, cluster_alert=None):
+  stock_161 = dict(msg_161)
   if msg_161["ALERTS_2"] == 5:
     msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
   if msg_161["ALERTS_3"] == 17:
@@ -251,6 +277,9 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBli
 
     msg_162["LEAD"] = 0 if not main_cruise_enabled else 2 if enabled else 1
     msg_162["LEAD_DISTANCE"] = msg_1b5["Longitudinal_Distance"]
+
+  # last, after the suppressions above, but decided on the camera's original frame so any stock warning wins
+  apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert, stock_161)
 
   return [packer.make_can_msg(msg, CAN.ECAN, data) for msg, data in [("CCNC_0x161", msg_161), ("CCNC_0x162", msg_162)]]
 
