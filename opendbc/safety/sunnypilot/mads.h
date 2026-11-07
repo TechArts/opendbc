@@ -130,6 +130,9 @@ inline void m_update_control_state(void) {
     controls_allowed_lateral = true;
     m_mads_state.current_disengage.active_reason = MADS_DISENGAGE_REASON_NONE;
     m_mads_state.current_disengage.pending_reasons = MADS_DISENGAGE_REASON_NONE;
+    // a new engagement starts a fresh heartbeat mismatch count: the check only runs at 1 Hz, so a count left at the
+    // threshold by a heartbeat exit would otherwise drop a re-engage on the next check, before the heartbeat catches up
+    heartbeat_engaged_mads_mismatches = 0U;
   }
 }
 

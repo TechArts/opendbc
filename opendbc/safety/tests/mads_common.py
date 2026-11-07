@@ -645,6 +645,36 @@ class MadsSafetyTestBase(unittest.TestCase):
     self.safety.tick_mads_state(False, False, False, False, False)
     self.assertTrue(self.safety.get_controls_allowed_lateral())
 
+  def test_heartbeat_mismatch_count_restarts_on_reengage(self):
+    """A MADS button re-engage right after a heartbeat-mismatch exit starts a fresh count: the 1 Hz check that runs
+    before the device's heartbeat reports the new engagement is one mismatch, not a fourth."""
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_mads_button_press(0)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.safety.set_mads_button_press(1)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    # driver turned lateral off on the device; the panda drops it on the 3rd 1 Hz check
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(3):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+    # driver presses the MADS button again before the next check, heartbeat not yet updated
+    self.safety.set_mads_button_press(0)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.safety.set_mads_button_press(1)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral(), "first mismatch after re-engage must not disengage")
+
+    # device heartbeat catches up and lateral stays allowed
+    self.safety.set_heartbeat_engaged_mads(True)
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
   def test_alt_exp_bit_discrimination(self):
     self.safety.mads_apply_alternative_experience(1)
     self.assertFalse(self.safety.get_enable_mads())
