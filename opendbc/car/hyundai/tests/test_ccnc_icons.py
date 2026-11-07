@@ -5,7 +5,7 @@ from opendbc.can import CANParser
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.hyundai import hyundaicanfd
 from opendbc.car.hyundai.carcontroller import CarController
-from opendbc.car.hyundai.carstate import CarState, MAIN_DESYNC_FRAMES
+from opendbc.car.hyundai.carstate import CarState, MAIN_PRESS_FRAMES
 from opendbc.car.hyundai.hyundaicanfd import CanBus, ICON_OFF, ICON_PAUSED, ICON_ACTIVE
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR, DBC
@@ -200,45 +200,66 @@ class TestDashStates(unittest.TestCase):
     self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["DISTANCE"]), (0, 1, 0))
 
 
-class TestMainDesync(unittest.TestCase):
+class TestCameraMain(unittest.TestCase):
+  """The camera's MainMode_ACC is the main cruise state; a main press only pairs with its rising edge into an engage request."""
+
   def setUp(self):
     _, _, _, self.cs = _carcontroller()
-    self.cs.main_cruise_enabled = True
-    self.cs.main_available = True
 
-  def _run(self, camera_main, frames, pressed=False):
+  def _step(self, camera_main, pressed=False, frames=1):
+    out = False
     for _ in range(frames):
-      self.cs.update_main_desync(camera_main, pressed)
+      out = self.cs.update_camera_main(camera_main, pressed)
+    return out
 
-  def test_agreement(self):
-    self._run(True, 5 * MAIN_DESYNC_FRAMES)
-    self.assertFalse(self.cs.main_desync)
+  def test_press_then_camera_rises_engages(self):
+    self.assertFalse(self._step(False, pressed=True))
+    self.assertFalse(self._step(False, frames=10))
+    self.assertTrue(self._step(True))
+    self.assertFalse(self._step(True, frames=5))  # one request per edge
 
-  def test_short_mismatch_after_press_ignored(self):
-    self._run(False, MAIN_DESYNC_FRAMES)
-    self.assertFalse(self.cs.main_desync)
+  def test_camera_rises_then_press_engages(self):
+    self.assertFalse(self._step(True))
+    self.assertFalse(self._step(True, frames=10))
+    self.assertTrue(self._step(True, pressed=True))
 
-  def test_persistent_mismatch_flagged_and_clears(self):
-    self._run(False, MAIN_DESYNC_FRAMES + 1)
-    self.assertTrue(self.cs.main_desync)
-    self._run(True, 1)
-    self.assertFalse(self.cs.main_desync)
+  def test_same_frame_engages(self):
+    self.assertTrue(self._step(True, pressed=True))
 
-  def test_unknown_camera_state_is_not_a_mismatch(self):
-    self._run(None, 5 * MAIN_DESYNC_FRAMES)
-    self.assertFalse(self.cs.main_desync)
+  def test_camera_ignores_press(self):
+    self._step(False, pressed=True)
+    self.assertFalse(self._step(False, frames=5 * MAIN_PRESS_FRAMES))
+    self.assertFalse(self.cs.camera_main)
 
-  def test_set_res_blocked_on_desync_or_main_off_but_main_press_works(self):
+  def test_camera_main_without_press_does_not_engage(self):
+    self.assertFalse(self._step(True, frames=5))
+    self.assertTrue(self.cs.camera_main)
+    self._step(True, frames=MAIN_PRESS_FRAMES + 5)
+    self.assertFalse(self._step(True, pressed=True))  # a press long after the rise has nothing to pair with
+
+  def test_stale_press_does_not_engage(self):
+    self._step(False, pressed=True)
+    self._step(False, frames=MAIN_PRESS_FRAMES + 5)
+    self.assertFalse(self._step(True))
+
+  def test_falling_edge_is_available_false_and_no_engage(self):
+    self._step(True, pressed=True)
+    self.assertFalse(self._step(False, pressed=True))
+    self.assertFalse(self.cs.camera_main)
+
+  def test_unknown_camera_state_keeps_last(self):
+    self._step(True, pressed=True)
+    self.assertFalse(self._step(None, frames=5))
+    self.assertTrue(self.cs.camera_main)
+
+  def test_set_res_needs_camera_main(self):
     set_release = [structs.CarState.ButtonEvent(type=ButtonType.decelCruise, pressed=False)]
+    self.cs.main_available = True
     self.assertTrue(self.cs.update_button_enable(set_release))
-    self._run(False, MAIN_DESYNC_FRAMES + 1)
-    self.assertFalse(self.cs.update_button_enable(set_release))
-    self.cs.main_button_enable = True  # a main press engages at the current speed regardless
-    self.assertTrue(self.cs.update_button_enable([]))
-    self.cs.main_button_enable = False
-    self._run(True, 1)
     self.cs.main_available = False
     self.assertFalse(self.cs.update_button_enable(set_release))
+    self.cs.main_button_enable = True  # an engage request still goes through
+    self.assertTrue(self.cs.update_button_enable([]))
 
 
 if __name__ == "__main__":
