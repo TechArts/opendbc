@@ -84,7 +84,8 @@ static uint32_t hyundai_canfd_get_checksum(const CANPacket_t *msg) {
 // openpilot longitudinal, 0x1A0 (SCC_CONTROL) until openpilot takes an axis, and gets it back only after a driver action.
 //   stock -> openpilot: the first openpilot frame that passes the TX checks while the panda allows that axis (0xCB: active request;
 //                       0x1A0: ACCMode 1/2). From then on the camera's frame is blocked, so there is no gap and no second sender.
-//   openpilot -> stock: the panda no longer allows the axis AND the driver acted (brake press, cancel, main button, MADS button)
+//   openpilot -> stock: the panda no longer allows the axis AND the driver acted (lateral: MADS button only, a brake or takeover never hands steering back;
+//                       longitudinal: brake press, cancel, main button)
 //                       within HYUNDAI_CANFD_HB_ACTION_WINDOW_US of that moment (before or after). Losing the permission any other
 //                       way (heartbeat mismatch, lag, invalid rx, stalled openpilot) keeps the camera blocked until the next driver action.
 // While stock owns an axis, openpilot's frames for it are rejected, so the two never interleave.
@@ -130,7 +131,7 @@ static void hyundai_canfd_handback_step(void) {
   hyundai_canfd_hb_mads_prev = mads_pressed;
 
   if (brake_edge || main_off_edge) {
-    hyundai_canfd_handback_note_action(now, true, true);
+    hyundai_canfd_handback_note_action(now, false, true);
   }
   if (mads_edge) {
     hyundai_canfd_handback_note_action(now, true, false);
@@ -153,7 +154,7 @@ static void hyundai_canfd_handback_buttons(int cruise_button, bool main_button) 
   hyundai_canfd_hb_main_button_prev = main_button;
   if (hyundai_canfd_handback) {
     if (cancel_edge || main_edge) {
-      hyundai_canfd_handback_note_action(microsecond_timer_get(), true, true);
+      hyundai_canfd_handback_note_action(microsecond_timer_get(), false, true);
     }
     hyundai_canfd_handback_step();
   }
