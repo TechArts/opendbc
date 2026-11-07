@@ -37,7 +37,15 @@ def get_baseline_safety_cp():
   return CarInterface.get_non_essential_params(ANGLE_SAFETY_BASELINE_MODEL)
 
 
-def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain):
+# GV70 CCNC LFA_ALT: the stock camera's own 0xCB gain vs driver torque, bin medians (placed at bin midpoints) from route 00000002
+# above 5 m/s; the stock LFA is barely active below that, so low speeds keep the generic curve. The generic curve held 3-6x more gain
+# against the driver.
+LFA_ALT_GAIN_TORQUE_BP = [25, 75, 125, 175, 250, 400]
+LFA_ALT_GAIN_V = [0.85, 0.55, 0.25, 0.15, 0.10, 0.07]
+LFA_ALT_GAIN_SPEED_BP = [4, 6]  # m/s: blend from the generic curve to the stock-matched one
+
+
+def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, lfa_alt=False):
   if lat_active:
     ceiling = np.interp(v_ego, [0.5, 1.5], [1.0, 0.85])
     shelf = np.interp(v_ego, [2, 11], [0.45, 0.6])
@@ -47,6 +55,10 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain)
     bp3 = np.interp(v_ego, [2, 11], [175, 275])
     bp4 = np.interp(v_ego, [2, 22], [400, 700])
     target = np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor])
+    if lfa_alt:
+      stock = np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, LFA_ALT_GAIN_V)
+      w = np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0])
+      target = (1.0 - w) * target + w * min(stock, ceiling)
 
   else:
     target = 0.0
@@ -161,7 +173,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
         apply_angle = apply_steer_angle_limits_vm(apply_angle or desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, CC.latActive,
                                                   self.params, self.BASELINE_VM)
 
-      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last)
+      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last,
+                                                   lfa_alt=self.CP.carFingerprint == CAR.GENESIS_GV70_2ND_GEN and
+                                                   bool(self.CP.flags & HyundaiFlags.SEND_LFA))
       apply_steer_req = CC.latActive and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
