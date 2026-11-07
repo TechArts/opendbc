@@ -155,8 +155,11 @@ def create_lfahda_cluster(packer, CAN, enabled, lfa_icon):
 
 
 def create_ccnc_mdps(packer, CAN, mdps):
-  # report LKA torque inactive/unavailable so the camera's own LFA stays in standby (from sunnypilot ccnc-port-sp)
-  return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_LkaToiActvSta": 0, "MDPS_LkaToiUnblSta": 1})
+  # The camera compares its own LFA request (LFA_ALT ADAS_ActvACILvl2Sta) with the MDPS's ACI state and reports System Fail
+  # ~0.5 s after they disagree (GV70: camera requested + MDPS inactive, and MDPS active for openpilot + camera not requesting).
+  # openpilot, not the camera, owns steering here, so tell the camera the MDPS is not executing an ACI request for it.
+  # LkaToi fields: from sunnypilot ccnc-port-sp (torque-path cars).
+  return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_LkaToiActvSta": 0, "MDPS_LkaToiUnblSta": 1, "MDPS_ADASAciActvSta_Lv2": 1})
 
 
 # ALERTS_2 values that are collision / emergency alerts (CCNC_0x161 value table, research/fork-features-and-cluster.md)
