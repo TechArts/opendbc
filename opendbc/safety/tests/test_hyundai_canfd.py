@@ -801,6 +801,110 @@ class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
     self.assertTrue(self.safety.get_relay_malfunction())
 
 
+class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
+  """Openpilot longitudinal (SCC_CONTROL) on top of HDA1 LFA_ALT angle steering with camera SCC."""
+
+  BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING
+  LONG = HyundaiSafetyFlags.LONG
+  CCNC = HyundaiSafetyFlags.CCNC
+
+  # superset of both variants; read by common.test_tx_hook_on_wrong_safety_mode
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
+
+  # (addr, bus, length) openpilot may send; 0x1CF is gated on button state, covered separately
+  TX_CCNC = {(0x1E0, 0, 16), (0xCB, 0, 24), (0x1A0, 0, 32), (0x161, 0, 32), (0x162, 0, 32), (0x7C4, 2, 8), (0xEA, 2, 24)}
+  TX_NON_CCNC = {(0x1E0, 0, 16), (0xCB, 0, 24), (0x1A0, 0, 32), (0x160, 0, 16)}
+  CANDIDATES = {(0x12A, 0, 16), (0x1CF, 2, 8), (0x160, 0, 16), (0x7D0, 0, 8), (0x51, 0, 32)} | TX_CCNC | TX_NON_CCNC
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def _init(self, ccnc=True, long=True):
+    param = self.BASE | (self.CCNC if ccnc else 0) | (self.LONG if long else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+
+  def _tx_zero(self, addr, bus, length):
+    if addr == 0x1A0:
+      return self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", bus, {"aReqRaw": 0, "aReqValue": 0}))
+    return self.safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def _rx(self, addr, bus, length):
+    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def test_tx_set(self):
+    for ccnc, expected in ((True, self.TX_CCNC), (False, self.TX_NON_CCNC)):
+      self._init(ccnc)
+      for msg in self.CANDIDATES:
+        with self.subTest(ccnc=ccnc, msg=tuple(map(hex, msg[:1])) + msg[1:]):
+          self.assertEqual(msg in expected, self._tx_zero(*msg))
+
+  def test_openpilot_never_sends_0x12a(self):
+    for ccnc in (True, False):
+      self._init(ccnc)
+      self.assertFalse(self._tx_zero(0x12A, 0, 16))
+
+  def test_camera_0x12a_forwarded_scc_control_blocked(self):
+    for ccnc in (True, False):
+      with self.subTest(ccnc=ccnc):
+        self._init(ccnc)
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x12A))  # lane/FCA/ESA status from the camera still reaches the car
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x1A0))  # the camera's SCC_CONTROL is replaced by ours
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0xCB))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x1E0))
+
+  def test_ccnc_camera_frames(self):
+    self._init(ccnc=True)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x161))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x162))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x160))  # not ours on CCNC: the camera's stock FCA warning light frame stays
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0x7C4))
+    self._init(ccnc=False)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x160))  # ours on non-CCNC
+
+  def test_mdps_copy_in_long(self):
+    self._init()
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+    self.assertTrue(self._tx_zero(0xEA, 2, 24))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0xEA))
+    self._init(ccnc=False)
+    self.assertFalse(self._tx_zero(0xEA, 2, 24))
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+
+  def test_relay_malfunction(self):
+    for ccnc, addr, length, expected in ((True, 0x1A0, 32, True), (True, 0x161, 32, True), (True, 0xCB, 24, True), (True, 0x12A, 16, False),
+                                         (True, 0x160, 16, False), (False, 0x160, 16, True), (False, 0x1A0, 32, True)):
+      with self.subTest(ccnc=ccnc, addr=hex(addr)):
+        self._init(ccnc)
+        self._rx(addr, 0, length)
+        self.assertEqual(expected, self.safety.get_relay_malfunction())
+
+  def test_camera_mdps_relay_malfunction(self):
+    self._init()
+    self._rx(0xEA, 2, 24)
+    self.assertTrue(self.safety.get_relay_malfunction())
+
+  def test_accel_limited_by_longitudinal_checks(self):
+    self._init()
+    self.assertTrue(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 0, "aReqValue": 0})))
+    # controls not allowed: only the inactive accel value goes out
+    self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 1.0, "aReqValue": 1.0})))
+
+  def test_cruise_buttons_still_gated(self):
+    self._init()
+    self.assertFalse(self._tx_zero(0x1CF, 2, 8))  # no button / main-button pulses are not allowed
+
+  def test_default_is_stock_scc(self):
+    # toggle off: openpilot may only cancel via SCC_CONTROL, the camera's SCC_CONTROL and 0x12A are forwarded, no MDPS copy until sent
+    for ccnc in (True, False):
+      with self.subTest(ccnc=ccnc):
+        self._init(ccnc, long=False)
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x12A))
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1A0))
+        self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 1.0, "aReqValue": 1.0})))
+        self.assertEqual(ccnc, self._tx_zero(0xEA, 2, 24))
+
 
 if __name__ == "__main__":
   unittest.main()
