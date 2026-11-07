@@ -37,7 +37,7 @@ class CanBus(CanBusBase):
     return self._cam
 
 
-def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_torque, apply_angle, lkas_icon):
+def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_torque, apply_angle, lkas_icon, lfa_alt_counter=None):
   values = {
     "LKA_OptUsmSta": 2,
     "LKA_SysIndReq": 2 if enabled else 1,
@@ -73,6 +73,8 @@ def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_torque,
       "FCA_ESA_ActvSta": ESA_ActvSta.INACTIVE.value,
       "FCA_ESA_TqBstGainVal": 0
     }
+    if lfa_alt_counter is not None:
+      LFA_ALT_values["COUNTER"] = lfa_alt_counter
 
   ret = []
   if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
@@ -154,10 +156,16 @@ def create_lfahda_cluster(packer, CAN, enabled, lfa_icon):
   return packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values)
 
 
-def create_ccnc_mdps(packer, CAN, mdps):
-  # The camera compares its own LFA request (LFA_ALT ADAS_ActvACILvl2Sta) with the MDPS's ACI state and reports System Fail
-  # ~0.5 s after they disagree (GV70: camera requested + MDPS inactive, and MDPS active for openpilot + camera not requesting).
-  # openpilot, not the camera, owns steering here, so tell the camera the MDPS is not executing an ACI request for it.
+def create_ccnc_mdps(packer, CAN, mdps, camera_aci_lvl2=None):
+  # The camera compares its own LFA request (LFA_ALT ADAS_ActvACILvl2Sta) with the MDPS's ACI state and reports System Fail ~0.5 s
+  # after they disagree.
+  if camera_aci_lvl2 is not None:
+    # Camera hand-back: openpilot owns steering, so the real MDPS follows openpilot's 0xCB. Tell the camera the MDPS state it would see on
+    # a stock drive: echo the camera's own request (2 if it asks for ACI, else 1). Everything else is the real MDPS.
+    echo = ActvACISta.ACTIVE35_ACTIVE.value if camera_aci_lvl2 == ActvACISta.ACTIVE35_ACTIVE.value else ActvACISta.INACTIVE.value
+    return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_ADASAciActvSta_Lv2": echo})
+
+  # Legacy (no hand-back): openpilot, not the camera, owns steering, so tell the camera the MDPS is not executing an ACI request for it.
   # LkaToi fields: from sunnypilot ccnc-port-sp (torque-path cars).
   return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_LkaToiActvSta": 0, "MDPS_LkaToiUnblSta": 1, "MDPS_ADASAciActvSta_Lv2": 1})
 
@@ -288,7 +296,7 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBli
 
 
 def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control,
-                       lead_data: CanFdLeadData, main_cruise_enabled, tuning, cruise_info=None):
+                       lead_data: CanFdLeadData, main_cruise_enabled, tuning, cruise_info=None, counter=None):
   jerk = 5
   jn = jerk / 50
   if not enabled or gas_override:
@@ -318,6 +326,8 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
   }
   if cruise_info:
     values.update({s: cruise_info[s] for s in ["ACC_ObjDist", "ACC_ObjRelSpd"]})
+  if counter is not None:
+    values["COUNTER"] = counter
 
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
 

@@ -1033,5 +1033,275 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.assertFalse(self.safety.get_controls_allowed())
 
 
+class TestHyundaiCanfdCameraHandback(unittest.TestCase):
+  """CAMERA_HANDBACK: the camera's 0xCB / 0xEA (MDPS) / 0x1A0 are forwarded unless openpilot owns that axis; ownership returns to the camera
+  only after a driver action (brake, cancel, main button, MADS button), never because openpilot stalled."""
+
+  BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING | HyundaiSafetyFlags.CCNC
+  FLAG = HyundaiSafetyFlags.CAMERA_HANDBACK
+  LONG = HyundaiSafetyFlags.LONG
+  MAIN = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
+  CANCEL = 4
+  S = 1_000_000  # us
+
+  # superset of the variants; read by common.test_tx_hook_on_wrong_safety_mode
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def _init(self, long=True, flag=True, base=None):
+    param = (self.BASE if base is None else base) | (self.FLAG if flag else 0) | ((self.LONG | self.MAIN) if long else 0)
+    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.LONG_MAIN_CRUISE_TOGGLEABLE)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+    self.safety.set_timer(0)
+
+  def _cb(self, active):
+    return self.safety.safety_tx_hook(self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2 if active else 1}))
+
+  def _mdps(self):
+    return self.safety.safety_tx_hook(libsafety_py.make_CANPacket(0xEA, 2, b"\x00" * 24))
+
+  def _scc(self, mode):
+    return self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": mode, "aReqRaw": 0, "aReqValue": 0}))
+
+  def _rx(self, addr, bus, length):
+    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def _button(self, buttons=0, main=0):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
+
+  def _brake(self, pressed):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
+
+  # forwarded (camera frame reaches the car / the camera) vs blocked
+  def _cb_fwd(self):
+    return self.safety.safety_fwd_hook(2, 0xCB) == 0
+
+  def _mdps_fwd(self):
+    return self.safety.safety_fwd_hook(0, 0xEA) == 2
+
+  def _scc_fwd(self):
+    return self.safety.safety_fwd_hook(2, 0x1A0) == 0
+
+  def _engage_lat(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._cb(True))
+
+  def _engage_long(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._scc(1))
+
+  def test_flag_off_unchanged(self):
+    self._init(flag=False)
+    self.assertFalse(self._cb_fwd())  # statically blocked, openpilot always sends
+    self.assertFalse(self._scc_fwd())
+    self.assertTrue(self._mdps_fwd())  # real MDPS until openpilot's copy appears
+    self.assertTrue(self._mdps())
+    self.assertFalse(self._mdps_fwd())
+
+  def test_flag_needs_ccnc_lfa_alt_camera_scc(self):
+    for base in (self.BASE & ~HyundaiSafetyFlags.CCNC, self.BASE & ~HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING,
+                 self.BASE & ~HyundaiSafetyFlags.CAMERA_SCC):
+      with self.subTest(base=int(base)):
+        self._init(base=base)
+        self.assertFalse(self._cb_fwd())
+
+  def test_startup_stock_owns_everything(self):
+    for long in (True, False):
+      with self.subTest(long=long):
+        self._init(long)
+        self.assertTrue(self._cb_fwd())
+        self.assertTrue(self._mdps_fwd())
+        self.assertTrue(self._scc_fwd())
+        self.assertTrue(self.safety.safety_fwd_hook(2, 0x12A) == 0)
+
+  def test_openpilot_rejected_while_stock_owns(self):
+    self._init()
+    self.assertFalse(self._cb(False))  # no inactive frame, no MDPS copy: a second sender would interleave with the camera
+    self.assertFalse(self._mdps())
+    self.assertFalse(self._scc(0))
+    self.assertFalse(self._cb(True))  # controls not allowed
+    self.assertFalse(self._scc(1))
+    self.assertTrue(self._cb_fwd() and self._scc_fwd() and self._mdps_fwd())
+
+  def test_lateral_takeover_on_first_active_frame(self):
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._cb_fwd())  # allowed, but openpilot has not sent yet: camera keeps the car supplied
+    self.assertTrue(self._cb(True))
+    self.assertFalse(self._cb_fwd())
+    self.assertFalse(self._mdps_fwd())
+    self.assertTrue(self._mdps())
+    self.assertTrue(self._cb(False))  # inactive frames continue (the car must not see a gap)
+    self.assertTrue(self._scc_fwd())  # longitudinal untouched
+
+  def test_mads_lateral_only(self):
+    self._init()
+    self.safety.set_controls_allowed_lateral(True)  # MADS: lateral permission without longitudinal
+    self.assertTrue(self._cb(True))
+    self.assertFalse(self._cb_fwd())
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc(1))  # longitudinal is not allowed
+
+  def test_long_takeover_on_first_active_frame(self):
+    self._init()
+    self.assertFalse(self._scc(0))
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc(0))  # an 'off' frame cannot take the axis
+    self.assertTrue(self._scc(1))
+    self.assertFalse(self._scc_fwd())
+    self.assertTrue(self._scc(0))  # off frames pass once openpilot owns it
+    self.assertTrue(self._cb_fwd())
+
+  def test_non_long_scc_always_forwarded(self):
+    self._init(long=False)
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc(1))  # openpilot may only cancel through 0x1A0 without longitudinal
+    self.assertTrue(self._cb(True))
+    self.assertTrue(self._scc_fwd())
+
+  def test_no_timeout_while_openpilot_owns(self):
+    self._init()
+    self._engage_lat()
+    self._engage_long()
+    self.safety.set_timer(100 * self.S)
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
+
+  def test_brake_hands_back(self):
+    self._init()
+    self._engage_lat()
+    self._engage_long()
+    self._brake(1)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+    # openpilot's trailing frames are dropped, never interleaved with the camera's
+    self.assertFalse(self._cb(False) or self._mdps() or self._scc(0))
+
+  def test_cancel_hands_back(self):
+    self._init()
+    self._engage_lat()
+    self._engage_long()
+    self._button(self.CANCEL)
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+
+  def test_main_button_off_hands_back(self):
+    self._init()
+    self._button(main=1)  # Driving Assist press: main on, controls allowed
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._cb(True) and self._scc(1))
+    self._button(main=0)
+    self.assertFalse(self._cb_fwd() or self._scc_fwd())
+    self._button(main=1)  # second press: main off
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+
+  def test_mads_button_then_permission_loss_hands_lateral_back(self):
+    self._init()
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._cb(True))
+    self.safety.set_mads_button_press(1)  # lane-assist button, then the heartbeat mismatch drops the permission ~3 s later
+    self.assertFalse(self._cb_fwd())
+    self.safety.set_timer(3 * self.S)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
+
+  def test_heartbeat_loss_keeps_camera_blocked_until_driver_action(self):
+    self._init()
+    self._engage_lat()
+    self._engage_long()
+    self.safety.set_controls_allowed(False)  # permission lost with no driver action (heartbeat mismatch / lag / stalled openpilot)
+    self.safety.set_timer(30 * self.S)
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
+    self._brake(1)  # the next driver action releases both axes
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+
+  def test_stale_driver_action_does_not_hand_back(self):
+    self._init()
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._cb(True))
+    self._brake(1)  # brake tap while MADS keeps steering
+    self._brake(0)
+    self.assertFalse(self._cb_fwd())
+    self.safety.set_timer(30 * self.S)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertFalse(self._cb_fwd())
+    self._button(self.CANCEL)
+    self.assertTrue(self._cb_fwd())
+
+  def test_recent_driver_action_before_permission_loss(self):
+    self._init()
+    self._engage_lat()
+    self._button(self.CANCEL)  # cancel also drops controls: hands back at once
+    self.assertTrue(self._cb_fwd())
+    self._init()
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._cb(True))
+    self._brake(1)  # MADS continues through the brake (no pause)
+    self.assertFalse(self._cb_fwd())
+    self.safety.set_timer(4 * self.S)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertTrue(self._cb_fwd())
+
+  def test_reengage_after_handback(self):
+    self._init()
+    self._engage_lat()
+    self._engage_long()
+    self._brake(1)
+    self._brake(0)
+    self.assertTrue(self._cb_fwd())
+    self._engage_lat()
+    self._engage_long()
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
+
+  def test_init_resets_ownership(self):
+    self._init()
+    self._engage_lat()
+    self._init()
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
+
+  def test_relay_malfunction(self):
+    for long in (True, False):
+      for addr, bus, length, expected in ((0xCB, 0, 24, True), (0xCB, 2, 24, False), (0xEA, 2, 24, True), (0xEA, 0, 24, False),
+                                          (0x1A0, 0, 32, long), (0x1A0, 2, 32, False), (0x161, 0, 32, True)):
+        with self.subTest(long=long, addr=hex(addr), bus=bus):
+          self._init(long)
+          self._rx(addr, bus, length)
+          self.assertEqual(expected, self.safety.get_relay_malfunction())
+
+  def test_camera_frames_forwarded_do_not_trip_relay(self):
+    self._init()
+    for _ in range(10):
+      self.assertTrue(self._cb_fwd() and self._scc_fwd())
+    self.assertFalse(self.safety.get_relay_malfunction())
+
+  def test_relay_malfunction_blocks_all_forwarding(self):
+    self._init()
+    self.safety.set_relay_malfunction(True)
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
+
+  def test_openpilot_checks_unchanged(self):
+    self._init()
+    self.safety.set_controls_allowed(True)
+    # steering request far from the measured angle is still refused, and does not take the axis
+    self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2, "ADAS_StrAnglReqVal": 300})))
+    self.assertTrue(self._cb_fwd())
+    # accel above the limit is refused
+    self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": 1, "aReqRaw": 3.5, "aReqValue": 3.5})))
+    self.assertTrue(self._scc_fwd())
+
+  def test_tx_set(self):
+    for long in (True, False):
+      self._init(long)
+      self.safety.set_controls_allowed(True)
+      self.assertTrue(self.safety.safety_tx_hook(libsafety_py.make_CANPacket(0x1E0, 0, b"\x00" * 16)))
+      self.assertFalse(self.safety.safety_tx_hook(libsafety_py.make_CANPacket(0x12A, 0, b"\x00" * 16)))  # camera keeps 0x12A
+      self.assertFalse(self.safety.safety_tx_hook(libsafety_py.make_CANPacket(0xEA, 0, b"\x00" * 24)))  # wrong bus
+
+
 if __name__ == "__main__":
   unittest.main()
