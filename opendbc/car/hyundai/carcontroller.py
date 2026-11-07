@@ -305,6 +305,23 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     return can_sends
 
+  def dash_states(self, CS, CC):
+    """(lateral, longitudinal) dash icon states from the real control state of each axis, independent of each other."""
+    ICON_OFF, ICON_PAUSED, ICON_ACTIVE = hyundaicanfd.ICON_OFF, hyundaicanfd.ICON_PAUSED, hyundaicanfd.ICON_ACTIVE
+
+    if CC.latActive:
+      lat = ICON_ACTIVE
+    elif CS.out.steerFaultTemporary or CS.out.steerFaultPermanent:
+      lat = ICON_OFF  # a steering fault is not a pause
+    else:
+      lat = ICON_PAUSED if (self.mads.paused if self.mads.enable_mads else CC.enabled) else ICON_OFF
+
+    if not CC.enabled or CS.out.accFaulted:
+      long = ICON_OFF
+    else:
+      long = ICON_ACTIVE if CC.longActive else ICON_PAUSED  # not longActive while engaged: gas override
+    return lat, long
+
   def create_canfd_msgs(self, apply_steer_req, apply_torque, set_speed_in_units, accel, stopping, hud_control, CS, CC):
     can_sends = []
 
@@ -343,9 +360,13 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # LFA and HDA icons
     if self.frame % 5 == 0 and (not lka_steering or lka_steering_long):
       if ccnc_non_hda2:
-        can_sends.extend(hyundaicanfd.create_ccnc(self.packer, self.CAN, self.CP.openpilotLongitudinalControl, CC.enabled, CC.hudControl, CC.leftBlinker,
+        lat_state, long_state = self.dash_states(CS, CC)
+        # hand-back: an axis openpilot doesn't own and doesn't claim shows the camera's own real state
+        can_sends.extend(hyundaicanfd.create_ccnc(self.packer, self.CAN, self.CP.openpilotLongitudinalControl, long_state, CC.hudControl, CC.leftBlinker,
                                                   CC.rightBlinker, CS.msg_161, CS.msg_162, CS.msg_1b5, CS.is_metric, CS.out, CS.main_cruise_enabled,
-                                                  self.lfa_icon, self.cluster_alert))
+                                                  lat_state, self.cluster_alert,
+                                                  passthrough_lat=not send_lat and lat_state == hyundaicanfd.ICON_OFF,
+                                                  passthrough_long=not send_long and long_state == hyundaicanfd.ICON_OFF))
       else:
         can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled, self.lfa_icon))
 

@@ -195,8 +195,17 @@ def apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert, stock_161):
   return True
 
 
-def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
-                is_metric, out, main_cruise_enabled, lfa_icon, cluster_alert=None):
+# Dash icon states for the CCNC cluster (value tables of CCNC_0x161: 0 hidden, 1 gray, 2 green) for one axis:
+#   OFF    axis disengaged for any reason (driver, error, fault)
+#   PAUSED engaged but temporarily not controlling (driver override, blinker pause, standstill, gas press)
+#   ACTIVE openpilot controls the axis right now
+ICON_OFF, ICON_PAUSED, ICON_ACTIVE = 0, 1, 2
+
+
+def create_ccnc(packer, CAN, openpilotLongitudinalControl, long_state, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
+                is_metric, out, main_cruise_enabled, lat_state, cluster_alert=None, passthrough_lat=False, passthrough_long=False):
+  """lat_state / long_state: ICON_*. passthrough_lat / passthrough_long: openpilot does not own that axis, so the camera's own dash fields
+  for it (its real LFA / cruise state) are kept as received."""
   stock_161 = dict(msg_161)
   if msg_161["ALERTS_2"] == 5:
     msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
@@ -211,21 +220,23 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBli
   anyBlinker = leftBlinker or rightBlinker
   curvature = {i: (31 if i == -1 else 13 - abs(i + 15)) if i < 0 else 15 + i for i in range(-15, 16)}
 
-  msg_161.update({
-    "DAW_ICON": 0,
-    "LKA_ICON": 0,
-    "LFA_ICON": 2 if lfa_icon else 0,
-    "CENTERLINE": 1 if lfa_icon else 0,
-    "LANELINE_CURVATURE": curvature.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14) if lfa_icon and not anyBlinker else 15,
-    "LANELINE_LEFT": (0 if not lfa_icon else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if anyBlinker else 2),
-    "LANELINE_RIGHT": (0 if not lfa_icon else 1 if not hud.rightLaneVisible else 4 if hud.rightLaneDepart else 6 if anyBlinker else 2),
-    "LCA_LEFT_ICON": (0 if not lfa_icon or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.leftBlindspot else 2 if anyBlinker else 4),
-    "LCA_RIGHT_ICON": (0 if not lfa_icon or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.rightBlindspot else 2 if anyBlinker else 4),
-    "LCA_LEFT_ARROW": 2 if leftBlinker else 0,
-    "LCA_RIGHT_ARROW": 2 if rightBlinker else 0,
-  })
+  msg_161.update({"DAW_ICON": 0, "LKA_ICON": 0})
+  lat_active = lat_state == ICON_ACTIVE
+  if not passthrough_lat:
+    # green wheel/centre line/lane lines only while openpilot steers; paused is a gray wheel with plain white lane lines
+    msg_161.update({
+      "LFA_ICON": lat_state,
+      "CENTERLINE": 1 if lat_active else 0,
+      "LANELINE_CURVATURE": curvature.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14) if lat_active and not anyBlinker else 15,
+      "LANELINE_LEFT": (0 if lat_state == ICON_OFF else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if anyBlinker and lat_active else 2),
+      "LANELINE_RIGHT": (0 if lat_state == ICON_OFF else 1 if not hud.rightLaneVisible else 4 if hud.rightLaneDepart else 6 if anyBlinker and lat_active else 2),
+      "LCA_LEFT_ICON": (0 if lat_state == ICON_OFF or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.leftBlindspot else 2 if anyBlinker else 4),
+      "LCA_RIGHT_ICON": (0 if lat_state == ICON_OFF or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.rightBlindspot else 2 if anyBlinker else 4),
+      "LCA_LEFT_ARROW": 2 if leftBlinker else 0,
+      "LCA_RIGHT_ARROW": 2 if rightBlinker else 0,
+    })
 
-  if lfa_icon and (leftBlinker or rightBlinker):
+  if lat_active and not passthrough_lat and (leftBlinker or rightBlinker):
     leftlaneraw, rightlaneraw = msg_1b5["Info_LftLnPosVal"], msg_1b5["Info_RtLnPosVal"]
 
     scale_per_m = 15 / 1.7
@@ -270,24 +281,29 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBli
     if msg_161["SOUNDS_3"] == 5:
       msg_161["SOUNDS_3"] = 0
 
-    msg_161.update({
-      "SETSPEED": 3 if enabled else 1,
-      "SETSPEED_HUD": 0 if not main_cruise_enabled else 2 if enabled else 1,
-      "SETSPEED_SPEED": (
-        255 if not main_cruise_enabled else
-        (40 if is_metric else 25) if (s := round(out.vCruiseCluster * (1 if is_metric else CV.KPH_TO_MPH))) > (145 if is_metric else 90) else s
-      ),
-      "DISTANCE": hud.leadDistanceBars,
-      "DISTANCE_SPACING": 0 if not main_cruise_enabled else 1 if enabled else 3,
-      "DISTANCE_LEAD": 0 if not main_cruise_enabled else 2 if enabled and hud.leadVisible else 1 if hud.leadVisible else 0,
-      "DISTANCE_CAR": 0 if not main_cruise_enabled else 2 if enabled else 1,
-      "SLA_ICON": 0,
-      "NAV_ICON": 0,
-      "TARGET": 0,
-    })
+    if not passthrough_long:
+      # green only while openpilot controls speed, gray on a gas override or in standby (main on), gap bars only while engaged.
+      # SETSPEED is also green when engaged (was white); which of SETSPEED / SETSPEED_HUD this cluster draws, and the meaning of
+      # DISTANCE_SPACING 1, are unverified (parked sweep).
+      engaged, long_active = long_state != ICON_OFF, long_state == ICON_ACTIVE
+      msg_161.update({
+        "SETSPEED": 2 if long_active else 1,
+        "SETSPEED_HUD": 0 if not main_cruise_enabled else 2 if long_active else 1,
+        "SETSPEED_SPEED": (
+          255 if not main_cruise_enabled else
+          (40 if is_metric else 25) if (s := round(out.vCruiseCluster * (1 if is_metric else CV.KPH_TO_MPH))) > (145 if is_metric else 90) else s
+        ),
+        "DISTANCE": hud.leadDistanceBars if engaged else 0,
+        "DISTANCE_SPACING": 1 if engaged else 0,
+        "DISTANCE_LEAD": 0 if not engaged or not hud.leadVisible else 2 if long_active else 1,
+        "DISTANCE_CAR": 0 if not engaged else 2 if long_active else 1,
+        "SLA_ICON": 0,
+        "NAV_ICON": 0,
+        "TARGET": 0,
+      })
 
-    msg_162["LEAD"] = 0 if not main_cruise_enabled else 2 if enabled else 1
-    msg_162["LEAD_DISTANCE"] = msg_1b5["Longitudinal_Distance"]
+      msg_162["LEAD"] = 0 if not main_cruise_enabled else 2 if long_active else 1
+      msg_162["LEAD_DISTANCE"] = msg_1b5["Longitudinal_Distance"]
 
   # last, after the suppressions above, but decided on the camera's original frame so any stock warning wins
   apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert, stock_161)
