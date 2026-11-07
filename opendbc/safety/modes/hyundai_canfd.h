@@ -400,6 +400,24 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     {0x7C4, 2, 8, .check_relay = true}, /* 0x7C4 */ \
     {0xEA, 2, 24, .check_relay = true, .disable_static_blocking = true}, /* MDPS copy to the camera */ \
 
+// Longitudinal on top of LFA_ALT steering: openpilot sends SCC_CONTROL (the camera's is blocked) but still not 0x12A,
+// so the camera's 0x12A keeps reaching the car. On CCNC we do not send ADRV_0x160 either, so the camera's FCA warning light
+// frame is forwarded too; on non-CCNC ADRV_0x160 is ours (and relay-checked).
+#define HYUNDAI_CANFD_LFA_ALT_STEERING_CAMERA_SCC_LONG_TX_MSGS \
+    HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(2) \
+    HYUNDAI_CANFD_LFA_ALT_STEERING_COMMON_TX_MSGS(0) \
+    HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(0, true) \
+    {0x160, 0, 16, .check_relay = true}, /* ADRV_0x160 */ \
+
+#define HYUNDAI_CANFD_LFA_ALT_STEERING_CAMERA_SCC_CCNC_LONG_TX_MSGS \
+    HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(2) \
+    HYUNDAI_CANFD_LFA_ALT_STEERING_COMMON_TX_MSGS(0) \
+    HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(0, true) \
+    {0x161, 0, 32, .check_relay = true}, /* CCNC_0x161 */ \
+    {0x162, 0, 32, .check_relay = true}, /* CCNC_0x162 */ \
+    {0x7C4, 2, 8, .check_relay = true}, /* 0x7C4 */ \
+    {0xEA, 2, 24, .check_relay = true, .disable_static_blocking = true}, /* MDPS copy to the camera */ \
+
   hyundai_common_init(param);
   hyundai_canfd_ccnc_mdps_tx = false;
 
@@ -409,7 +427,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   // TODO: test this restriction
   hyundai_canfd_lka_steer_msg_alt = GET_FLAG(param, HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT);
   hyundai_ccnc = GET_FLAG(param, HYUNDAI_PARAM_CCNC);
-  // only meaningful for non-longitudinal, camera SCC, LFA angle steering (see LFA steering checks below)
+  // only meaningful for camera SCC, LFA angle steering (see the LFA steering checks below, with and without longitudinal)
   const bool lfa_alt_steering = hyundai_canfd_angle_steering && GET_FLAG(param, HYUNDAI_PARAM_CANFD_LFA_ALT_STEERING);
 
   safety_config ret;
@@ -439,6 +457,14 @@ static safety_config hyundai_canfd_init(uint16_t param) {
         HYUNDAI_CANFD_LFA_STEERING_CAMERA_SCC_CCNC_TX_MSGS(true)
       };
 
+      static CanMsg hyundai_canfd_lfa_alt_steering_camera_scc_long_tx_msgs[] = {
+        HYUNDAI_CANFD_LFA_ALT_STEERING_CAMERA_SCC_LONG_TX_MSGS
+      };
+
+      static CanMsg hyundai_canfd_lfa_alt_steering_camera_scc_ccnc_long_tx_msgs[] = {
+        HYUNDAI_CANFD_LFA_ALT_STEERING_CAMERA_SCC_CCNC_LONG_TX_MSGS
+      };
+
       if (hyundai_canfd_alt_buttons) {
         SET_RX_CHECKS(hyundai_canfd_alt_buttons_long_rx_checks, ret);
       } else {
@@ -446,7 +472,13 @@ static safety_config hyundai_canfd_init(uint16_t param) {
       }
 
       if (hyundai_camera_scc) {
-        if (get_hyundai_ccnc()) {
+        if (lfa_alt_steering) {
+          if (get_hyundai_ccnc()) {
+            SET_TX_MSGS(hyundai_canfd_lfa_alt_steering_camera_scc_ccnc_long_tx_msgs, ret);
+          } else {
+            SET_TX_MSGS(hyundai_canfd_lfa_alt_steering_camera_scc_long_tx_msgs, ret);
+          }
+        } else if (get_hyundai_ccnc()) {
           SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_ccnc_tx_msgs, ret);
         } else {
           SET_TX_MSGS(hyundai_canfd_lfa_steering_camera_scc_tx_msgs, ret);

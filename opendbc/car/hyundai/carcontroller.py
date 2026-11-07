@@ -282,10 +282,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       can_sends.append(hyundaicanfd.create_suppress_lfa(self.packer, self.CAN, CS.lfa_block_msg,
                                                         self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT))
 
-    # CCNC LFA_ALT (HDA1 angle) cars: the camera needs MDPS (0xEA) at all times. Send our own copy that reports
-    # LKA torque inactive/unavailable so the camera's own LFA stays in standby; the panda then stops forwarding the real one.
-    if ccnc_non_hda2 and self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING and self.CP.flags & HyundaiFlags.SEND_LFA \
-       and not self.CP.openpilotLongitudinalControl and CS.mdps:
+    # CCNC LFA_ALT (HDA1 angle) cars: the camera needs MDPS (0xEA) at all times, with or without openpilot longitudinal. Send our own
+    # copy that reports LKA torque inactive/unavailable so the camera's own LFA stays in standby; the panda then stops forwarding the real one.
+    if ccnc_non_hda2 and self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING and self.CP.flags & HyundaiFlags.SEND_LFA and CS.mdps:
       can_sends.append(hyundaicanfd.create_ccnc_mdps(self.packer, self.CAN, CS.mdps))
 
     # LFA and HDA icons
