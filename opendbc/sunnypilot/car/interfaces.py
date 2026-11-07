@@ -111,6 +111,12 @@ def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: str
     elif hyundai_steer_feel == 3:
       CP_SP.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK.value | HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS.value
 
+    # GV70 steering takeover filter (integer units: torque, ms, deg per frame x 10); HyundaiTakeoverTorque 0 turns it off
+    CP_SP.hyundaiTakeoverTorque = int(params_dict.get("HyundaiTakeoverTorque", 150))
+    CP_SP.hyundaiTakeoverReleaseTorque = int(params_dict.get("HyundaiTakeoverReleaseTorque", 100))
+    CP_SP.hyundaiTakeoverHoldMs = int(params_dict.get("HyundaiTakeoverHold", 500))
+    CP_SP.hyundaiResumeAngleRateX10 = int(params_dict.get("HyundaiResumeAngleRate", 10))
+
   _ = CI.get_longitudinal_tuning_sp(CP, CP_SP)
 
 

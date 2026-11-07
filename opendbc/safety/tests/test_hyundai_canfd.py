@@ -1111,7 +1111,7 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
 
 class TestHyundaiCanfdCameraHandback(unittest.TestCase):
   """CAMERA_HANDBACK: the camera's 0xCB / 0xEA (MDPS) / 0x1A0 are forwarded unless openpilot owns that axis; ownership returns to the camera
-  only after a driver action (brake, cancel, main button, MADS button), never because openpilot stalled."""
+  only after a driver action (lateral: MADS button only; longitudinal: brake, cancel, main button), never because openpilot stalled."""
 
   BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING | HyundaiSafetyFlags.CCNC
   FLAG = HyundaiSafetyFlags.CAMERA_HANDBACK
@@ -1248,24 +1248,30 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.safety.set_timer(100 * self.S)
     self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
 
-  def test_brake_hands_back(self):
+  def _lfa_button(self):
+    self.safety.set_mads_button_press(1)
+
+  def test_brake_hands_back_longitudinal_only(self):
     self._init()
     self._engage_lat()
     self._engage_long()
     self._brake(1)
     self.assertFalse(self.safety.get_controls_allowed())
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
-    # openpilot's trailing frames are dropped, never interleaved with the camera's
-    self.assertFalse(self._cb(False) or self._mdps() or self._scc(0))
+    self.assertTrue(self._scc_fwd())
+    # steering stays with openpilot: a brake edge is not an explicit steering disable, and its trailing frames keep flowing
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+    self.assertTrue(self._cb(False) and self._mdps())
+    self.assertFalse(self._scc(0))  # the camera owns longitudinal again
 
-  def test_cancel_hands_back(self):
+  def test_cancel_hands_back_longitudinal_only(self):
     self._init()
     self._engage_lat()
     self._engage_long()
     self._button(self.CANCEL)
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
-  def test_main_button_off_hands_back(self):
+  def test_main_button_off_hands_back_longitudinal_only(self):
     self._init()
     self._button(main=1)  # Driving Assist press: main on, controls allowed
     self.assertTrue(self.safety.get_controls_allowed())
@@ -1274,7 +1280,20 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertFalse(self._cb_fwd() or self._scc_fwd())
     self._button(main=1)  # second press: main off
     self.assertFalse(self.safety.get_controls_allowed())
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+
+  def test_lfa_button_hands_lateral_back_after_brake(self):
+    self._init()
+    self._engage_lat()
+    self._engage_long()
+    self._brake(1)
+    self._brake(0)
+    self.assertFalse(self._cb_fwd())
+    self._lfa_button()
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
+
 
   def test_mads_button_then_permission_loss_hands_lateral_back(self):
     self._init()
@@ -1293,35 +1312,45 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.safety.set_controls_allowed(False)  # permission lost with no driver action (heartbeat mismatch / lag / stalled openpilot)
     self.safety.set_timer(30 * self.S)
     self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
-    self._brake(1)  # the next driver action releases both axes
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd() and self._scc_fwd())
+    self._brake(1)  # the next brake releases longitudinal only
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+    self._lfa_button()  # explicit steering disable releases lateral
+    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
 
   def test_stale_driver_action_does_not_hand_back(self):
     self._init()
     self.safety.set_controls_allowed_lateral(True)
     self.assertTrue(self._cb(True))
-    self._brake(1)  # brake tap while MADS keeps steering
-    self._brake(0)
+    self._lfa_button()  # old LFA press
+    self.safety.set_mads_button_press(0)
     self.assertFalse(self._cb_fwd())
     self.safety.set_timer(30 * self.S)
     self.safety.set_controls_allowed_lateral(False)
     self.assertFalse(self._cb_fwd())
-    self._button(self.CANCEL)
+    self._button(self.CANCEL)  # cancel never hands steering back
+    self.assertFalse(self._cb_fwd())
+    self._lfa_button()
     self.assertTrue(self._cb_fwd())
 
-  def test_recent_driver_action_before_permission_loss(self):
-    self._init()
-    self._engage_lat()
-    self._button(self.CANCEL)  # cancel also drops controls: hands back at once
-    self.assertTrue(self._cb_fwd())
+  def test_recent_lfa_button_before_permission_loss(self):
     self._init()
     self.safety.set_controls_allowed_lateral(True)
     self.assertTrue(self._cb(True))
-    self._brake(1)  # MADS continues through the brake (no pause)
+    self._lfa_button()  # MADS continues until the heartbeat mismatch drops the permission
     self.assertFalse(self._cb_fwd())
     self.safety.set_timer(4 * self.S)
     self.safety.set_controls_allowed_lateral(False)
     self.assertTrue(self._cb_fwd())
+
+  def test_brake_while_steering_never_hands_lateral_back(self):
+    self._init()
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._cb(True))
+    self._brake(1)  # MADS continues through the brake, also when the permission is lost soon after
+    self.safety.set_timer(4 * self.S)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertFalse(self._cb_fwd())
 
   def test_reengage_after_handback(self):
     self._init()
@@ -1329,10 +1358,15 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self._engage_long()
     self._brake(1)
     self._brake(0)
+    self.assertTrue(self._scc_fwd())
+    self._lfa_button()
+    self.safety.set_controls_allowed_lateral(False)
     self.assertTrue(self._cb_fwd())
+    self.safety.set_mads_button_press(0)
     self._engage_lat()
     self._engage_long()
     self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
+
 
   def test_init_resets_ownership(self):
     self._init()

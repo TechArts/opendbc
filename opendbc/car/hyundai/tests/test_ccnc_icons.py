@@ -157,6 +157,13 @@ class TestDashStates(unittest.TestCase):
   def test_lateral_pause_is_gray_and_does_not_touch_cruise(self):
     self.assertEqual(self._states(enabled=True, long_active=True, mads_enabled=True), (ICON_PAUSED, ICON_ACTIVE))
 
+  def test_takeover_pause_is_gray_and_fault_is_off(self):
+    self.cc.takeover.paused = True
+    self.assertEqual(self._states(enabled=True, lat_active=True, long_active=True, mads_enabled=True), (ICON_PAUSED, ICON_ACTIVE))
+    self.assertEqual(self._states(enabled=True, long_active=True, mads_enabled=True, steer_fault=True)[0], ICON_OFF)  # not latActive
+    self.cc.takeover.paused = False
+    self.assertEqual(self._states(enabled=True, lat_active=True, long_active=True, mads_enabled=True)[0], ICON_ACTIVE)
+
   def test_gas_override_is_gray_cruise_only(self):
     self.assertEqual(self._states(enabled=True, lat_active=True, mads_enabled=True), (ICON_ACTIVE, ICON_PAUSED))
 
