@@ -1015,16 +1015,46 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self._brake(1)
     self.assertFalse(self.safety.get_controls_allowed())
 
-  def test_set_resume_unchanged(self):
+  def test_set_resume_without_flag_unchanged(self):
     for btn in (self.SET, self.RESUME):
       with self.subTest(btn=btn):
-        for param in (self.BASE | self.FLAG, self.BASE):
-          self._init(param)
-          self._button(btn)
-          self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
-          self._button(0)
-          self.assertTrue(self.safety.get_controls_allowed())
-          self.assertFalse(self.safety.get_acc_main_on())
+        self._init(self.BASE)
+        self._button(btn)
+        self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
+        self._button(0)
+        self.assertTrue(self.safety.get_controls_allowed())
+        self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_set_resume_with_main_off_does_not_arm(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init()
+        self._button(btn)
+        self._button(0)
+        self.assertFalse(self.safety.get_acc_main_on())
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_set_resume_with_main_on_arms(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init()
+        self._press_main()
+        self._button(self.CANCEL)  # main stays on, controls off
+        self._button(0)
+        self.assertTrue(self.safety.get_acc_main_on())
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._button(btn)
+        self._button(0)
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_set_after_main_off_does_not_rearm(self):
+    self._init()
+    self._press_main()  # engage
+    self._press_main()  # main off
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(self.SET)
+    self._button(0)
+    self.assertFalse(self.safety.get_controls_allowed())
 
   def test_init_resets_flag(self):
     self._init()
