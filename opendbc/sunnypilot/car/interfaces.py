@@ -101,6 +101,13 @@ def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: str
     if hyundai_longitudinal_tuning == LongitudinalTuningType.PREDICTIVE:
       CP_SP.flags |= HyundaiFlagsSP.LONG_TUNING_PREDICTIVE.value
 
+    # GV70 LFA_ALT steering feel (experimental): 0 generic curve, 1 halfway to stock, 2 stock camera curve
+    hyundai_steer_feel = int(params_dict.get("HyundaiSteerFeel", 0))
+    if hyundai_steer_feel == 1:
+      CP_SP.flags |= HyundaiFlagsSP.STEER_FEEL_HALFWAY.value
+    elif hyundai_steer_feel == 2:
+      CP_SP.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK.value
+
   _ = CI.get_longitudinal_tuning_sp(CP, CP_SP)
 
 

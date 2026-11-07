@@ -18,6 +18,7 @@ from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagemen
 from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
 from opendbc.sunnypilot.car.hyundai.mads import MadsCarController
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -39,13 +40,23 @@ def get_baseline_safety_cp():
 
 # GV70 CCNC LFA_ALT: the stock camera's own 0xCB gain vs driver torque, bin medians (placed at bin midpoints) from route 00000002
 # above 5 m/s; the stock LFA is barely active below that, so low speeds keep the generic curve. The generic curve held 3-6x more gain
-# against the driver.
+# against the driver. Experimental, chosen per drive with the HyundaiSteerFeel param (0 generic, 1 halfway, 2 stock).
 LFA_ALT_GAIN_TORQUE_BP = [25, 75, 125, 175, 250, 400]
 LFA_ALT_GAIN_V = [0.85, 0.55, 0.25, 0.15, 0.10, 0.07]
 LFA_ALT_GAIN_SPEED_BP = [4, 6]  # m/s: blend from the generic curve to the stock-matched one
 
 
-def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, lfa_alt=False):
+def steer_feel_blend(CP, CP_SP) -> float:
+  if CP.carFingerprint != CAR.GENESIS_GV70_2ND_GEN or not CP.flags & HyundaiFlags.SEND_LFA:
+    return 0.0
+  if CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_STOCK:
+    return 1.0
+  if CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_HALFWAY:
+    return 0.5
+  return 0.0
+
+
+def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0):
   if lat_active:
     ceiling = np.interp(v_ego, [0.5, 1.5], [1.0, 0.85])
     shelf = np.interp(v_ego, [2, 11], [0.45, 0.6])
@@ -55,10 +66,10 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain,
     bp3 = np.interp(v_ego, [2, 11], [175, 275])
     bp4 = np.interp(v_ego, [2, 22], [400, 700])
     target = np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor])
-    if lfa_alt:
-      stock = np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, LFA_ALT_GAIN_V)
-      w = np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0])
-      target = (1.0 - w) * target + w * min(stock, ceiling)
+    if stock_blend > 0.0:
+      stock = min(np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, LFA_ALT_GAIN_V), ceiling)
+      w = stock_blend * np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0])
+      target = (1.0 - w) * target + w * stock
 
   else:
     target = 0.0
@@ -135,6 +146,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     # camera hand-back (GV70 CCNC LFA_ALT): send an axis only while openpilot owns it, see handback.py
     self.handback = bool(CP.safetyConfigs and CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK)
+    self.steer_feel_blend = steer_feel_blend(CP, CP_SP)
     self.lat_owner, self.long_owner = AxisOwner(), AxisOwner()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
@@ -174,8 +186,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
                                                   self.params, self.BASELINE_VM)
 
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last,
-                                                   lfa_alt=self.CP.carFingerprint == CAR.GENESIS_GV70_2ND_GEN and
-                                                   bool(self.CP.flags & HyundaiFlags.SEND_LFA))
+                                                   self.steer_feel_blend)
       apply_steer_req = CC.latActive and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
