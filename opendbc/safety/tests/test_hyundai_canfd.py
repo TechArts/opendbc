@@ -908,7 +908,8 @@ class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
 
 
 class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
-  """CCNC LFA_ALT camera-SCC longitudinal: a cruise main button press engages (main on) / disengages (main off) openpilot longitudinal."""
+  """CCNC LFA_ALT camera-SCC longitudinal: the camera's own MainMode_ACC (bus 2 0x1A0) is the main cruise state. Its rising edge with a main
+  button press nearby engages openpilot longitudinal, its falling edge disengages. A press the camera ignores or a camera change without a press does nothing."""
 
   # superset of the CCNC LFA_ALT long variants; read by common.test_tx_hook_on_wrong_safety_mode
   TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
@@ -927,13 +928,22 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.LONG_MAIN_CRUISE_TOGGLEABLE if toggleable else 0)
     self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
     self.safety.init_tests()
+    self.safety.set_timer(0)
+    self.cam = False
+
+  def _camera_main(self, on):
+    self.cam = on
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": int(on)}))
 
   def _button(self, buttons=0, main=0):
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
 
-  def _press_main(self, frames=3):
-    for _ in range(frames):
+  def _press_main(self, frames=3, camera=True):
+    """A main press; the camera toggles its main state on the first frame of it (unless it ignores the press)."""
+    for i in range(frames):
       self._button(main=1)
+      if i == 0 and camera:
+        self._camera_main(not self.cam)
     self._button(main=0)
 
   def _brake(self, pressed):
@@ -943,20 +953,73 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self._init()
     self._button(main=0)
     self.assertFalse(self.safety.get_controls_allowed())
-    self._button(main=1)  # rising edge, like the main toggle
+    self._button(main=1)  # a press alone does not change main: only the camera does
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._camera_main(True)
     self.assertTrue(self.safety.get_acc_main_on())
     self.assertTrue(self.safety.get_controls_allowed())
     self._button(main=0)
     self.assertTrue(self.safety.get_controls_allowed())
 
+  def test_camera_ignores_press(self):
+    self._init()
+    self._press_main(camera=False)  # e.g. brake held at low speed: the stock car does not engage either
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(100_000_000)
+    self._camera_main(True)  # much later, no press near it
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_camera_reacts_before_press_is_seen(self):
+    self._init()
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(200_000)
+    self._button(main=1)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_camera_main_without_press_does_not_arm(self):
+    self._init()
+    self._camera_main(True)
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(2_000_000)
+    self._button(main=1)  # a press long after: nothing to pair with
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_stale_press_does_not_arm(self):
+    self._init()
+    self._button(main=1)
+    self._button(main=0)
+    self.safety.set_timer(2_000_000)
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_camera_main_falling_disengages_and_keeps_lateral(self):
+    self._init()
+    self.safety.set_mads_params(True, False, False)
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed() and self.safety.get_controls_allowed_lateral())
+    self._camera_main(False)  # also without a press (e.g. the car switched ACC off)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_does_not_toggle_by_press_alone(self):
+    self._init()
+    self._press_main(camera=False)
+    self._press_main(camera=False)
+    self.assertFalse(self.safety.get_acc_main_on())
+
   def test_second_main_press_disengages(self):
     self._init()
     self._press_main()
     self.assertTrue(self.safety.get_controls_allowed())
-    self._button(main=1)
+    self._press_main()  # camera: main off
     self.assertFalse(self.safety.get_acc_main_on())
-    self.assertFalse(self.safety.get_controls_allowed())
-    self._button(main=0)
     self.assertFalse(self.safety.get_controls_allowed())
     self._press_main()  # and again: engage
     self.assertTrue(self.safety.get_controls_allowed())
@@ -990,10 +1053,10 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
         self._press_main()
         self.assertFalse(self.safety.get_controls_allowed())
 
-  def test_requires_main_toggleable(self):
-    self._init(toggleable=False)
+  def test_toggleable_flag_irrelevant(self):
+    self._init(toggleable=False)  # the camera, not a toggled flag, is the main state
     self._press_main()
-    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed())
 
   def test_cancel_still_disengages(self):
     self._init()
@@ -1033,6 +1096,10 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
         self._button(0)
         self.assertFalse(self.safety.get_acc_main_on())
         self.assertFalse(self.safety.get_controls_allowed())
+        self._press_main(camera=False)  # camera main still off after an ignored press
+        self._button(btn)
+        self._button(0)
+        self.assertFalse(self.safety.get_controls_allowed())
 
   def test_set_resume_with_main_on_arms(self):
     for btn in (self.SET, self.RESUME):
@@ -1070,8 +1137,7 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
 
   def test_main_off_keeps_lateral_with_flag(self):
     self._lateral_on()
-    self._button(main=1)  # second press: main off ends cruise only
-    self._button(main=0)
+    self._press_main()  # second press: main off ends cruise only
     self.assertFalse(self.safety.get_acc_main_on())
     self.assertFalse(self.safety.get_controls_allowed())
     self.assertTrue(self.safety.get_controls_allowed_lateral())
@@ -1151,6 +1217,9 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
 
   def _brake(self, pressed):
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
+
+  def _camera_main(self, on):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": on}))
 
   # forwarded (camera frame reaches the car / the camera) vs blocked
   def _cb_fwd(self):
@@ -1273,12 +1342,14 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
 
   def test_main_button_off_hands_back_longitudinal_only(self):
     self._init()
-    self._button(main=1)  # Driving Assist press: main on, controls allowed
+    self._button(main=1)  # Driving Assist press, the camera turns main on: controls allowed
+    self._camera_main(1)
     self.assertTrue(self.safety.get_controls_allowed())
     self.assertTrue(self._cb(True) and self._scc(1))
     self._button(main=0)
     self.assertFalse(self._cb_fwd() or self._scc_fwd())
-    self._button(main=1)  # second press: main off
+    self._button(main=1)  # second press: the camera turns main off
+    self._camera_main(0)
     self.assertFalse(self.safety.get_controls_allowed())
     self.assertTrue(self._scc_fwd())
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
