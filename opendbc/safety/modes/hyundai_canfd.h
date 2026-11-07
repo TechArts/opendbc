@@ -157,6 +157,9 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   hyundai_common_reset_acc_main_on_mismatches();
 }
 
+// CCNC LFA_ALT: the camera needs MDPS (0xEA) at all times, so pass the real one until openpilot sends its own copy
+static bool hyundai_canfd_ccnc_mdps_tx = false;
+
 static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   const TorqueSteeringLimits HYUNDAI_CANFD_TORQUE_STEERING_LIMITS = {
     .max_torque = 270,
@@ -218,6 +221,10 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 
 
   bool tx = true;
+
+  if ((msg->addr == 0xEAU) && (msg->bus == 2U)) {
+    hyundai_canfd_ccnc_mdps_tx = true;
+  }
 
   // HDA1 steering
   if ((msg->addr == 0xCBU) && hyundai_canfd_angle_steering) {
@@ -315,6 +322,11 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
+static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
+  // block the car's MDPS toward the camera only once openpilot sends its own copy (only allowed on the CCNC LFA_ALT list)
+  return (bus_num == 0) && (addr == 0xEA) && hyundai_canfd_ccnc_mdps_tx;
+}
+
 static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT = 128;
   const uint16_t HYUNDAI_PARAM_CANFD_ALT_BUTTONS = 32;
@@ -386,8 +398,10 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     {0x161, 0, 32, .check_relay = true}, /* CCNC_0x161 */ \
     {0x162, 0, 32, .check_relay = true}, /* CCNC_0x162 */ \
     {0x7C4, 2, 8, .check_relay = true}, /* 0x7C4 */ \
+    {0xEA, 2, 24, .check_relay = true, .disable_static_blocking = true}, /* MDPS copy to the camera */ \
 
   hyundai_common_init(param);
+  hyundai_canfd_ccnc_mdps_tx = false;
 
   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
@@ -536,6 +550,7 @@ const safety_hooks hyundai_canfd_hooks = {
   .init = hyundai_canfd_init,
   .rx = hyundai_canfd_rx_hook,
   .tx = hyundai_canfd_tx_hook,
+  .fwd = hyundai_canfd_fwd_hook,
   .get_counter = hyundai_canfd_get_counter,
   .get_checksum = hyundai_canfd_get_checksum,
   .compute_checksum = hyundai_common_canfd_compute_checksum,

@@ -154,6 +154,11 @@ def create_lfahda_cluster(packer, CAN, enabled, lfa_icon):
   return packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values)
 
 
+def create_ccnc_mdps(packer, CAN, mdps):
+  # report LKA torque inactive/unavailable so the camera's own LFA stays in standby (from sunnypilot ccnc-port-sp)
+  return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_LkaToiActvSta": 0, "MDPS_LkaToiUnblSta": 1})
+
+
 def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
                 is_metric, out, main_cruise_enabled, lfa_icon):
   if msg_161["ALERTS_2"] == 5:

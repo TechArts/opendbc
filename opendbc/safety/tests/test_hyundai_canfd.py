@@ -740,7 +740,7 @@ class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
   """HDA1 angle steering through LFA_ALT (0xCB) only: the camera keeps 0x12A (status/warnings, no actuation)."""
 
   # CCNC variant (superset); read by common.test_tx_hook_on_wrong_safety_mode
-  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2]]
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
 
   BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC
   FLAG = HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING
@@ -779,6 +779,26 @@ class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
   def test_without_flag_unchanged(self):
     self._init(self.BASE | HyundaiSafetyFlags.CCNC)
     self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x12A))
+
+  def test_ccnc_mdps_copy_replaces_real_mdps(self):
+    self._init(self.BASE | HyundaiSafetyFlags.CCNC | self.FLAG)
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))  # real MDPS reaches the camera until openpilot sends a copy
+    self.assertTrue(self._tx(0xEA, 2, 24))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0xEA))  # then only openpilot's copy
+    self._init(self.BASE | HyundaiSafetyFlags.CCNC | self.FLAG)
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))  # init resets
+
+  def test_mdps_copy_not_allowed_elsewhere(self):
+    for param in (self.BASE | self.FLAG, self.BASE | HyundaiSafetyFlags.CCNC):
+      with self.subTest(param=int(param)):
+        self._init(param)
+        self.assertFalse(self._tx(0xEA, 2, 24))
+        self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+
+  def test_relay_malfunction_on_camera_mdps(self):
+    self._init(self.BASE | HyundaiSafetyFlags.CCNC | self.FLAG)
+    self._rx(0xEA, 2, 24)
+    self.assertTrue(self.safety.get_relay_malfunction())
 
 
 
