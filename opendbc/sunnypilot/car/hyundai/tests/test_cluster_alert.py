@@ -80,10 +80,24 @@ class TestCcncClusterAlert(unittest.TestCase):
       for k, v in FAULT_VALUES.items():
         self.assertEqual(out_161[k], v)
 
-  def test_existing_suppression_frees_target_field(self):
-    # with openpilot long the stock ALERTS_3 == 1 (set speed adjusting) is stripped, so our cue may use the field
-    out_161, _ = run_ccnc(*stock_frames(ALERTS_3=1), ClusterAlert.red, long_control=True)
-    self.assertEqual(out_161["ALERTS_3"], 18)
+  def test_stock_target_field_never_overwritten_in_long_and_non_long(self):
+    # ALERTS_3 1-4/7-10, ALERTS_5 == 4 and SOUNDS_3 == 5 are zeroed by sunnypilot in long mode; the stock frame still counts as an alert
+    cases = [(ClusterAlert.red, {"ALERTS_3": 1}), (ClusterAlert.red, {"ALERTS_3": 9}), (ClusterAlert.red, {"SOUNDS_3": 5}),
+             (ClusterAlert.green, {"ALERTS_5": 4}), (ClusterAlert.red, {"ALERTS_3": 20}),
+             (ClusterAlert.green, {"ALERTS_5": 12})]
+    for long_control in (False, True):
+      for alert, overrides in cases:
+        out_161, out_162 = run_ccnc(*stock_frames(**overrides), alert, long_control=long_control)
+        field, our_value = ("ALERTS_3", 18) if alert == ClusterAlert.red else ("ALERTS_5", 11)
+        self.assertNotEqual(out_161[field], our_value, (long_control, alert, overrides))
+        self.assertEqual(out_162["VIBRATE"], 0, (long_control, alert, overrides))
+        if not long_control:
+          for k, v in overrides.items():
+            self.assertEqual(out_161[k], v)
+
+  def test_long_mode_sets_cue_when_stock_frame_is_clear(self):
+    out_161, out_162 = run_ccnc(*stock_frames(), ClusterAlert.green, long_control=True)
+    self.assertEqual((out_161["ALERTS_5"], out_161["SOUNDS_2"], out_162["VIBRATE"]), (11, 2, 1))
 
   def test_values_survive_dbc_packing(self):
     packer = CANPacker(DBC)

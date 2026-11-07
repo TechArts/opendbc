@@ -168,15 +168,16 @@ CCNC_CLUSTER_ALERTS = {
 }
 
 
-def apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert):
-  """Put our red/green-light cue on the cluster. A stock car alert always wins: nothing is written if the camera's own ALERTS_1
-  is set, a collision ALERTS_2 is showing, or the target text/chime field is already in use. Returns True if the cue was written."""
+def apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert, stock_161):
+  """Put our red/green-light cue on the cluster. A stock car alert always wins: stock_161 is the camera's ORIGINAL frame (before any
+  sunnypilot suppression); nothing is written if its ALERTS_1 is set, a collision ALERTS_2 is showing, or the target text/chime field
+  is in use. Returns True if the cue was written."""
   if cluster_alert not in CCNC_CLUSTER_ALERTS:
     return False
   alert_field, alert, sound_field, sound = CCNC_CLUSTER_ALERTS[cluster_alert]
-  if msg_161["ALERTS_1"] != 0 or msg_161["ALERTS_2"] in CCNC_COLLISION_ALERTS_2:
+  if stock_161["ALERTS_1"] != 0 or stock_161["ALERTS_2"] in CCNC_COLLISION_ALERTS_2:
     return False
-  if msg_161[alert_field] != 0 or msg_161[sound_field] != 0:
+  if stock_161[alert_field] != 0 or stock_161[sound_field] != 0:
     return False
   msg_161.update({alert_field: alert, sound_field: sound})
   msg_162["VIBRATE"] = 1
@@ -185,6 +186,7 @@ def apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert):
 
 def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
                 is_metric, out, main_cruise_enabled, lfa_icon, cluster_alert=None):
+  stock_161 = dict(msg_161)
   if msg_161["ALERTS_2"] == 5:
     msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
   if msg_161["ALERTS_3"] == 17:
@@ -276,8 +278,8 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBli
     msg_162["LEAD"] = 0 if not main_cruise_enabled else 2 if enabled else 1
     msg_162["LEAD_DISTANCE"] = msg_1b5["Longitudinal_Distance"]
 
-  # last, after the stock-alert suppressions above, so a suppressed stock alert does not block ours but a live one does
-  apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert)
+  # last, after the suppressions above, but decided on the camera's original frame so any stock warning wins
+  apply_ccnc_cluster_alert(msg_161, msg_162, cluster_alert, stock_161)
 
   return [packer.make_can_msg(msg, CAN.ECAN, data) for msg, data in [("CCNC_0x161", msg_161), ("CCNC_0x162", msg_162)]]
 
