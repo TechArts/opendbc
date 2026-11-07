@@ -17,6 +17,7 @@ ButtonState mads_button_press = MADS_BUTTON_UNAVAILABLE;
 MADSState m_mads_state;
 
 bool controls_allowed_lateral = false;
+bool mads_main_off_keeps_lateral = false;  // set by the brand mode init, not reset by the MADS state
 
 // state for mads controls_allowed_lateral timeout logic
 bool heartbeat_engaged_mads = false;  // MADS enabled, passed in heartbeat USB command
@@ -91,7 +92,8 @@ inline void m_update_control_state(void) {
   }
 
   // Primary control blockers - these prevent any further control processing
-  if (m_mads_state.acc_main.transition == MADS_EDGE_FALLING) {
+  // brands where the main button is only the cruise engage/disengage button keep lateral on main off
+  if ((m_mads_state.acc_main.transition == MADS_EDGE_FALLING) && !mads_main_off_keeps_lateral) {
     mads_exit_controls(MADS_DISENGAGE_REASON_ACC_MAIN_OFF);
     allowed = false;  // No matter what, no further control processing on this cycle
   }
