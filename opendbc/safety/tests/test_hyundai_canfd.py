@@ -1062,6 +1062,52 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self._press_main()
     self.assertFalse(self.safety.get_controls_allowed())
 
+  def _lateral_on(self, param=None):
+    self._init(param)
+    self.safety.set_mads_params(True, False, False)
+    self._press_main()  # main on: also requests lateral
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_off_keeps_lateral_with_flag(self):
+    self._lateral_on()
+    self._button(main=1)  # second press: main off ends cruise only
+    self._button(main=0)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_off_drops_lateral_without_flag(self):
+    self._init(self.BASE)
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._button(main=1)
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_other_lateral_exits_unchanged_with_flag(self):
+    # heartbeat mismatch (sunnypilot ended lateral, e.g. LFA button) still exits after 3 checks
+    self._lateral_on()
+    self.safety.set_heartbeat_engaged_mads(True)
+    for _ in range(5):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(3):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_flag_resets_on_init(self):
+    self._lateral_on()
+    self._init(self.BASE)
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self._button(main=1)
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
 
 class TestHyundaiCanfdCameraHandback(unittest.TestCase):
   """CAMERA_HANDBACK: the camera's 0xCB / 0xEA (MDPS) / 0x1A0 are forwarded unless openpilot owns that axis; ownership returns to the camera

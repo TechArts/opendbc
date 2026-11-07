@@ -97,6 +97,7 @@ void hyundai_common_init(uint16_t param) {
   hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
 
   hyundai_long_main_button_engage = false;
+  mads_main_off_keeps_lateral = false;
   main_button_prev = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
