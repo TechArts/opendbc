@@ -33,3 +33,4 @@ class HyundaiFlagsSP(IntFlag):
   HAS_LKAS12 = 2 ** 10
   STEER_FEEL_HALFWAY = 2 ** 11  # GV70 LFA_ALT: steering gain halfway between the generic curve and the stock camera's
   STEER_FEEL_STOCK = 2 ** 12  # GV70 LFA_ALT: steering gain follows the stock camera's curve
+  STEER_FEEL_ALL_SPEEDS = 2 ** 13  # GV70 LFA_ALT: apply the steer feel curve at every speed, not only above 6 m/s

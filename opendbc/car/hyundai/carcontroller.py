@@ -39,24 +39,27 @@ def get_baseline_safety_cp():
 
 
 # GV70 CCNC LFA_ALT: the stock camera's own 0xCB gain vs driver torque, bin medians (placed at bin midpoints) from route 00000002
-# above 5 m/s; the stock LFA is barely active below that, so low speeds keep the generic curve. The generic curve held 3-6x more gain
-# against the driver. Experimental, chosen per drive with the HyundaiSteerFeel param (0 generic, 1 halfway, 2 stock).
+# above 5 m/s. The generic curve held 3-6x more gain against the driver. Experimental, chosen per drive with the HyundaiSteerFeel
+# param (0 generic, 1 halfway, 2 stock above 6 m/s, 3 stock at every speed). Below 4 m/s there is no stock data (the stock LFA
+# is barely active there), so 1 and 2 keep the generic curve at low speed; 3 uses the stock curve there too.
 LFA_ALT_GAIN_TORQUE_BP = [25, 75, 125, 175, 250, 400]
 LFA_ALT_GAIN_V = [0.85, 0.55, 0.25, 0.15, 0.10, 0.07]
 LFA_ALT_GAIN_SPEED_BP = [4, 6]  # m/s: blend from the generic curve to the stock-matched one
 
 
-def steer_feel_blend(CP, CP_SP) -> float:
+def steer_feel_blend(CP, CP_SP) -> tuple[float, bool]:
+  """Returns (weight of the stock curve, whether it applies at every speed)."""
   if CP.carFingerprint != CAR.GENESIS_GV70_2ND_GEN or not CP.flags & HyundaiFlags.SEND_LFA:
-    return 0.0
+    return 0.0, False
+  all_speeds = bool(CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS)
   if CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_STOCK:
-    return 1.0
+    return 1.0, all_speeds
   if CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_HALFWAY:
-    return 0.5
-  return 0.0
+    return 0.5, all_speeds
+  return 0.0, False
 
 
-def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0):
+def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0, all_speeds=False):
   if lat_active:
     ceiling = np.interp(v_ego, [0.5, 1.5], [1.0, 0.85])
     shelf = np.interp(v_ego, [2, 11], [0.45, 0.6])
@@ -67,8 +70,9 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain,
     bp4 = np.interp(v_ego, [2, 22], [400, 700])
     target = np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor])
     if stock_blend > 0.0:
-      stock = min(np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, LFA_ALT_GAIN_V), ceiling)
-      w = stock_blend * np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0])
+      # first point at the ceiling, so the no-hands gain is unchanged at any speed (the ceiling is 0.85 above 1.5 m/s)
+      stock = min(np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, [ceiling, *LFA_ALT_GAIN_V[1:]]), ceiling)
+      w = stock_blend * (1.0 if all_speeds else np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0]))
       target = (1.0 - w) * target + w * stock
 
   else:
@@ -146,7 +150,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     # camera hand-back (GV70 CCNC LFA_ALT): send an axis only while openpilot owns it, see handback.py
     self.handback = bool(CP.safetyConfigs and CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK)
-    self.steer_feel_blend = steer_feel_blend(CP, CP_SP)
+    self.steer_feel_blend, self.steer_feel_all_speeds = steer_feel_blend(CP, CP_SP)
     self.lat_owner, self.long_owner = AxisOwner(), AxisOwner()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
@@ -186,7 +190,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
                                                   self.params, self.BASELINE_VM)
 
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last,
-                                                   self.steer_feel_blend)
+                                                   self.steer_feel_blend, self.steer_feel_all_speeds)
       apply_steer_req = CC.latActive and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
