@@ -221,17 +221,17 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, long_state, hud, left
   curvature = {i: (31 if i == -1 else 13 - abs(i + 15)) if i < 0 else 15 + i for i in range(-15, 16)}
 
   msg_161.update({"DAW_ICON": 0, "LKA_ICON": 0})
-  lat_active = lat_state == ICON_ACTIVE
+  lat_active, lat_off = lat_state == ICON_ACTIVE, lat_state == ICON_OFF
   if not passthrough_lat:
     # green wheel/centre line/lane lines only while openpilot steers; paused is a gray wheel with plain white lane lines
     msg_161.update({
       "LFA_ICON": lat_state,
       "CENTERLINE": 1 if lat_active else 0,
       "LANELINE_CURVATURE": curvature.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14) if lat_active and not anyBlinker else 15,
-      "LANELINE_LEFT": (0 if lat_state == ICON_OFF else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if anyBlinker and lat_active else 2),
-      "LANELINE_RIGHT": (0 if lat_state == ICON_OFF else 1 if not hud.rightLaneVisible else 4 if hud.rightLaneDepart else 6 if anyBlinker and lat_active else 2),
-      "LCA_LEFT_ICON": (0 if lat_state == ICON_OFF or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.leftBlindspot else 2 if anyBlinker else 4),
-      "LCA_RIGHT_ICON": (0 if lat_state == ICON_OFF or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.rightBlindspot else 2 if anyBlinker else 4),
+      "LANELINE_LEFT": (0 if lat_off else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if anyBlinker and lat_active else 2),
+      "LANELINE_RIGHT": (0 if lat_off else 1 if not hud.rightLaneVisible else 4 if hud.rightLaneDepart else 6 if anyBlinker and lat_active else 2),
+      "LCA_LEFT_ICON": (0 if lat_off or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.leftBlindspot else 2 if anyBlinker else 4),
+      "LCA_RIGHT_ICON": (0 if lat_off or out.vEgo < LANE_CHANGE_SPEED_MIN else 1 if out.rightBlindspot else 2 if anyBlinker else 4),
       "LCA_LEFT_ARROW": 2 if leftBlinker else 0,
       "LCA_RIGHT_ARROW": 2 if rightBlinker else 0,
     })
