@@ -675,6 +675,76 @@ class MadsSafetyTestBase(unittest.TestCase):
     self.safety.mads_heartbeat_engaged_check()
     self.assertTrue(self.safety.get_controls_allowed_lateral())
 
+  def _engage_lateral_with_button(self):
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_mads_button_press(0)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.safety.set_mads_button_press(1)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def _press_mads_button(self):
+    self.safety.set_mads_button_press(0)
+    self.safety.tick_mads_state(False, False, False, False, False)
+    self.safety.set_mads_button_press(1)
+    self.safety.tick_mads_state(False, False, False, False, False)
+
+  def test_quick_lfa_off_on_keeps_lateral(self):
+    """Route 2b 16:08: LFA off, then on again 2.4 s later. The off's mismatch count was at 2 when the on press came and the
+    3rd 1 Hz check ran 0.06 s after it, before the device heartbeat reported the re-enable: the panda dropped lateral while
+    openpilot was enabled. The press restarts the count, and the heartbeat catching up keeps lateral allowed."""
+    self._engage_lateral_with_button()
+
+    self.safety.set_heartbeat_engaged_mads(False)  # driver turned steering off on the device
+    for _ in range(2):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+    self._press_mads_button()  # driver turns it on again; the heartbeat has not caught up
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral(), "check right after the re-enable press must not drop lateral")
+
+    self.safety.set_heartbeat_engaged_mads(True)
+    for _ in range(5):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_lfa_on_off_on_keeps_lateral(self):
+    """on -> off -> on within the heartbeat window ends with lateral allowed and the device enabled."""
+    self._engage_lateral_with_button()
+    self.safety.set_heartbeat_engaged_mads(False)
+    self.safety.mads_heartbeat_engaged_check()
+    self.safety.mads_heartbeat_engaged_check()
+    self._press_mads_button()
+    self.safety.set_heartbeat_engaged_mads(True)
+    self.safety.mads_heartbeat_engaged_check()
+    self.safety.set_heartbeat_engaged_mads(False)  # off again
+    self.safety.mads_heartbeat_engaged_check()
+    self.safety.mads_heartbeat_engaged_check()
+    self._press_mads_button()  # on again
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.set_heartbeat_engaged_mads(True)
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_lfa_off_still_drops_lateral_without_a_new_enable(self):
+    """The press restarts the count only: a device that stays disabled still loses lateral on the 3rd check after the press,
+    and nothing re-grants it without another press."""
+    self._engage_lateral_with_button()
+    self.safety.set_heartbeat_engaged_mads(False)
+    self.safety.mads_heartbeat_engaged_check()
+    self._press_mads_button()  # the press that turned it off on the device
+    for _ in range(2):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    for _ in range(5):
+      self.safety.tick_mads_state(False, False, False, False, False)
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
   def test_alt_exp_bit_discrimination(self):
     self.safety.mads_apply_alternative_experience(1)
     self.assertFalse(self.safety.get_enable_mads())

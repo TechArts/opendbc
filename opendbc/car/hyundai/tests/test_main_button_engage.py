@@ -4,7 +4,7 @@ from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.values import CAR, HyundaiSafetyFlags
+from opendbc.car.hyundai.values import CAR, HyundaiFlags, HyundaiSafetyFlags
 
 ButtonType = structs.CarState.ButtonEvent.Type
 FLAG = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
@@ -67,3 +67,32 @@ class TestMainButtonEngage(unittest.TestCase):
     cs.main_available = False  # SET/RES with main off never enables
     for btn in (ButtonType.accelCruise, ButtonType.decelCruise):
       assert not cs.update_button_enable([structs.CarState.ButtonEvent(type=btn, pressed=False)])
+
+
+class TestStockAccEngaged(unittest.TestCase):
+  """CarStateSP.stockAccEngaged: the camera's ACCMode (bus 2 SCC_CONTROL), the stock ACC that openpilot does not control."""
+
+  def _update(self, alpha_long, acc_mode, main_mode=1):
+    from opendbc.can.packer import CANPacker
+    from opendbc.car import Bus
+    from opendbc.car.hyundai.values import DBC
+    cp = _cp(CAR.GENESIS_GV70_2ND_GEN, alpha_long)
+    cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
+    cs = CarState(cp, cp_sp)
+    parsers = cs.get_can_parsers(cp, cp_sp)
+    packer = CANPacker(DBC[CAR.GENESIS_GV70_2ND_GEN][Bus.pt])
+    can = CanBus(cp)
+    camera_scc = bool(cp.flags & HyundaiFlags.CANFD_CAMERA_SCC)
+    assert camera_scc
+    msg = packer.make_can_msg("SCC_CONTROL", can.CAM, {"ACCMode": acc_mode, "MainMode_ACC": main_mode})
+    for i in range(3):
+      parsers[Bus.cam].update([((i + 1) * 10_000_000, [msg])])
+      _, ret_sp = cs.update(parsers)
+    return ret_sp
+
+  def test_camera_acc_modes(self):
+    for acc_mode, expected in ((0, False), (1, True), (2, True), (3, False)):
+      assert self._update(True, acc_mode).stockAccEngaged == expected, acc_mode
+
+  def test_off_without_the_camera_main_gate(self):
+    assert not self._update(False, 1).stockAccEngaged
