@@ -73,6 +73,14 @@ class TestTakeoverFilter(unittest.TestCase):
     self.assertFalse(run(f, 1, torque=300, active=False)[0])
     self.assertFalse(f.paused or f.resuming)
 
+  def test_any_lateral_resume_blends_in(self):
+    # e.g. the end of a blinker pause at low speed: the request starts at the wheel and moves at most 1 deg per frame
+    f = make()
+    run(f, 20, active=False)
+    f.update(0.0, False, False, 3.0, 20.0, 60.0, True)
+    self.assertTrue(f.resuming)
+    self.assertEqual(f.limit(60.0, 20.0, 20.0, 3.0), 21.0)
+
   def test_resume_ramp_and_convergence(self):
     f = make()
     run(f, 10, torque=300)

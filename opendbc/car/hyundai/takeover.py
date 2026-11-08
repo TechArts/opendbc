@@ -35,6 +35,7 @@ class TakeoverFilter:
     self.resume_frames = 0
     self.fault_frames = 0
     self.bind_frames = 0
+    self.lat_active_last = False
 
   @property
   def enabled(self) -> bool:
@@ -57,7 +58,13 @@ class TakeoverFilter:
     self.fault_frames = FAULT_FRAMES if fault else max(0, self.fault_frames - 1)
     if not lat_active:
       self._reset()
+      self.lat_active_last = False
       return False
+    if not self.lat_active_last:
+      # lateral just came back (engage, blinker pause, MADS pause, fault): blend in like after a takeover, never snap to the model
+      self.resuming = True
+      self.resume_frames = RESUME_FRAMES
+    self.lat_active_last = True
 
     binds = self.guard_active(angle, v_ego) and (abs(desired - angle) > GUARD_MAX_ERROR or abs(desired) > GUARD_MAX_ANGLE)
     self.bind_frames = self.bind_frames + 1 if binds else 0
