@@ -373,6 +373,9 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       self.main_button_enable = self.update_camera_main(camera_main, main_pressed)
       self.main_cruise_enabled = self.camera_main
       ret.cruiseState.available = self.camera_main
+      # the camera's own ACC engagement (ACCMode on SCC_CONTROL, readable although the panda blocks it): lets sunnypilot
+      # tell the driver when the car's cruise is driving and openpilot longitudinal is not
+      ret_sp.stockAccEngaged = bool(cp_scc.ts_nanos["SCC_CONTROL"]["ACCMode"] and cp_scc.vl["SCC_CONTROL"]["ACCMode"] in (1, 2))
     else:
       if self.CP.openpilotLongitudinalControl:
         ret.cruiseState.available = self.get_main_cruise(ret)
