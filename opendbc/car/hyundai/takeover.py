@@ -30,8 +30,6 @@ OPPOSE_RELEASE = 100  # opposing torque (curve sign) that blocks the release and
 ALONG_BASE = 300  # beyond-push clause: along-turn torque >= ALONG_BASE + ALONG_PER_A * a ...
 ALONG_PER_A = 150
 BEYOND_DEG = 3.0  # ... and the wheel at least this far past the model's angle in the push direction
-RELEASE_ALONG_BASE = 150  # curve release: along-turn torque < RELEASE_ALONG_BASE + RELEASE_ALONG_PER_A * a
-RELEASE_ALONG_PER_A = 130
 
 
 class TakeoverFilter:
@@ -88,7 +86,7 @@ class TakeoverFilter:
     binds = self.guard_active(angle, v_ego) and (abs(desired - angle) > GUARD_MAX_ERROR or abs(desired) > GUARD_MAX_ANGLE)
     self.bind_frames = self.bind_frames + 1 if binds else 0
 
-    turn, load = 0, 0.0
+    turn, load, beyond = 0, 0.0, False
     self.hold_load, self.opposing = 0.0, False
     if self.curve_hold:
       self.hold_load = v_ego * v_ego * abs(desired) * self.k
@@ -102,7 +100,8 @@ class TakeoverFilter:
       grab = abs(torque) >= self.enter_torque
       press = pressed
     else:
-      grab = along <= -self.enter_torque or (along >= ALONG_BASE + ALONG_PER_A * load and (angle - desired) * turn >= BEYOND_DEG)
+      beyond = along >= ALONG_BASE + ALONG_PER_A * load and (angle - desired) * turn >= BEYOND_DEG
+      grab = along <= -self.enter_torque or beyond
       press = pressed and along < 0  # steeringPressed from along-turn torque is the driver holding the curve
     self.grab_frames = self.grab_frames + 1 if grab else 0
 
@@ -115,7 +114,7 @@ class TakeoverFilter:
       if turn == 0:
         calm = abs(torque) < self.release_torque and not pressed
       else:
-        calm = -self.release_torque < along < RELEASE_ALONG_BASE + RELEASE_ALONG_PER_A * load and not press
+        calm = along > -self.release_torque and not beyond  # however hard the hand holds along the turn (data: 270-490 at 0.5-2 m/s^2)
       self.release_frames = self.release_frames + 1 if calm else 0
       if self.release_frames >= self.hold_frames and self.fault_frames == 0 and not binds:
         self.paused = False

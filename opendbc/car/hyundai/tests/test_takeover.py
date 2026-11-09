@@ -257,24 +257,28 @@ class TestCurveTakeover(unittest.TestCase):
     self.assertFalse(any(self.curve(make_curve(), 50, 700, angle=13.5, desired=17.0)))  # wheel short of the model, not past it
 
   def test_curve_release_while_holding_along_the_turn(self):
+    # latched pause at a = 1.75 (v 15, 19.5 deg) with 490 along-turn torque, the hand holds the curve: ends after the hold time, also pressed
     f = make_curve()
-    self.curve(f, 10, -300)  # opposing grab
+    self.curve(f, 10, -300, angle=19.5, desired=19.5)  # opposing grab
     self.assertTrue(f.paused)
-    # along 200 < 150 + 130 * 1.53 = 349: ends the pause after the hold time, also with steeringPressed from along-turn torque
-    paused = self.curve(f, 49, 200, pressed=True)
-    self.assertTrue(all(paused))
-    self.assertFalse(self.curve(f, 1, 200, pressed=True)[-1])
+    self.assertTrue(all(self.curve(f, 49, 490, pressed=True, angle=19.5, desired=19.5)))
+    self.assertFalse(self.curve(f, 1, 490, pressed=True, angle=19.5, desired=19.5)[-1])
     self.assertTrue(f.resuming)
 
-  def test_curve_release_blocked_by_opposing_or_too_hard_along(self):
+  def test_curve_release_blocked_by_opposing(self):
     f = make_curve()
     self.curve(f, 10, -300)
     self.assertTrue(all(self.curve(f, 200, -120)))
-    self.assertTrue(all(self.curve(f, 200, 450)))  # above 349
     self.assertTrue(all(self.curve(f, 49, 0)))
     self.curve(f, 1, -120)  # restarts the hold
     self.assertTrue(all(self.curve(f, 49, 0)))
     self.assertFalse(self.curve(f, 1, 0)[-1])
+
+  def test_curve_release_blocked_by_beyond_push(self):
+    f = make_curve()
+    self.curve(f, 10, -300)
+    self.assertTrue(all(self.curve(f, 200, 700, angle=20.5, desired=17.0)))  # along >= 530 and wheel 3.5 deg past the model
+    self.assertFalse(self.curve(f, 50, 700, angle=17.0, desired=17.0)[-1])  # wheel back on the model: releases
 
   def test_exposes_load_and_opposing_for_the_gain(self):
     f = make_curve()
