@@ -58,6 +58,13 @@ class TakeoverFilter:
   def enabled(self) -> bool:
     return self.enter_torque > 0
 
+  @property
+  def hold_state(self) -> tuple[float, bool, bool] | None:
+    """Input of the curve-hold gain floor: (lateral demand, hand opposes the turn, paused or resuming); None unless curve hold applies."""
+    if not (self.curve_hold and self.enabled):
+      return None
+    return self.hold_load, self.opposing, self.paused or self.resuming
+
   def _reset(self):
     self.paused = False
     self.resuming = False
