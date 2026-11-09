@@ -5,7 +5,8 @@ from opendbc.can import CANParser
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.hyundai import hyundaicanfd
 from opendbc.car.hyundai.carcontroller import CarController
-from opendbc.car.hyundai.carstate import CarState, MAIN_PRESS_FRAMES
+from opendbc.car.hyundai.camera_main import MAIN_PRESS_FRAMES
+from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import CanBus, ICON_OFF, ICON_PAUSED, ICON_ACTIVE
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR, DBC
@@ -237,7 +238,7 @@ class TestCameraMain(unittest.TestCase):
   def _step(self, camera_main, pressed=False, frames=1):
     out = False
     for _ in range(frames):
-      out = self.cs.update_camera_main(camera_main, pressed)
+      out = self.cs.camera_main.update(camera_main, pressed)
     return out
 
   def test_press_then_camera_rises_engages(self):
@@ -257,11 +258,11 @@ class TestCameraMain(unittest.TestCase):
   def test_camera_ignores_press(self):
     self._step(False, pressed=True)
     self.assertFalse(self._step(False, frames=5 * MAIN_PRESS_FRAMES))
-    self.assertFalse(self.cs.camera_main)
+    self.assertFalse(self.cs.camera_main.on)
 
   def test_camera_main_without_press_does_not_engage(self):
     self.assertFalse(self._step(True, frames=5))
-    self.assertTrue(self.cs.camera_main)
+    self.assertTrue(self.cs.camera_main.on)
     self._step(True, frames=MAIN_PRESS_FRAMES + 5)
     self.assertFalse(self._step(True, pressed=True))  # a press long after the rise has nothing to pair with
 
@@ -273,12 +274,12 @@ class TestCameraMain(unittest.TestCase):
   def test_falling_edge_is_available_false_and_no_engage(self):
     self._step(True, pressed=True)
     self.assertFalse(self._step(False, pressed=True))
-    self.assertFalse(self.cs.camera_main)
+    self.assertFalse(self.cs.camera_main.on)
 
   def test_unknown_camera_state_keeps_last(self):
     self._step(True, pressed=True)
     self.assertFalse(self._step(None, frames=5))
-    self.assertTrue(self.cs.camera_main)
+    self.assertTrue(self.cs.camera_main.on)
 
   def test_set_res_needs_camera_main(self):
     set_release = [structs.CarState.ButtonEvent(type=ButtonType.decelCruise, pressed=False)]
