@@ -80,6 +80,85 @@ static uint32_t hyundai_canfd_get_checksum(const CANPacket_t *msg) {
   return chksum;
 }
 
+// CAMERA_HANDBACK (GV70 CCNC LFA_ALT camera SCC): the stock camera keeps control of 0xCB (LFA_ALT), 0xEA (MDPS to the camera) and, with
+// openpilot longitudinal, 0x1A0 (SCC_CONTROL) until openpilot takes an axis, and gets it back only after a driver action.
+//   stock -> openpilot: the first openpilot frame that passes the TX checks while the panda allows that axis (0xCB: active request;
+//                       0x1A0: ACCMode 1/2). From then on the camera's frame is blocked, so there is no gap and no second sender.
+//   openpilot -> stock: the panda no longer allows the axis AND the driver acted (brake press, cancel, main button, MADS button)
+//                       within HYUNDAI_CANFD_HB_ACTION_WINDOW_US of that moment (before or after). Losing the permission any other
+//                       way (heartbeat mismatch, lag, invalid rx, stalled openpilot) keeps the camera blocked until the next driver action.
+// While stock owns an axis, openpilot's frames for it are rejected, so the two never interleave.
+static bool hyundai_canfd_handback = false;
+static bool hyundai_canfd_hb_lat_op = false;
+static bool hyundai_canfd_hb_long_op = false;
+static bool hyundai_canfd_hb_lat_action = false;
+static bool hyundai_canfd_hb_long_action = false;
+static uint32_t hyundai_canfd_hb_lat_action_ts = 0U;
+static uint32_t hyundai_canfd_hb_long_action_ts = 0U;
+static bool hyundai_canfd_hb_brake_prev = false;
+static bool hyundai_canfd_hb_main_on_prev = false;
+static bool hyundai_canfd_hb_mads_prev = false;
+static bool hyundai_canfd_hb_cancel_prev = false;
+static bool hyundai_canfd_hb_main_button_prev = false;
+static const uint32_t HYUNDAI_CANFD_HB_ACTION_WINDOW_US = 10000000U;  // heartbeat mismatch exits MADS/controls ~3 s after openpilot disengages
+
+static void hyundai_canfd_handback_note_action(uint32_t now, bool lat, bool lon) {
+  if (lat) {
+    hyundai_canfd_hb_lat_action = true;
+    hyundai_canfd_hb_lat_action_ts = now;
+  }
+  if (lon) {
+    hyundai_canfd_hb_long_action = true;
+    hyundai_canfd_hb_long_action_ts = now;
+  }
+}
+
+static bool hyundai_canfd_handback_recent(bool valid, uint32_t ts, uint32_t now) {
+  return valid && (safety_get_ts_elapsed(now, ts) <= HYUNDAI_CANFD_HB_ACTION_WINDOW_US);
+}
+
+static void hyundai_canfd_handback_step(void) {
+  const uint32_t now = microsecond_timer_get();
+  const bool lat_allowed = controls_allowed || controls_allowed_lateral;
+
+  const bool brake_edge = brake_pressed && !hyundai_canfd_hb_brake_prev;
+  const bool main_off_edge = hyundai_canfd_hb_main_on_prev && !acc_main_on;
+  const bool mads_pressed = (mads_button_press == MADS_BUTTON_PRESSED);
+  const bool mads_edge = mads_pressed && !hyundai_canfd_hb_mads_prev;
+  hyundai_canfd_hb_brake_prev = brake_pressed;
+  hyundai_canfd_hb_main_on_prev = acc_main_on;
+  hyundai_canfd_hb_mads_prev = mads_pressed;
+
+  if (brake_edge || main_off_edge) {
+    hyundai_canfd_handback_note_action(now, true, true);
+  }
+  if (mads_edge) {
+    hyundai_canfd_handback_note_action(now, true, false);
+  }
+
+  if (hyundai_canfd_hb_lat_op && !lat_allowed && hyundai_canfd_handback_recent(hyundai_canfd_hb_lat_action, hyundai_canfd_hb_lat_action_ts, now)) {
+    hyundai_canfd_hb_lat_op = false;
+    hyundai_canfd_hb_lat_action = false;
+  }
+  if (hyundai_canfd_hb_long_op && !controls_allowed && hyundai_canfd_handback_recent(hyundai_canfd_hb_long_action, hyundai_canfd_hb_long_action_ts, now)) {
+    hyundai_canfd_hb_long_op = false;
+    hyundai_canfd_hb_long_action = false;
+  }
+}
+
+static void hyundai_canfd_handback_buttons(int cruise_button, bool main_button) {
+  const bool cancel_edge = (cruise_button == HYUNDAI_BTN_CANCEL) && !hyundai_canfd_hb_cancel_prev;
+  const bool main_edge = main_button && !hyundai_canfd_hb_main_button_prev;
+  hyundai_canfd_hb_cancel_prev = (cruise_button == HYUNDAI_BTN_CANCEL);
+  hyundai_canfd_hb_main_button_prev = main_button;
+  if (hyundai_canfd_handback) {
+    if (cancel_edge || main_edge) {
+      hyundai_canfd_handback_note_action(microsecond_timer_get(), true, true);
+    }
+    hyundai_canfd_handback_step();
+  }
+}
+
 static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
 
   const unsigned pt_bus = hyundai_canfd_lka_steer_msg ? 1U : 0U;
@@ -112,6 +191,7 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
         mads_button_press = GET_BIT(msg, 39U) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
       }
       hyundai_common_cruise_buttons_check(cruise_button, main_button);
+      hyundai_canfd_handback_buttons(cruise_button, main_button);
     }
 
     // gas press, different for EV, hybrid, and ICE models
@@ -155,6 +235,11 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   }
 
   hyundai_common_reset_acc_main_on_mismatches();
+
+  // sample the driver-action edges (brake, main off) on every whitelisted rx, not only when a frame is forwarded or sent
+  if (hyundai_canfd_handback) {
+    hyundai_canfd_handback_step();
+  }
 }
 
 // CCNC LFA_ALT: the camera needs MDPS (0xEA) at all times, so pass the real one until openpilot sends its own copy
@@ -223,7 +308,15 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   bool tx = true;
 
   if ((msg->addr == 0xEAU) && (msg->bus == 2U)) {
-    hyundai_canfd_ccnc_mdps_tx = true;
+    if (hyundai_canfd_handback) {
+      // openpilot's MDPS copy only while it owns lateral; otherwise the real MDPS is forwarded and a second sender would interleave
+      hyundai_canfd_handback_step();
+      if (!hyundai_canfd_hb_lat_op) {
+        tx = false;
+      }
+    } else {
+      hyundai_canfd_ccnc_mdps_tx = true;
+    }
   }
 
   // HDA1 steering
@@ -236,6 +329,18 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 
     if (steer_angle_cmd_checks_vm(desired_angle, steer_angle_req, HYUNDAI_CANFD_ANGLE_STEERING_LIMITS, HYUNDAI_STEERING_PARAMS)) {
       tx = false;
+    }
+
+    if (hyundai_canfd_handback) {
+      hyundai_canfd_handback_step();
+      if (hyundai_canfd_hb_lat_op) {
+        // openpilot owns lateral: inactive frames pass too, so the car keeps getting 0xCB until the driver hands it back
+      } else if (tx && steer_angle_req && (controls_allowed || controls_allowed_lateral)) {
+        hyundai_canfd_hb_lat_op = true;
+        hyundai_canfd_hb_lat_action = false;
+      } else {
+        tx = false;
+      }
     }
   }
 
@@ -311,6 +416,19 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
       }
     }
 
+    if (hyundai_canfd_handback && hyundai_longitudinal) {
+      hyundai_canfd_handback_step();
+      const int hb_acc_mode = (msg->data[8] >> 4) & 0x7U;
+      if (!hyundai_canfd_hb_long_op) {
+        if (!violation && ((hb_acc_mode == 1) || (hb_acc_mode == 2)) && controls_allowed) {
+          hyundai_canfd_hb_long_op = true;
+          hyundai_canfd_hb_long_action = false;
+        } else {
+          violation = true;
+        }
+      }
+    }
+
     if (violation) {
       tx = false;
     }
@@ -323,6 +441,21 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 }
 
 static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
+  if (hyundai_canfd_handback) {
+    // block the camera's frame only while openpilot owns the axis (the car's own relay/static blocking is disabled for these addresses)
+    hyundai_canfd_handback_step();
+    if ((bus_num == 2) && (addr == 0xCB)) {
+      return hyundai_canfd_hb_lat_op;
+    }
+    if ((bus_num == 0) && (addr == 0xEA)) {
+      return hyundai_canfd_hb_lat_op;
+    }
+    if ((bus_num == 2) && (addr == 0x1A0) && hyundai_longitudinal) {
+      return hyundai_canfd_hb_long_op;
+    }
+    return false;
+  }
+
   // block the car's MDPS toward the camera only once openpilot sends its own copy (only allowed on the CCNC LFA_ALT list)
   return (bus_num == 0) && (addr == 0xEA) && hyundai_canfd_ccnc_mdps_tx;
 }
@@ -334,6 +467,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CCNC = 2048;
   const uint16_t HYUNDAI_PARAM_CANFD_LFA_ALT_STEERING = 4096;
   const uint16_t HYUNDAI_PARAM_LONG_MAIN_BUTTON_ENGAGE = 8192;
+  const uint16_t HYUNDAI_PARAM_CAMERA_HANDBACK = 16384;
 
   static const CanMsg HYUNDAI_CANFD_LKA_STEER_MSG_TX_MSGS[] = {
     HYUNDAI_CANFD_LKA_STEER_MSG_COMMON_TX_MSGS(0, 1)
@@ -419,6 +553,17 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     {0x7C4, 2, 8, .check_relay = true}, /* 0x7C4 */ \
     {0xEA, 2, 24, .check_relay = true, .disable_static_blocking = true}, /* MDPS copy to the camera */ \
 
+// Camera hand-back: 0xCB and 0x1A0 are forwarded from the camera unless openpilot owns the axis (hyundai_canfd_fwd_hook), so static blocking is off.
+#define HYUNDAI_CANFD_LFA_ALT_CCNC_HANDBACK_TX_MSGS(longitudinal) \
+    HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(2) \
+    {0x1E0, 0, 16, .check_relay = true}, /* LFAHDA_CLUSTER */ \
+    {0xCB, 0, 24, .check_relay = true, .disable_static_blocking = true}, /* LFA_ALT */ \
+    {0x1A0, 0, 32, .check_relay = (longitudinal), .disable_static_blocking = true}, /* SCC_CONTROL */ \
+    {0x161, 0, 32, .check_relay = true}, /* CCNC_0x161 */ \
+    {0x162, 0, 32, .check_relay = true}, /* CCNC_0x162 */ \
+    {0x7C4, 2, 8, .check_relay = true}, /* 0x7C4 */ \
+    {0xEA, 2, 24, .check_relay = true, .disable_static_blocking = true}, /* MDPS copy to the camera */ \
+
   hyundai_common_init(param);
   hyundai_canfd_ccnc_mdps_tx = false;
 
@@ -433,6 +578,19 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   // main cruise button engages/disengages openpilot longitudinal; only valid with the CCNC LFA_ALT camera-SCC long config
   hyundai_long_main_button_engage = GET_FLAG(param, HYUNDAI_PARAM_LONG_MAIN_BUTTON_ENGAGE) && lfa_alt_steering && hyundai_ccnc &&
                                     hyundai_camera_scc && hyundai_longitudinal && !hyundai_canfd_alt_buttons && !hyundai_canfd_lka_steer_msg;
+  hyundai_canfd_handback = GET_FLAG(param, HYUNDAI_PARAM_CAMERA_HANDBACK) && lfa_alt_steering && hyundai_ccnc && hyundai_camera_scc &&
+                           !hyundai_canfd_alt_buttons && !hyundai_canfd_lka_steer_msg;
+  hyundai_canfd_hb_lat_op = false;
+  hyundai_canfd_hb_long_op = false;
+  hyundai_canfd_hb_lat_action = false;
+  hyundai_canfd_hb_long_action = false;
+  hyundai_canfd_hb_lat_action_ts = 0U;
+  hyundai_canfd_hb_long_action_ts = 0U;
+  hyundai_canfd_hb_brake_prev = false;
+  hyundai_canfd_hb_main_on_prev = false;
+  hyundai_canfd_hb_mads_prev = false;
+  hyundai_canfd_hb_cancel_prev = false;
+  hyundai_canfd_hb_main_button_prev = false;
 
   safety_config ret;
   if (hyundai_longitudinal) {
@@ -469,6 +627,10 @@ static safety_config hyundai_canfd_init(uint16_t param) {
         HYUNDAI_CANFD_LFA_ALT_STEERING_CAMERA_SCC_CCNC_LONG_TX_MSGS
       };
 
+      static CanMsg hyundai_canfd_lfa_alt_camera_scc_ccnc_handback_long_tx_msgs[] = {
+        HYUNDAI_CANFD_LFA_ALT_CCNC_HANDBACK_TX_MSGS(true)
+      };
+
       if (hyundai_canfd_alt_buttons) {
         SET_RX_CHECKS(hyundai_canfd_alt_buttons_long_rx_checks, ret);
       } else {
@@ -477,7 +639,9 @@ static safety_config hyundai_canfd_init(uint16_t param) {
 
       if (hyundai_camera_scc) {
         if (lfa_alt_steering) {
-          if (get_hyundai_ccnc()) {
+          if (hyundai_canfd_handback) {
+            SET_TX_MSGS(hyundai_canfd_lfa_alt_camera_scc_ccnc_handback_long_tx_msgs, ret);
+          } else if (get_hyundai_ccnc()) {
             SET_TX_MSGS(hyundai_canfd_lfa_alt_steering_camera_scc_ccnc_long_tx_msgs, ret);
           } else {
             SET_TX_MSGS(hyundai_canfd_lfa_alt_steering_camera_scc_long_tx_msgs, ret);
@@ -559,8 +723,14 @@ static safety_config hyundai_canfd_init(uint16_t param) {
         HYUNDAI_CANFD_LFA_ALT_STEERING_CAMERA_SCC_CCNC_TX_MSGS
       };
 
+      static CanMsg hyundai_canfd_lfa_alt_camera_scc_ccnc_handback_tx_msgs[] = {
+        HYUNDAI_CANFD_LFA_ALT_CCNC_HANDBACK_TX_MSGS(false)
+      };
+
       if (lfa_alt_steering) {
-        if (get_hyundai_ccnc()) {
+        if (hyundai_canfd_handback) {
+          SET_TX_MSGS(hyundai_canfd_lfa_alt_camera_scc_ccnc_handback_tx_msgs, ret);
+        } else if (get_hyundai_ccnc()) {
           SET_TX_MSGS(hyundai_canfd_lfa_alt_steering_camera_scc_ccnc_tx_msgs, ret);
         } else {
           SET_TX_MSGS(hyundai_canfd_lfa_alt_steering_camera_scc_tx_msgs, ret);

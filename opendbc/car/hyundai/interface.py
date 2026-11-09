@@ -99,6 +99,11 @@ class CarInterface(CarInterfaceBase):
           ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING.value
       if ret.flags & HyundaiFlags.CCNC and not ret.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CCNC.value
+        sp = ret.safetyConfigs[-1].safetyParam
+        if candidate == CAR.GENESIS_GV70_2ND_GEN and sp & HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING and sp & HyundaiSafetyFlags.CCNC and \
+           sp & HyundaiSafetyFlags.CAMERA_SCC:
+          # the stock camera keeps LFA_ALT / MDPS / SCC_CONTROL whenever openpilot is not controlling that axis
+          ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CAMERA_HANDBACK.value
 
     else:
       # Shared configuration for non CAN-FD cars
