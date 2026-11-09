@@ -175,6 +175,7 @@ typedef struct {
   const bool ignore_counter;         // counter check is not performed when set to true
   const uint8_t max_counter;         // maximum value of the counter. 0 means that the counter check is skipped
   const bool ignore_quality_flag;    // true if quality flag check is skipped
+  const bool optional;               // the message may be absent: it is only read in the rx hook, a lag never disables controls
 } CanMsgCheck;
 
 typedef struct {

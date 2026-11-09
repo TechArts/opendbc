@@ -169,7 +169,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
                                    CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
                                    1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD))
-    self.lat_owner, self.long_owner, self.lka_window = AxisOwner(latch=True), AxisOwner(), LkaWindow()
+    self.long_owner, self.lka_window = AxisOwner(), LkaWindow()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
 
@@ -368,12 +368,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       self.prev_brake_pressed = CS.out.brakePressed
       pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
       driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
-      # lateral: from the first frame while MADS allows it (also while the takeover filter has paused our request: inactive frames keep the
-      # camera's own request off the EPS), and for good, except while the car's own lane-keeping nudge (LKA, not LFA) steers with openpilot
+      # lateral: always ours from the start (inactive frames too: the camera's own request, LFA lane centering included, must not reach the EPS,
+      # also after a main press that turns the car's LFA on), except while the car's own lane-keeping nudge (LKA) steers with openpilot
       # steering off: then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we send nothing (the panda decides the same, see LkaWindow)
-      send_lat = self.lat_owner.update(bool(CC.latActive), button_type.lkas in pressed, self.frame)
       lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, self.frame)
-      send_lat = send_lat and not (lka_nudge and not CC.latActive)
+      send_lat = not (lka_nudge and not CC.latActive)
       send_long = self.long_owner.update(bool(CC.enabled and self.CP.openpilotLongitudinalControl), driver_cruise, self.frame)
       # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
       stock_acc_lock = bool(self.CP.openpilotLongitudinalControl and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))

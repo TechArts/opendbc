@@ -225,19 +225,21 @@ class TestCarControllerHandback(unittest.TestCase):
     sent = self._msgs(steer_req=True, lat_active=True)
     self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
 
-  def test_stock_owns_lateral_before_first_use(self):
-    for icon, ind in ((0, 3), (2, 3)):
-      with self.subTest(icon=icon, ind=ind):
-        self.assertFalse(self._nudge(icon, ind) & {0xCB, 0xEA})  # openpilot never owned it: the camera is untouched
+  def test_openpilot_owns_lateral_from_boot(self):
+    self.assertEqual(self._nudge(2, 3) & {0xCB, 0xEA}, {0xCB, 0xEA})  # the car's LFA (icon 2): ours replaces it, also with a lane departure
+    self.assertEqual(self._nudge(2, 2) & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def test_lka_nudge_from_boot_sends_nothing(self):
+    self.assertFalse(self._nudge(0, 3) & {0xCB, 0xEA})  # MADS never used, the car's own nudge may steer
 
   def test_flag_set(self):
     self.assertTrue(self.cp.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK)
     self.assertTrue(self.cc.handback)
 
-  def test_silent_when_not_controlling(self):
+  def test_only_lateral_frames_when_not_controlling(self):
     for frame in (f for f in range(2, 40, 2) if f % 5):  # off the 5-frame icon cadence (needs real CCNC frames)
       sent = self._msgs(frame=frame)
-      self.assertFalse(sent & {0xCB, 0xEA, 0x1A0}, hex(next(iter(sent & {0xCB, 0xEA, 0x1A0}), 0)))
+      self.assertEqual(sent & {0xCB, 0xEA, 0x1A0}, {0xCB, 0xEA})  # inactive lateral from boot, longitudinal stays with the camera
 
   def test_lateral_and_mdps_only_while_lat_active_then_off_frames(self):
     sent = self._msgs(steer_req=True)
@@ -248,7 +250,6 @@ class TestCarControllerHandback(unittest.TestCase):
   def test_long_only_while_enabled(self):
     sent = self._msgs(enabled=True)
     self.assertIn(0x1A0, sent)
-    self.assertNotIn(0xCB, sent)
     sent = self._msgs(enabled=False)  # disengaged by openpilot alone: 'off' frames continue
     self.assertIn(0x1A0, sent)
 
@@ -286,10 +287,10 @@ class TestCarControllerHandback(unittest.TestCase):
     self.assertEqual(parser.vl["LFA_ALT"]["ADAS_ActvACILvl2Sta"], 1)  # inactive
     self.assertEqual(parser.vl["LFA_ALT"]["ADAS_ACIAnglTqRedcGainVal"], 0)
 
-  def test_silent_while_mads_off_and_never_owned(self):
+  def test_inactive_frames_from_boot_while_mads_never_used(self):
     for _ in range(10):
       sent = self._msgs(lat_active=False)
-      self.assertFalse(sent & {0xCB, 0xEA})
+      self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
 
   def test_stock_acc_lock_sends_off_frames(self):
     # camera ACC engaged (ACCMode 1) while openpilot is not: 0x1A0 'off' frames, also if openpilot never owned the axis
