@@ -72,6 +72,14 @@ static bool acc_main_on_prev;
 static bool acc_main_on_tx;
 static uint32_t acc_main_on_mismatches;
 
+// main-button engage: the camera's own MainMode_ACC (bus 2 0x1A0) is the single source of truth for main cruise. A rising edge of it with a main
+// press near it (either order) enters controls; a camera main change without a press, or a press the camera ignores, enters nothing
+static const uint32_t HYUNDAI_MAIN_PRESS_WINDOW_US = 500000U;
+static bool main_press_valid;
+static uint32_t main_press_ts;
+static bool camera_main_rise_valid;
+static uint32_t camera_main_rise_ts;
+
 void hyundai_common_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_EV_GAS = 1;
   const uint16_t HYUNDAI_PARAM_HYBRID_GAS = 2;
@@ -99,6 +107,8 @@ void hyundai_common_init(uint16_t param) {
   hyundai_long_main_button_engage = false;
   mads_main_off_keeps_lateral = false;
   main_button_prev = false;
+  main_press_valid = false;
+  camera_main_rise_valid = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
   acc_main_on_mismatches = 0U;
@@ -149,19 +159,47 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
       controls_allowed = false;
     }
 
+    // main-button engage: the press only marks the engage request, the camera's main state does the rest (hyundai_common_camera_main_update)
+    if (main_button && !main_button_prev && hyundai_long_main_button_engage) {
+      const uint32_t now = microsecond_timer_get();
+      main_press_valid = true;
+      main_press_ts = now;
+      if (acc_main_on && camera_main_rise_valid && (safety_get_ts_elapsed(now, camera_main_rise_ts) <= HYUNDAI_MAIN_PRESS_WINDOW_US)) {
+        controls_allowed = true;  // the camera reacted before this press was seen
+        camera_main_rise_valid = false;
+      }
+    }
+
     // toggle main cruise state on rising edge of main cruise button
-    if (main_button && !main_button_prev && hyundai_longitudinal_main_cruise_toggleable) {
+    if (main_button && !main_button_prev && hyundai_longitudinal_main_cruise_toggleable && !hyundai_long_main_button_engage) {
       acc_main_on = !acc_main_on;
 
-      // main-button engage: the press that turns main on also enters controls (like a set release), the press that turns it off exits.
-      // acting on the rising edge keeps this the same edge as the main toggle, so a long press cannot produce a second transition
-      if (hyundai_long_main_button_engage) {
-        controls_allowed = acc_main_on && (cruise_button != HYUNDAI_BTN_CANCEL);
-      }
     }
 
     cruise_button_prev = cruise_button;
     main_button_prev = main_button;
+  }
+}
+
+// main-button engage: acc_main_on follows the camera's MainMode_ACC
+void hyundai_common_camera_main_update(const bool camera_main) {
+  const uint32_t now = microsecond_timer_get();
+  const bool rising = camera_main && !acc_main_on;
+  const bool falling = !camera_main && acc_main_on;
+  acc_main_on = camera_main;
+
+  if (rising) {
+    camera_main_rise_valid = true;
+    camera_main_rise_ts = now;
+    if (main_press_valid && (safety_get_ts_elapsed(now, main_press_ts) <= HYUNDAI_MAIN_PRESS_WINDOW_US)) {
+      controls_allowed = true;
+      main_press_valid = false;
+      camera_main_rise_valid = false;
+    }
+  }
+  if (falling) {
+    controls_allowed = false;  // lateral stays with MADS (main off keeps lateral)
+    camera_main_rise_valid = false;
   }
 }
 
