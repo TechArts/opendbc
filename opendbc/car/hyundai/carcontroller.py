@@ -65,7 +65,6 @@ def steer_feel_blend(CP, CP_SP) -> tuple[float, bool]:
 # HyundaiCurveHold (research/curve-hold.md Q3): in a curve the gain never falls below this share of the model's lateral demand a = v^2 * |desired| * k
 CURVE_HOLD_A_BP = [0.3, 1.0, 2.0]  # m/s^2
 CURVE_HOLD_FLOOR = [0.0, 0.30, 0.55]
-CURVE_HOLD_OPPOSE = 100  # the floor is dropped when the hand pulls against the turn by this much (takeover.OPPOSE_RELEASE)
 
 
 def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0, all_speeds=False, curve_hold=None):
