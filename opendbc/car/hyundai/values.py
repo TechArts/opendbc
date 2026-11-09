@@ -100,6 +100,7 @@ class HyundaiSafetyFlags(IntFlag):
   CCNC = 2048
   CANFD_LFA_ALT_STEERING = 4096
   LONG_MAIN_BUTTON_ENGAGE = 8192  # the cruise main button engages/disengages openpilot longitudinal (CCNC LFA_ALT camera-SCC long only)
+  CAMERA_HANDBACK = 16384  # CCNC LFA_ALT camera-SCC: the stock camera keeps 0xCB / 0xEA / 0x1A0 until openpilot engages that axis (GV70 2nd gen)
 
 
 # Hyundai/Kia/Genesis SCC (Smart Cruise Control) and steering architecture:

@@ -27,11 +27,11 @@ class TestMainButtonEngage(unittest.TestCase):
   def test_flag_only_for_long_ccnc_lfa_alt(self):
     gv70_long = _cp(CAR.GENESIS_GV70_2ND_GEN, True)
     assert gv70_long.openpilotLongitudinalControl
-    assert gv70_long.safetyConfigs[-1].safetyParam == 7180 | FLAG
+    assert gv70_long.safetyConfigs[-1].safetyParam == 7180 | FLAG | HyundaiSafetyFlags.CAMERA_HANDBACK
 
     # stock longitudinal, no LFA_ALT, other CAN FD cars: unchanged
     assert not _flag(_cp(CAR.GENESIS_GV70_2ND_GEN, False))
-    assert _cp(CAR.GENESIS_GV70_2ND_GEN, False).safetyConfigs[-1].safetyParam == 7176
+    assert _cp(CAR.GENESIS_GV70_2ND_GEN, False).safetyConfigs[-1].safetyParam == 7176 | HyundaiSafetyFlags.CAMERA_HANDBACK
     assert not _flag(_cp(CAR.GENESIS_GV70_2ND_GEN, True, lfa_alt=False))
     for candidate in (CAR.KIA_EV6, CAR.HYUNDAI_IONIQ_5, CAR.HYUNDAI_SONATA_HEV_2024):
       assert not _flag(_cp(candidate, True))
