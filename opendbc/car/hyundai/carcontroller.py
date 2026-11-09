@@ -11,7 +11,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons, CarControllerParams, CAR
-from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow
+from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
 from opendbc.car.hyundai.takeover import TakeoverFilter
 from opendbc.car.interfaces import CarControllerBase
@@ -128,15 +128,12 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.apply_angle_last = 0
 
     # camera hand-back (GV70 CCNC LFA_ALT): send an axis only while openpilot owns it, see handback.py
-    self.handback = bool(CP.safetyConfigs and CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK)
+    self.handback = CameraHandback() if CP.safetyConfigs and CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK else None
     self.steer_feel_blend, self.steer_feel_all_speeds = steer_feel_blend(CP, CP_SP)
     gv70_angle = CP.carFingerprint == CAR.GENESIS_GV70_2ND_GEN and bool(CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
     self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
                                    CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
                                    1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD))
-    self.long_owner, self.lka_window = AxisOwner(), LkaWindow()
-    self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
-    self.prev_brake_pressed = False
 
   def update(self, CC, CC_SP, CS, now_nanos):
     EsccCarController.update(self, CS)
@@ -328,23 +325,10 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # steering control
     send_lat, send_long = True, True
     if self.handback:
-      button_type = structs.CarState.ButtonEvent.Type
-      brake_edge = CS.out.brakePressed and not self.prev_brake_pressed
-      self.prev_brake_pressed = CS.out.brakePressed
-      pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
-      driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
-      # lateral: always ours from the start (inactive frames too: the camera's own request, LFA lane centering included, must not reach the EPS,
-      # also after a main press that turns the car's LFA on), except while the car's own lane-keeping nudge (LKA) steers with openpilot
-      # steering off: then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we send nothing (the panda decides the same, see LkaWindow)
-      lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, self.frame)
-      send_lat = not (lka_nudge and not CC.latActive)
-      send_long = self.long_owner.update(bool(CC.enabled and self.CP.openpilotLongitudinalControl), driver_cruise, self.frame)
-      # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
-      stock_acc_lock = bool(self.CP.openpilotLongitudinalControl and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
-      send_long = send_long or stock_acc_lock
+      send_lat, send_long = self.handback.update(CC, CS, self.CP.openpilotLongitudinalControl, self.frame)
 
     if send_lat:
-      lfa_alt_counter = self.lfa_alt_counter.next(CS.cam_lfa_alt.get("COUNTER")) if self.handback else None
+      lfa_alt_counter = self.handback.lfa_alt_counter.next(CS.cam_lfa_alt.get("COUNTER")) if self.handback else None
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque, self.apply_angle_last,
                                                              self.lkas_icon, lfa_alt_counter))
 
@@ -370,7 +354,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
                                                   lat_state, self.cluster_alert,
                                                   passthrough_lat=not send_lat and lat_state == hyundaicanfd.ICON_OFF,
                                                   passthrough_long=not send_long and long_state == hyundaicanfd.ICON_OFF,
-                                                  camera_lfa_on=self.handback and self.lka_window.lfa_on))
+                                                  camera_lfa_on=bool(self.handback and self.handback.lka_window.lfa_on)))
       else:
         can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled, self.lfa_icon))
 
@@ -385,7 +369,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
         can_sends.extend(hyundaicanfd.create_fca_warning_light(self.packer, self.CAN, self.frame))
       if self.frame % 2 == 0:
         if send_long:
-          scc_counter = self.scc_counter.next(CS.cruise_info.get("COUNTER")) if self.handback else None
+          scc_counter = self.handback.scc_counter.next(CS.cruise_info.get("COUNTER")) if self.handback else None
           can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
                                                            set_speed_in_units, hud_control, self.lead_data, CS.main_cruise_enabled, self.tuning,
                                                            CS.cruise_info if ccnc_non_hda2 else None, scc_counter))
