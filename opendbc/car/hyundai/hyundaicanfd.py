@@ -287,7 +287,7 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, long_state, hud, left
       # DISTANCE_SPACING 1, are unverified (parked sweep).
       engaged, long_active = long_state != ICON_OFF, long_state == ICON_ACTIVE
       msg_161.update({
-        "SETSPEED": 2 if long_active else 1,
+        "SETSPEED": 2 if long_active else (1 if main_cruise_enabled else 0),
         "SETSPEED_HUD": 0 if not main_cruise_enabled else 2 if long_active else 1,
         "SETSPEED_SPEED": (
           255 if not main_cruise_enabled else
