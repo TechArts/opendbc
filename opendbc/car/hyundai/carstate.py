@@ -5,6 +5,7 @@ import math
 from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.hyundai.camera_main import CameraMain
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, CAR, DBC, Buttons, CarControllerParams
 from opendbc.car.interfaces import CarStateBase
@@ -17,7 +18,6 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 ButtonType = structs.CarState.ButtonEvent.Type
 
 PREV_BUTTON_SAMPLES = 8
-MAIN_PRESS_FRAMES = 50  # 0.5 s at 100 Hz: a main press and the camera's main change this close belong together
 CLUSTER_SAMPLE_RATE = 20  # frames
 STANDSTILL_THRESHOLD = 12 * 0.03125
 
@@ -43,8 +43,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
                                         CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE)
     self.main_button_enable = False
     self.main_available = False
-    self.camera_main = False
-    self.main_press_age = self.camera_rise_age = MAIN_PRESS_FRAMES + 1
+    self.camera_main = CameraMain()
 
     self.gear_msg_canfd = "ACCELERATOR" if CP.flags & HyundaiFlags.EV else \
                           "GEAR_ALT" if CP.flags & HyundaiFlags.CANFD_ALT_GEARS else \
@@ -90,18 +89,6 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     # To avoid re-engaging when openpilot cancels, check user engagement intention via buttons
     # Main button also can trigger an engagement on these cars
     return any(btn in ENABLE_BUTTONS for btn in self.cruise_buttons) or any(self.main_buttons)
-
-  def update_camera_main(self, camera_main: bool | None, main_pressed: bool) -> bool:
-    """The camera's own MainMode_ACC (readable even while the panda blocks its SCC_CONTROL) is the car's main cruise state, the single source
-    of truth shared with the panda. Returns the engage request: a rising edge of it with a main press within MAIN_PRESS_FRAMES (either
-    order). A press the camera ignores (e.g. brake held at low speed) or a camera change without a press engages nothing."""
-    if camera_main is None:
-      camera_main = self.camera_main  # not seen yet: keep the last state
-    rising = camera_main and not self.camera_main
-    self.camera_main = camera_main
-    self.main_press_age = 0 if main_pressed else min(self.main_press_age + 1, MAIN_PRESS_FRAMES + 1)
-    self.camera_rise_age = 0 if rising else min(self.camera_rise_age + 1, MAIN_PRESS_FRAMES + 1)
-    return camera_main and ((rising and self.main_press_age <= MAIN_PRESS_FRAMES) or (main_pressed and self.camera_rise_age <= MAIN_PRESS_FRAMES))
 
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
     # a main press that turns the main cruise state on is an enable request, on the same (rising) edge as the panda safety.
@@ -375,9 +362,9 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     if self.long_main_button_engage:
       cp_scc = cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp
       camera_main = cp_scc.vl["SCC_CONTROL"]["MainMode_ACC"] == 1 if cp_scc.ts_nanos["SCC_CONTROL"]["MainMode_ACC"] else None
-      self.main_button_enable = self.update_camera_main(camera_main, main_pressed)
-      self.main_cruise_enabled = self.camera_main
-      ret.cruiseState.available = self.camera_main
+      self.main_button_enable = self.camera_main.update(camera_main, main_pressed)
+      self.main_cruise_enabled = self.camera_main.on
+      ret.cruiseState.available = self.camera_main.on
       # the camera's own ACC engagement (ACCMode on SCC_CONTROL, readable although the panda blocks it): lets sunnypilot
       # tell the driver when the car's cruise is driving and openpilot longitudinal is not
       ret_sp.stockAccEngaged = bool(cp_scc.ts_nanos["SCC_CONTROL"]["ACCMode"] and cp_scc.vl["SCC_CONTROL"]["ACCMode"] in (1, 2))
