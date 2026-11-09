@@ -66,6 +66,10 @@ class CarParamsSP:
   pcmCruiseSpeed: bool = auto_field()
   intelligentCruiseButtonManagementAvailable: bool = auto_field()
   enableGasInterceptor: bool = auto_field()
+  hyundaiTakeoverTorque: int = auto_field()  # GV70 steering takeover filter, 0 = off
+  hyundaiTakeoverReleaseTorque: int = auto_field()
+  hyundaiTakeoverHoldMs: int = auto_field()
+  hyundaiResumeAngleRateX10: int = auto_field()  # deg per frame x 10
 
   neuralNetworkLateralControl: 'CarParamsSP.NeuralNetworkLateralControl' = field(default_factory=lambda: CarParamsSP.NeuralNetworkLateralControl())
 

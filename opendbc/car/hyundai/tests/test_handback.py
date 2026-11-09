@@ -150,12 +150,27 @@ class TestCarControllerHandback(unittest.TestCase):
     sent = self._msgs(enabled=False)  # disengaged by openpilot alone: 'off' frames continue
     self.assertIn(0x1A0, sent)
 
-  def test_driver_action_ends_sending_after_tail(self):
+  def test_brake_ends_longitudinal_tail_only(self):
     self._msgs(steer_req=True, enabled=True)
     self._msgs(steer_req=False, enabled=False, brake=True)
     self._msgs(brake=False, frame=2 + TAIL_FRAMES + 10)
     sent = self._msgs()
-    self.assertFalse(sent & {0xCB, 0xEA, 0x1A0})
+    self.assertNotIn(0x1A0, sent)
+    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})  # steering is not handed back by a brake or a takeover
+
+  def test_cancel_and_main_do_not_end_lateral(self):
+    self._msgs(steer_req=True, enabled=True)
+    self._msgs(steer_req=False, enabled=False, buttons=(ButtonType.cancel, ButtonType.mainCruise))
+    self._msgs(frame=2 + TAIL_FRAMES + 10)
+    sent = self._msgs()
+    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def test_lfa_button_ends_lateral_after_tail(self):
+    self._msgs(steer_req=True, enabled=True)
+    self._msgs(steer_req=False, enabled=False, buttons=(ButtonType.lkas,))
+    self._msgs(frame=2 + TAIL_FRAMES + 10)
+    sent = self._msgs()
+    self.assertFalse(sent & {0xCB, 0xEA})
 
   def test_counter_follows_camera(self):
     msgs = self.cc.create_canfd_msgs(True, 0, 0.0, 0.0, False, self.hud, self.cs, SimpleNamespace(

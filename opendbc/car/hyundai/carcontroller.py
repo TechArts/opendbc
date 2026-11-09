@@ -10,6 +10,7 @@ from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons, CarControllerParams, CAR
 from opendbc.car.hyundai.handback import AxisOwner, CounterFollower
+from opendbc.car.hyundai.takeover import TakeoverFilter
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.cluster_alert import ClusterAlertCarController
@@ -151,6 +152,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # camera hand-back (GV70 CCNC LFA_ALT): send an axis only while openpilot owns it, see handback.py
     self.handback = bool(CP.safetyConfigs and CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK)
     self.steer_feel_blend, self.steer_feel_all_speeds = steer_feel_blend(CP, CP_SP)
+    gv70_angle = CP.carFingerprint == CAR.GENESIS_GV70_2ND_GEN and bool(CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
+    self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
+                                   CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10)
     self.lat_owner, self.long_owner = AxisOwner(), AxisOwner()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
@@ -167,6 +171,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     hud_control = CC.hudControl
 
     # steering torque
+    lat_active = CC.latActive  # not while the driver has taken over, see takeover.py
     if not self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
       self.angle_limit_counter, apply_steer_req = common_fault_avoidance(abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive,
                                                                          self.angle_limit_counter, MAX_ANGLE_FRAMES,
@@ -182,16 +187,23 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       self.angle_filter.update_alpha(float(np.interp(CS.out.vEgo, [5, 10, 20], [0.2, 0.1, 0.0])))
       desired_angle = self.angle_filter.update(desired_angle)
 
-      apply_angle = apply_steer_angle_limits_vm(desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, CC.latActive, self.params, self.VM)
+      paused = self.takeover.update(CS.out.steeringTorque, CS.out.steeringPressed, CS.out.steerFaultTemporary, CS.out.vEgo,
+                                    CS.out.steeringAngleDeg, desired_angle, CC.latActive)
+      lat_active = CC.latActive and not paused
+
+      apply_angle = apply_steer_angle_limits_vm(desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, lat_active, self.params, self.VM)
 
       # if we are not the baseline model, we use the baseline model for further limits to prevent a panda block since it is hardcoded for baseline model.
       if self.CP.carFingerprint != ANGLE_SAFETY_BASELINE_MODEL:
-        apply_angle = apply_steer_angle_limits_vm(apply_angle or desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, CC.latActive,
+        apply_angle = apply_steer_angle_limits_vm(apply_angle or desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, lat_active,
                                                   self.params, self.BASELINE_VM)
 
-      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last,
+      if lat_active and apply_angle is not None:
+        apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo)
+
+      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds)
-      apply_steer_req = CC.latActive and apply_torque != 0
+      apply_steer_req = lat_active and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
       if apply_angle is None:
@@ -202,11 +214,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       # After we've used the last angle wherever we needed it, we now update it.
       self.apply_angle_last = apply_angle
 
-      if not CC.latActive:
+      if not lat_active:
         self.apply_angle_last = float(np.clip(CS.out.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
         self.angle_filter.x = self.apply_angle_last
 
-    if not CC.latActive:
+    if not lat_active:
       apply_torque = 0
 
     self.apply_torque_last = apply_torque
@@ -309,7 +321,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     """(lateral, longitudinal) dash icon states from the real control state of each axis, independent of each other."""
     ICON_OFF, ICON_PAUSED, ICON_ACTIVE = hyundaicanfd.ICON_OFF, hyundaicanfd.ICON_PAUSED, hyundaicanfd.ICON_ACTIVE
 
-    if CC.latActive:
+    if CC.latActive and self.takeover.paused:
+      lat = ICON_PAUSED  # driver takeover: a pause, the system resumes by itself
+    elif CC.latActive:
       lat = ICON_ACTIVE
     elif CS.out.steerFaultTemporary or CS.out.steerFaultPermanent:
       lat = ICON_OFF  # a steering fault is not a pause
@@ -335,9 +349,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       button_type = structs.CarState.ButtonEvent.Type
       brake_edge = CS.out.brakePressed and not self.prev_brake_pressed
       self.prev_brake_pressed = CS.out.brakePressed
-      pressed = {be.type for be in CS.out.buttonEvents if be.pressed}
-      driver_cruise = brake_edge or bool(pressed & {button_type.cancel, button_type.mainCruise})
-      send_lat = self.lat_owner.update(bool(apply_steer_req), driver_cruise or button_type.lkas in pressed, self.frame)
+      pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
+      driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
+      send_lat = self.lat_owner.update(bool(apply_steer_req), button_type.lkas in pressed, self.frame)
       send_long = self.long_owner.update(bool(CC.enabled and self.CP.openpilotLongitudinalControl), driver_cruise, self.frame)
 
     if send_lat:
