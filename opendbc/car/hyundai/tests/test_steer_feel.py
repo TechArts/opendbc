@@ -7,10 +7,10 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 from opendbc.sunnypilot.car.interfaces import _initialize_custom_longitudinal_tuning
 
 
-def settle(torque, v_ego, blend, all_speeds=False):
+def settle(torque, v_ego, blend, all_speeds=False, curve_hold=None):
   gain = 0.0
   for _ in range(500):
-    gain = compute_torque_reduction_gain(torque, v_ego, True, gain, blend, all_speeds)
+    gain = compute_torque_reduction_gain(torque, v_ego, True, gain, blend, all_speeds, curve_hold)
   return gain
 
 
@@ -64,6 +64,49 @@ class TestSteerFeel(unittest.TestCase):
 
   def test_zero_when_not_active(self):
     self.assertEqual(compute_torque_reduction_gain(300, 15.0, False, 0.0, 1.0), 0.0)
+
+  def test_curve_hold_param(self):
+    self.assertFalse(self._cp_sp(3).flags & HyundaiFlagsSP.CURVE_HOLD)
+    CP_SP = structs.CarParamsSP()
+    _initialize_custom_longitudinal_tuning(_CI, self._cp(CAR.GENESIS_GV70_2ND_GEN, HyundaiFlags.SEND_LFA), CP_SP,
+                                           {"HyundaiSteerFeel": "3", "HyundaiCurveHold": "1"})
+    self.assertTrue(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD)
+
+  def test_curve_hold_floor_interpolates_with_lateral_demand(self):
+    # v 16, 250 torque: stock curve 0.10, generic 0.60
+    stock = settle(250, 16.0, 1.0, True)
+    self.assertAlmostEqual(stock, 0.10, delta=0.004)
+    self.assertEqual(settle(250, 16.0, 1.0, True, (0.2, False, False)), stock)  # below 0.3 m/s^2: stock
+    self.assertEqual(settle(250, 16.0, 1.0, True, (0.3, False, False)), stock)
+    self.assertAlmostEqual(settle(250, 16.0, 1.0, True, (1.0, False, False)), 0.30, delta=0.004)
+    self.assertAlmostEqual(settle(250, 16.0, 1.0, True, (0.65, False, False)), 0.15, delta=0.004)
+    self.assertAlmostEqual(settle(250, 16.0, 1.0, True, (2.0, False, False)), 0.55, delta=0.004)
+    self.assertAlmostEqual(settle(250, 16.0, 1.0, True, (3.5, False, False)), 0.55, delta=0.004)
+
+  def test_curve_hold_never_above_generic_curve_or_below_stock(self):
+    for v in (8.0, 11.0, 16.0, 22.0):
+      for torque in (0, 100, 150, 250, 300, 400, 550, 700):
+        generic = settle(torque, v, 0.0)
+        stock = settle(torque, v, 1.0, True)
+        for a in (0.0, 0.5, 1.0, 1.5, 2.0, 4.0):
+          held = settle(torque, v, 1.0, True, (a, False, False))
+          self.assertLessEqual(held, max(generic, stock) + 0.004, (v, torque, a))
+          self.assertGreaterEqual(held, stock - 0.004, (v, torque, a))
+    # at 550 torque and 22 m/s the generic curve (0.41) is below the 0.55 floor, so it caps the floor
+    self.assertAlmostEqual(settle(550, 22.0, 1.0, True, (2.0, False, False)), settle(550, 22.0, 0.0), delta=0.004)
+
+  def test_curve_hold_off_when_opposing_paused_or_param_off(self):
+    stock = settle(250, 16.0, 1.0, True)
+    self.assertEqual(settle(250, 16.0, 1.0, True, (2.0, True, False)), stock)
+    self.assertEqual(settle(250, 16.0, 1.0, True, (2.0, False, True)), stock)
+    self.assertEqual(settle(250, 16.0, 1.0, True, None), stock)
+    self.assertEqual(settle(250, 16.0, 0.0, False, (2.0, False, False)), settle(250, 16.0, 0.0))  # steer feel 0: generic is the cap
+    self.assertEqual(compute_torque_reduction_gain(250, 16.0, False, 0.5, 1.0, True, (2.0, False, False)),
+                     compute_torque_reduction_gain(250, 16.0, False, 0.5, 1.0, True))  # inactive: ramps down as before
+
+  def test_curve_hold_keeps_no_hands_and_light_hand_gain(self):
+    for torque in (0, 25, 50):
+      self.assertEqual(settle(torque, 16.0, 1.0, True, (2.0, False, False)), settle(torque, 16.0, 1.0, True))
 
 
 if __name__ == "__main__":
