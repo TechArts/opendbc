@@ -9,6 +9,7 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.takeover import TakeoverFilter, ENTER_FRAMES, RESUME_FRAMES, FAULT_FRAMES, GUARD_FRAMES, CONVERGE_DEG
 from opendbc.car.hyundai.values import CAR, DBC
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
 
 def _defaults(msg):
@@ -146,7 +147,7 @@ class TestLowSpeedGuard(unittest.TestCase):
     self.assertFalse(any(run(f, 100, v=4.0, angle=175.0, desired=170.0)))
 
 
-def _carcontroller(takeover_torque):
+def _carcontroller(takeover_torque, curve_hold=False):
   fingerprint = gen_empty_fingerprint()
   can = CanBus(None, fingerprint)
   fingerprint[can.ECAN] = {0x1CF: 8}
@@ -155,12 +156,15 @@ def _carcontroller(takeover_torque):
   cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
   cp_sp.hyundaiTakeoverTorque = takeover_torque
   cp_sp.hyundaiTakeoverReleaseTorque, cp_sp.hyundaiTakeoverHoldMs, cp_sp.hyundaiResumeAngleRateX10 = 100, 500, 10
+  cp_sp.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK | HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS
+  if curve_hold:
+    cp_sp.flags |= HyundaiFlagsSP.CURVE_HOLD
   return CarController(DBC[cp.carFingerprint], cp, cp_sp), CarState(cp, cp_sp)
 
 
 class TestControllerTakeover(unittest.TestCase):
-  def _update(self, cc, cs, torque, angle_cmd=30.0):
-    cs.out = structs.CarState(vEgo=10.0, vEgoRaw=10.0, steeringTorque=torque, steeringAngleDeg=5.0)
+  def _update(self, cc, cs, torque, angle_cmd=30.0, angle=5.0):
+    cs.out = structs.CarState(vEgo=10.0, vEgoRaw=10.0, steeringTorque=torque, steeringAngleDeg=angle)
     cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
     cs.msg_161, cs.msg_162, cs.msg_1b5 = (_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
@@ -189,6 +193,105 @@ class TestControllerTakeover(unittest.TestCase):
       act = self._update(cc, cs, 300.0)
     self.assertFalse(cc.takeover.paused)
     self.assertGreater(act.torqueOutputCan, 0)
+
+  def test_curve_hold_flag_holds_along_turn_push_in_controller(self):
+    # a = 10^2 * 30 deg * k = 1.2 m/s^2, wheel on the model, 250 torque along the turn: off pauses (today), on stays active at the gain floor
+    outputs = {}
+    for on in (False, True):
+      cc, cs = _carcontroller(150, curve_hold=on)
+      for _ in range(400):
+        act = self._update(cc, cs, 250.0, angle_cmd=30.0, angle=30.0)
+      outputs[on] = (cc.takeover.paused, act.torqueOutputCan)
+    self.assertEqual(outputs[False], (True, 0))
+    self.assertFalse(outputs[True][0])
+    self.assertGreater(outputs[True][1], 0)
+
+
+K = 1.0 / (15.2 * 2.875 * 57.2958)  # deg -> m/s^2 per (m/s)^2, as the controller computes it
+
+
+def make_curve(**kw):
+  return TakeoverFilter(150, 100, 500, 10, K, curve_hold=True, **kw)
+
+
+class TestCurveTakeover(unittest.TestCase):
+  """v 15 m/s, model and wheel at 17 deg: a = 1.53 m/s^2, a turn in the positive direction (along = torque)."""
+
+  def curve(self, f, frames, torque, **kw):
+    kw.setdefault("angle", 17.0)
+    kw.setdefault("desired", 17.0)
+    return run(f, frames, torque=torque, **kw)
+
+  def test_along_turn_hold_never_pauses_also_with_pressed(self):
+    for sign in (1, -1):
+      f = make_curve()
+      self.assertFalse(any(self.curve(f, 100, 250 * sign, angle=17.0 * sign, desired=17.0 * sign)))
+      self.assertFalse(any(self.curve(f, 100, 250 * sign, pressed=True, angle=17.0 * sign, desired=17.0 * sign)))
+
+  def test_opposing_grab_pauses_by_frame_three(self):
+    for sign in (1, -1):
+      f = make_curve()
+      paused = self.curve(f, ENTER_FRAMES, -160 * sign, angle=17.0 * sign, desired=17.0 * sign)
+      self.assertEqual(paused, [False, False, True])
+
+  def test_opposing_pressed_pauses_at_once(self):
+    self.assertTrue(self.curve(make_curve(), 1, -200, pressed=True)[0])
+
+  def test_straight_is_unchanged(self):
+    for kw in (dict(angle=1.0, desired=1.0), dict(angle=17.0, desired=1.0, v=0.5)):
+      f = make_curve()
+      self.assertEqual(self.curve(f, ENTER_FRAMES, 150, **kw), [False, False, True])  # along or opposing: symmetric
+      self.assertTrue(self.curve(make_curve(), 1, 0, pressed=True, **kw)[0])
+
+  def test_disabled_flag_is_todays_behaviour(self):
+    f = TakeoverFilter(150, 100, 500, 10, K, curve_hold=False)
+    self.assertTrue(self.curve(f, ENTER_FRAMES, 250)[-1])
+
+  def test_beyond_push_pauses_only_with_the_wheel_past_the_model(self):
+    # a = 1.53 -> along-turn threshold 300 + 150 * 1.53 = 530
+    self.assertFalse(any(self.curve(make_curve(), 50, 700, angle=17.0, desired=17.0)))
+    self.assertFalse(any(self.curve(make_curve(), 50, 700, angle=19.0, desired=17.0)))  # 2 deg: not beyond
+    self.assertFalse(any(self.curve(make_curve(), 50, 500, angle=20.5, desired=17.0)))  # beyond but below the torque bar
+    self.assertTrue(self.curve(make_curve(), ENTER_FRAMES, 700, angle=20.5, desired=17.0)[-1])
+    self.assertTrue(self.curve(make_curve(), ENTER_FRAMES, -700, angle=-20.5, desired=-17.0)[-1])
+    self.assertFalse(any(self.curve(make_curve(), 50, 700, angle=13.5, desired=17.0)))  # wheel short of the model, not past it
+
+  def test_curve_release_while_holding_along_the_turn(self):
+    # latched pause at a = 1.75 (v 15, 19.5 deg) with 490 along-turn torque, the hand holds the curve: ends after the hold time, also pressed
+    f = make_curve()
+    self.curve(f, 10, -300, angle=19.5, desired=19.5)  # opposing grab
+    self.assertTrue(f.paused)
+    self.assertTrue(all(self.curve(f, 49, 490, pressed=True, angle=19.5, desired=19.5)))
+    self.assertFalse(self.curve(f, 1, 490, pressed=True, angle=19.5, desired=19.5)[-1])
+    self.assertTrue(f.resuming)
+
+  def test_curve_release_blocked_by_opposing(self):
+    f = make_curve()
+    self.curve(f, 10, -300)
+    self.assertTrue(all(self.curve(f, 200, -120)))
+    self.assertTrue(all(self.curve(f, 49, 0)))
+    self.curve(f, 1, -120)  # restarts the hold
+    self.assertTrue(all(self.curve(f, 49, 0)))
+    self.assertFalse(self.curve(f, 1, 0)[-1])
+
+  def test_curve_release_blocked_by_beyond_push(self):
+    f = make_curve()
+    self.curve(f, 10, -300)
+    self.assertTrue(all(self.curve(f, 200, 700, angle=20.5, desired=17.0)))  # along >= 530 and wheel 3.5 deg past the model
+    self.assertFalse(self.curve(f, 50, 700, angle=17.0, desired=17.0)[-1])  # wheel back on the model: releases
+
+  def test_exposes_load_and_opposing_for_the_gain(self):
+    f = make_curve()
+    self.curve(f, 1, 0)
+    self.assertAlmostEqual(f.hold_load, 15.0 ** 2 * 17.0 * K)
+    self.assertFalse(f.opposing)
+    self.curve(f, 1, -100)
+    self.assertTrue(f.opposing)
+    self.curve(f, 1, 250)
+    self.assertFalse(f.opposing)
+    g = make_curve()
+    self.curve(g, 1, -150, angle=1.0, desired=1.0)
+    self.assertFalse(g.opposing)  # straight: no curve sign
 
 
 if __name__ == "__main__":

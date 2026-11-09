@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.car.common.filter_simple import FirstOrderFilter
@@ -60,7 +62,14 @@ def steer_feel_blend(CP, CP_SP) -> tuple[float, bool]:
   return 0.0, False
 
 
-def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0, all_speeds=False):
+# HyundaiCurveHold (research/curve-hold.md Q3): in a curve the gain never falls below this share of the model's lateral demand a = v^2 * |desired| * k
+CURVE_HOLD_A_BP = [0.3, 1.0, 2.0]  # m/s^2
+CURVE_HOLD_FLOOR = [0.0, 0.30, 0.55]
+CURVE_HOLD_OPPOSE = 100  # the floor is dropped when the hand pulls against the turn by this much (takeover.OPPOSE_RELEASE)
+
+
+def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0, all_speeds=False, curve_hold=None):
+  """curve_hold: None (off) or (lateral demand a_hold in m/s^2, hand opposes the turn, filter paused or resuming)."""
   if lat_active:
     ceiling = np.interp(v_ego, [0.5, 1.5], [1.0, 0.85])
     shelf = np.interp(v_ego, [2, 11], [0.45, 0.6])
@@ -75,7 +84,11 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain,
       stock = min(np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, [ceiling, *LFA_ALT_GAIN_V[1:]]), ceiling)
       w = stock_blend * (1.0 if all_speeds else np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0]))
       target = (1.0 - w) * target + w * stock
-
+    if curve_hold is not None and stock_blend > 0.0:
+      a_hold, opposing, paused = curve_hold
+      if not opposing and not paused:
+        generic = float(np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor]))
+        target = max(target, min(float(np.interp(a_hold, CURVE_HOLD_A_BP, CURVE_HOLD_FLOOR)), generic))
   else:
     target = 0.0
   gain = rate_limit(target, last_gain, -0.014, 0.004)
@@ -154,7 +167,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.steer_feel_blend, self.steer_feel_all_speeds = steer_feel_blend(CP, CP_SP)
     gv70_angle = CP.carFingerprint == CAR.GENESIS_GV70_2ND_GEN and bool(CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
     self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
-                                   CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10)
+                                   CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
+                                   1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD))
     self.lat_owner, self.long_owner = AxisOwner(), AxisOwner()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
@@ -201,8 +215,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       if lat_active and apply_angle is not None:
         apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo)
 
+      curve_hold = None
+      if self.takeover.curve_hold and self.takeover.enabled:
+        curve_hold = (self.takeover.hold_load, self.takeover.opposing, self.takeover.paused or self.takeover.resuming)
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
-                                                   self.steer_feel_blend, self.steer_feel_all_speeds)
+                                                   self.steer_feel_blend, self.steer_feel_all_speeds, curve_hold)
       apply_steer_req = lat_active and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
