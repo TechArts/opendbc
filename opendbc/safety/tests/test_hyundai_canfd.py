@@ -736,5 +736,51 @@ class TestHyundaiCanfdLFASteeringLongCCNC(TestHyundaiCanfdLFASteeringLongBase):
           self.assertFalse(self._tx(make_msg(bus, addr)), f"allowed TX {addr=:#x} {bus=}")
 
 
+class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
+  """HDA1 angle steering through LFA_ALT (0xCB) only: the camera keeps 0x12A (status/warnings, no actuation)."""
+
+  # CCNC variant (superset); read by common.test_tx_hook_on_wrong_safety_mode
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2]]
+
+  BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC
+  FLAG = HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING
+
+  def _init(self, param):
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+
+  def _tx(self, addr, bus, length):
+    return self.safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def _rx(self, addr, bus, length):
+    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def test_camera_lfa_forwarded_and_not_sendable(self):
+    for ccnc in (0, HyundaiSafetyFlags.CCNC):
+      with self.subTest(ccnc=bool(ccnc)):
+        self._init(self.BASE | ccnc | self.FLAG)
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x12A))
+        self.assertFalse(self._tx(0x12A, 0, 16))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0xCB))
+        self.assertTrue(self._tx(0xCB, 0, 24))  # inactive, zero angle
+
+  def test_relay_malfunction(self):
+    for addr, length, expected in ((0x12A, 16, False), (0xCB, 24, True)):
+      with self.subTest(addr=hex(addr)):
+        self._init(self.BASE | HyundaiSafetyFlags.CCNC | self.FLAG)
+        self._rx(addr, 0, length)
+        self.assertEqual(expected, self.safety.get_relay_malfunction())
+
+  def test_flag_requires_angle_steering(self):
+    self._init(HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CCNC | self.FLAG)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x12A))
+
+  def test_without_flag_unchanged(self):
+    self._init(self.BASE | HyundaiSafetyFlags.CCNC)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x12A))
+
+
+
 if __name__ == "__main__":
   unittest.main()

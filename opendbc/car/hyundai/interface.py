@@ -94,6 +94,9 @@ class CarInterface(CarInterfaceBase):
       if ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
         ret.steerControlType = structs.CarParams.SteerControlType.angle
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_ANGLE_STEERING.value
+        if ret.flags & HyundaiFlags.SEND_LFA:
+          # HDA1 angle steering actuates through LFA_ALT (0xCB) only; the camera keeps 0x12A
+          ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING.value
       if ret.flags & HyundaiFlags.CCNC and not ret.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CCNC.value
 
