@@ -1,7 +1,8 @@
 import unittest
 
 from opendbc.car import structs
-from opendbc.car.hyundai.carcontroller import compute_torque_reduction_gain, steer_feel_blend
+from opendbc.car.hyundai.carcontroller import compute_torque_reduction_gain
+from opendbc.car.hyundai.steer_feel import steer_feel_blend
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 from opendbc.sunnypilot.car.interfaces import _initialize_custom_longitudinal_tuning
