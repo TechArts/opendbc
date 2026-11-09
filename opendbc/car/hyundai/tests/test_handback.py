@@ -2,11 +2,11 @@ import unittest
 from types import SimpleNamespace
 
 from opendbc.can import CANPacker, CANParser
-from opendbc.car import gen_empty_fingerprint, structs
+from opendbc.car import Bus, gen_empty_fingerprint, structs
 from opendbc.car.hyundai import hyundaicanfd
 from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.carstate import CarState
-from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, TAIL_FRAMES, RECENT_ACTION_FRAMES
+from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow, TAIL_FRAMES, RECENT_ACTION_FRAMES, LKA_ICON_SETTLE_FRAMES, LKA_HOLD_FRAMES
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR, HyundaiSafetyFlags, DBC
@@ -60,6 +60,70 @@ class TestAxisOwner(unittest.TestCase):
     o.update(False, True, 10)
     self.assertTrue(o.update(True, False, 20))
     self.assertTrue(o.update(False, False, 20 + 2 * TAIL_FRAMES))
+
+
+class TestLkaWindow(unittest.TestCase):
+  def _run(self, w, icon, ind, start, frames):
+    open_ = False
+    for f in range(start, start + frames):
+      open_ = w.update(icon, ind, f)
+    return open_
+
+  def test_nudge_needs_settled_icon_and_lane_departure(self):
+    w = LkaWindow()
+    self.assertFalse(w.update(None, None, 0))  # nothing received yet
+    self.assertFalse(self._run(w, 0, 3, 1, LKA_ICON_SETTLE_FRAMES - 2))  # icon 0 for less than the settle time
+    self.assertTrue(self._run(w, 0, 3, 1 + LKA_ICON_SETTLE_FRAMES - 2, 5))
+    w = LkaWindow()
+    self.assertFalse(self._run(w, 0, 2, 0, 3 * LKA_ICON_SETTLE_FRAMES))  # settled, but no lane departure (an LFA start has LKA_SysIndReq 1/2)
+
+  def test_lfa_never_opens(self):
+    for icon, ind in ((2, 3), (1, 3), (2, 2), (3, 3)):
+      with self.subTest(icon=icon, ind=ind):
+        self.assertFalse(self._run(LkaWindow(), icon, ind, 0, 3 * LKA_ICON_SETTLE_FRAMES))
+
+  def test_blink_restarts_settle_time(self):
+    w = LkaWindow()
+    self._run(w, 0, 3, 0, 3 * LKA_ICON_SETTLE_FRAMES)
+    w.update(3, 3, 1000)  # the off-press blink 3,0,3,0
+    self.assertFalse(self._run(w, 0, 3, 1001, LKA_ICON_SETTLE_FRAMES - 5))
+    self.assertTrue(self._run(w, 0, 3, 1001 + LKA_ICON_SETTLE_FRAMES - 5, 10))
+
+  def test_window_closes_after_hold(self):
+    w = LkaWindow()
+    self._run(w, 0, 3, 0, 3 * LKA_ICON_SETTLE_FRAMES)
+    base = 3 * LKA_ICON_SETTLE_FRAMES
+    self.assertTrue(self._run(w, 0, 2, base, LKA_HOLD_FRAMES))
+    self.assertFalse(self._run(w, 0, 2, base + LKA_HOLD_FRAMES, 5))
+
+  def test_lfa_on_is_settled_state(self):
+    w = LkaWindow()
+    self.assertFalse(w.lfa_on)
+    w.update(2, 1, 0)
+    self.assertTrue(w.lfa_on)
+    for icon, f in ((3, 1), (0, 2), (3, 3), (0, 4)):  # the off blink alone does not flip it before the icon settles at 0
+      w.update(icon, 1, f)
+    self.assertTrue(w.lfa_on)
+    self._run(w, 0, 1, 5, LKA_ICON_SETTLE_FRAMES)
+    self.assertFalse(w.lfa_on)
+    w.update(1, 1, 500)  # grey: on, not steering
+    self.assertTrue(w.lfa_on)
+    for icon, f in ((3, 501), (0, 502), (3, 503), (1, 504)):  # lane lost blink 3,0,3,1: stays on
+      w.update(icon, 1, f)
+    self.assertTrue(w.lfa_on)
+
+
+class TestCarStateCameraLka(unittest.TestCase):
+  def test_camera_icon_and_lka_indicator_are_read(self):
+    # recorded camera frames (route 2f): 0x12A with LKA_SysIndReq 3 (lane departure), 0x161 with LFA_ICON 2
+    f12a = bytes.fromhex("9c0b0158c00000000082080004000000")
+    f161 = bytes.fromhex("3a93b1c000000000c1fff2c803000040000000000000000000ff000002000000")
+    cp, cp_sp, _, cs = _carcontroller()
+    parsers = cs.get_can_parsers(cp, cp_sp)
+    for t in (10_000_000, 20_000_000):  # the first update registers the messages
+      parsers[Bus.cam].update([(t, [(0x12A, f12a, 2), (0x161, f161, 2)])])
+      cs.update(parsers)
+    self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (2, 3))
 
 
 class TestCounterFollower(unittest.TestCase):
@@ -133,14 +197,49 @@ class TestCarControllerHandback(unittest.TestCase):
     self._last_scc = next((m[1] for m in msgs if m[0] == 0x1A0), None)
     return {m[0] for m in msgs}
 
+  def _nudge(self, icon, ind, lat_active=False, seconds=2.2):
+    """feed the camera's icon / LKA_SysIndReq for a while; returns what the last call sent"""
+    sent = set()
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = icon, ind
+    for _ in range(int(seconds * 50)):
+      sent = self._msgs(steer_req=False, lat_active=lat_active)
+    return sent
+
+  def test_lka_nudge_sends_nothing_with_mads_off(self):
+    self._msgs(steer_req=True)  # openpilot took lateral, then MADS went off
+    sent = self._nudge(0, 3)
+    self.assertFalse(sent & {0xCB, 0xEA})  # the panda forwards the camera's frame and the real MDPS
+
+  def test_inactive_frames_when_not_a_lka_nudge(self):
+    self._msgs(steer_req=True)
+    for icon, ind in ((2, 3), (1, 3), (2, 2), (0, 2), (3, 3)):  # LFA, or no lane departure
+      with self.subTest(icon=icon, ind=ind):
+        sent = self._nudge(icon, ind)
+        self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def test_lka_nudge_not_allowed_while_mads_on_or_paused(self):
+    self._msgs(steer_req=True)
+    self._nudge(0, 3)
+    sent = self._msgs(steer_req=False, lat_active=True)  # MADS on, request paused by a takeover
+    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+    sent = self._msgs(steer_req=True, lat_active=True)
+    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def test_openpilot_owns_lateral_from_boot(self):
+    self.assertEqual(self._nudge(2, 3) & {0xCB, 0xEA}, {0xCB, 0xEA})  # the car's LFA (icon 2): ours replaces it, also with a lane departure
+    self.assertEqual(self._nudge(2, 2) & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def test_lka_nudge_from_boot_sends_nothing(self):
+    self.assertFalse(self._nudge(0, 3) & {0xCB, 0xEA})  # MADS never used, the car's own nudge may steer
+
   def test_flag_set(self):
     self.assertTrue(self.cp.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_HANDBACK)
     self.assertTrue(self.cc.handback)
 
-  def test_silent_when_not_controlling(self):
+  def test_only_lateral_frames_when_not_controlling(self):
     for frame in (f for f in range(2, 40, 2) if f % 5):  # off the 5-frame icon cadence (needs real CCNC frames)
       sent = self._msgs(frame=frame)
-      self.assertFalse(sent & {0xCB, 0xEA, 0x1A0}, hex(next(iter(sent & {0xCB, 0xEA, 0x1A0}), 0)))
+      self.assertEqual(sent & {0xCB, 0xEA, 0x1A0}, {0xCB, 0xEA})  # inactive lateral from boot, longitudinal stays with the camera
 
   def test_lateral_and_mdps_only_while_lat_active_then_off_frames(self):
     sent = self._msgs(steer_req=True)
@@ -151,7 +250,6 @@ class TestCarControllerHandback(unittest.TestCase):
   def test_long_only_while_enabled(self):
     sent = self._msgs(enabled=True)
     self.assertIn(0x1A0, sent)
-    self.assertNotIn(0xCB, sent)
     sent = self._msgs(enabled=False)  # disengaged by openpilot alone: 'off' frames continue
     self.assertIn(0x1A0, sent)
 
@@ -189,10 +287,10 @@ class TestCarControllerHandback(unittest.TestCase):
     self.assertEqual(parser.vl["LFA_ALT"]["ADAS_ActvACILvl2Sta"], 1)  # inactive
     self.assertEqual(parser.vl["LFA_ALT"]["ADAS_ACIAnglTqRedcGainVal"], 0)
 
-  def test_silent_while_mads_off_and_never_owned(self):
+  def test_inactive_frames_from_boot_while_mads_never_used(self):
     for _ in range(10):
       sent = self._msgs(lat_active=False)
-      self.assertFalse(sent & {0xCB, 0xEA})
+      self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
 
   def test_stock_acc_lock_sends_off_frames(self):
     # camera ACC engaged (ACCMode 1) while openpilot is not: 0x1A0 'off' frames, also if openpilot never owned the axis
