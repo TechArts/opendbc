@@ -64,7 +64,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     self.buttons_counter = 0
 
     self.cruise_info = {}
-    self.msg_161, self.msg_162, self.msg_1b5 = {}, {}, {}
+    self.msg_161, self.msg_162, self.msg_1b5, self.mdps = {}, {}, {}, {}
 
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
@@ -273,6 +273,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       torque_overriding = abs(ret.steeringTorque) > self.params.STEER_THRESHOLD
       ret.steeringPressed = self.update_steering_pressed(torque_overriding, 5)
       self.imu_lateral_acceleration = cp.vl["IMU_01_10ms"]["IMU_LatAccelVal"] * 9.81  # m/s^2
+      # never copy before the real MDPS has arrived; the copy is re-sent to the camera on CCNC LFA_ALT cars
+      self.mdps = copy.copy(cp.vl["MDPS"]) if cp.ts_nanos["MDPS"]["COUNTER"] else {}
     else:
       ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)
 
