@@ -183,6 +183,9 @@ class HyundaiFlags(IntFlag):
 
   CCNC = 2 ** 28
 
+  # MRR35 front radar on ACAN (bus 1) streams 32 tracks in 0x3A5-0x3C4
+  CANFD_MRR35_RADAR = 2 ** 29
+
 
 @dataclass
 class HyundaiCarDocs(CarDocs):
@@ -766,7 +769,8 @@ class CAR(Platforms):
     # 2.5T AWD: wheelbase 113.2 in, base curb weight 4,275 lb (Car and Driver); variable-ratio steering,
     # so steerRatio is the value learned on the car (liveParameters 15.17, 2026-11-07)
     CarSpecs(mass=1950, wheelbase=2.875, steerRatio=15.2),
-    flags=HyundaiFlags.CANFD_ANGLE_STEERING | HyundaiFlags.CCNC,
+    dbc_dict={Bus.pt: "hyundai_canfd_generated", Bus.radar: "hyundai_radar_3a5_3c4_generated"},
+    flags=HyundaiFlags.CANFD_ANGLE_STEERING | HyundaiFlags.CCNC | HyundaiFlags.CANFD_MRR35_RADAR,
   )
   GENESIS_GV70_ELECTRIFIED_1ST_GEN = HyundaiCanFDPlatformConfig(
     [
