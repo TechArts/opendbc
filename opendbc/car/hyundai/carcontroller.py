@@ -11,7 +11,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons, CarControllerParams, CAR
-from opendbc.car.hyundai.handback import AxisOwner, CounterFollower
+from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow
 from opendbc.car.hyundai.takeover import TakeoverFilter
 from opendbc.car.interfaces import CarControllerBase
 
@@ -169,7 +169,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
                                    CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
                                    1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD))
-    self.lat_owner, self.long_owner = AxisOwner(latch=True), AxisOwner()
+    self.lat_owner, self.long_owner, self.lka_window = AxisOwner(latch=True), AxisOwner(), LkaWindow()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
 
@@ -369,8 +369,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
       driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
       # lateral: from the first frame while MADS allows it (also while the takeover filter has paused our request: inactive frames keep the
-      # camera's own request off the EPS), and for good
+      # camera's own request off the EPS), and for good, except while the car's own lane-keeping nudge (LKA, not LFA) steers with openpilot
+      # steering off: then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we send nothing (the panda decides the same, see LkaWindow)
       send_lat = self.lat_owner.update(bool(CC.latActive), button_type.lkas in pressed, self.frame)
+      lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, self.frame)
+      send_lat = send_lat and not (lka_nudge and not CC.latActive)
       send_long = self.long_owner.update(bool(CC.enabled and self.CP.openpilotLongitudinalControl), driver_cruise, self.frame)
       # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
       stock_acc_lock = bool(self.CP.openpilotLongitudinalControl and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
@@ -402,7 +405,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
                                                   CC.rightBlinker, CS.msg_161, CS.msg_162, CS.msg_1b5, CS.is_metric, CS.out, CS.main_cruise_enabled,
                                                   lat_state, self.cluster_alert,
                                                   passthrough_lat=not send_lat and lat_state == hyundaicanfd.ICON_OFF,
-                                                  passthrough_long=not send_long and long_state == hyundaicanfd.ICON_OFF))
+                                                  passthrough_long=not send_long and long_state == hyundaicanfd.ICON_OFF,
+                                                  camera_lfa_on=self.handback and self.lka_window.lfa_on))
       else:
         can_sends.append(hyundaicanfd.create_lfahda_cluster(self.packer, self.CAN, CC.enabled, self.lfa_icon))
 

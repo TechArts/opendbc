@@ -74,6 +74,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     self.cruise_info = {}
     self.msg_161, self.msg_162, self.msg_1b5, self.mdps = {}, {}, {}, {}
     self.cam_lfa_alt = {}  # the camera's own LFA_ALT (0xCB), also while the panda blocks it
+    self.cam_lfa_icon, self.cam_lka_ind = None, None  # the camera's own LFA_ICON (0x161) and LKA_SysIndReq (0x12A) while hand-back is on
 
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
@@ -315,6 +316,10 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
         if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING and self.CP.flags & HyundaiFlags.SEND_LFA:
           lfa_alt = cp_cam.vl["LFA_ALT"]  # registers the message in the parser
           self.cam_lfa_alt = copy.copy(lfa_alt) if cp_cam.ts_nanos["LFA_ALT"]["COUNTER"] else {}
+          # the camera's lane-keeping signals, also while the panda blocks its 0xCB: LFA_ICON (0x161) and LKA_SysIndReq (0x12A, 3 = lane departure)
+          lka = cp_cam.vl["LFA"]  # registers the message in the parser
+          self.cam_lka_ind = lka["LKA_SysIndReq"] if cp_cam.ts_nanos["LFA"]["COUNTER"] else None
+          self.cam_lfa_icon = self.msg_161["LFA_ICON"] if cp_cam.ts_nanos["CCNC_0x161"]["COUNTER"] else None
     if self.CP.carFingerprint == CAR.KIA_SELTOS_2027:
       # stalk position (not lamp) so hazards don't register as a blinker
       ret.leftBlinker = cp.vl["BLINKERS_NEW"]["LEFT_STALK"] == 1
