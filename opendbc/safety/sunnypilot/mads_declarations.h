@@ -90,6 +90,7 @@ extern ButtonState mads_button_press;
 extern MADSState m_mads_state;
 
 extern bool controls_allowed_lateral;
+extern bool mads_main_off_keeps_lateral;  // acc_main falling edge does not end lateral (brand mode config)
 
 // state for mads controls_allowed_lateral timeout logic
 extern bool heartbeat_engaged_mads;
