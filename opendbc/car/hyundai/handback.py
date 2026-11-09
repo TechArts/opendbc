@@ -1,11 +1,13 @@
 """
 Camera hand-back (GV70 CCNC LFA_ALT camera SCC): which side sends an axis, mirroring the panda's ownership rules.
 
-The panda blocks the camera's frame of an axis (LFA_ALT 0xCB + MDPS 0xEA for lateral, SCC_CONTROL 0x1A0 for longitudinal) from the first
-accepted openpilot frame until the axis is no longer allowed AND the driver acted. openpilot therefore:
-  - lateral: always ours from the start (the panda blocks the camera's 0xCB / MDPS from init), active or inactive frames, so the car's own LFA
-    lane centering never steers; the only exception is the car's own lane-keeping nudge while MADS is off (LkaWindow), where we send nothing
-  - longitudinal: sends the axis only while it is active, and keeps sending 'off' frames after that (the car must not see a gap) until a driver
+Lateral (LFA_ALT 0xCB + MDPS 0xEA) is openpilot's from panda init: the panda blocks the camera's frames from the start and ours replace them,
+active or inactive, so the car's own LFA lane centering never steers. The only exception is the car's own lane-keeping nudge while openpilot
+steering is off (LkaWindow): the panda then forwards the camera's frames and we send nothing.
+
+Longitudinal (SCC_CONTROL 0x1A0) belongs to the camera until openpilot takes it. The panda blocks the camera's frame from the first accepted
+openpilot frame until the axis is no longer allowed AND the driver acted. openpilot therefore:
+  - sends the axis only while it is active, and keeps sending 'off' frames after that (the car must not see a gap) until a driver
     action, and stops TAIL_FRAMES after the driver action: the panda hands the axis back at the first moment the permission is gone after the
     action (the heartbeat mismatch takes ~3 s), and rejects any frame of ours from then on, so a long tail is harmless and a short one is not.
 Without a driver action it keeps sending 'off' frames: the car sees a benign off state, the stock camera does not take over unannounced.
