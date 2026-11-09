@@ -97,6 +97,7 @@ void hyundai_common_init(uint16_t param) {
   hyundai_last_button_interaction = HYUNDAI_PREV_BUTTON_SAMPLES;
 
   hyundai_long_main_button_engage = false;
+  mads_main_off_keeps_lateral = false;
   main_button_prev = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
@@ -138,7 +139,8 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
     // enter controls on falling edge of resume or set
     bool set = (cruise_button != HYUNDAI_BTN_SET) && (cruise_button_prev == HYUNDAI_BTN_SET);
     bool res = (cruise_button != HYUNDAI_BTN_RESUME) && (cruise_button_prev == HYUNDAI_BTN_RESUME);
-    if (set || res) {
+    // with main-button engage a SET/RES release with main off must not arm controls
+    if ((set || res) && (acc_main_on || !hyundai_long_main_button_engage)) {
       controls_allowed = true;
     }
 

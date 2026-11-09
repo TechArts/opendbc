@@ -578,6 +578,8 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   // main cruise button engages/disengages openpilot longitudinal; only valid with the CCNC LFA_ALT camera-SCC long config
   hyundai_long_main_button_engage = GET_FLAG(param, HYUNDAI_PARAM_LONG_MAIN_BUTTON_ENGAGE) && lfa_alt_steering && hyundai_ccnc &&
                                     hyundai_camera_scc && hyundai_longitudinal && !hyundai_canfd_alt_buttons && !hyundai_canfd_lka_steer_msg;
+  // the main button is the cruise button on this config, so main off ends cruise only
+  mads_main_off_keeps_lateral = hyundai_long_main_button_engage;
   hyundai_canfd_handback = GET_FLAG(param, HYUNDAI_PARAM_CAMERA_HANDBACK) && lfa_alt_steering && hyundai_ccnc && hyundai_camera_scc &&
                            !hyundai_canfd_alt_buttons && !hyundai_canfd_lka_steer_msg;
   hyundai_canfd_hb_lat_op = false;

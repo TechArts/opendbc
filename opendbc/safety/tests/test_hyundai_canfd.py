@@ -1015,22 +1015,98 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self._brake(1)
     self.assertFalse(self.safety.get_controls_allowed())
 
-  def test_set_resume_unchanged(self):
+  def test_set_resume_without_flag_unchanged(self):
     for btn in (self.SET, self.RESUME):
       with self.subTest(btn=btn):
-        for param in (self.BASE | self.FLAG, self.BASE):
-          self._init(param)
-          self._button(btn)
-          self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
-          self._button(0)
-          self.assertTrue(self.safety.get_controls_allowed())
-          self.assertFalse(self.safety.get_acc_main_on())
+        self._init(self.BASE)
+        self._button(btn)
+        self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
+        self._button(0)
+        self.assertTrue(self.safety.get_controls_allowed())
+        self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_set_resume_with_main_off_does_not_arm(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init()
+        self._button(btn)
+        self._button(0)
+        self.assertFalse(self.safety.get_acc_main_on())
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_set_resume_with_main_on_arms(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init()
+        self._press_main()
+        self._button(self.CANCEL)  # main stays on, controls off
+        self._button(0)
+        self.assertTrue(self.safety.get_acc_main_on())
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._button(btn)
+        self._button(0)
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_set_after_main_off_does_not_rearm(self):
+    self._init()
+    self._press_main()  # engage
+    self._press_main()  # main off
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(self.SET)
+    self._button(0)
+    self.assertFalse(self.safety.get_controls_allowed())
 
   def test_init_resets_flag(self):
     self._init()
     self._init(self.BASE)
     self._press_main()
     self.assertFalse(self.safety.get_controls_allowed())
+
+  def _lateral_on(self, param=None):
+    self._init(param)
+    self.safety.set_mads_params(True, False, False)
+    self._press_main()  # main on: also requests lateral
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_off_keeps_lateral_with_flag(self):
+    self._lateral_on()
+    self._button(main=1)  # second press: main off ends cruise only
+    self._button(main=0)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_off_drops_lateral_without_flag(self):
+    self._init(self.BASE)
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._button(main=1)
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_other_lateral_exits_unchanged_with_flag(self):
+    # heartbeat mismatch (sunnypilot ended lateral, e.g. LFA button) still exits after 3 checks
+    self._lateral_on()
+    self.safety.set_heartbeat_engaged_mads(True)
+    for _ in range(5):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(3):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_flag_resets_on_init(self):
+    self._lateral_on()
+    self._init(self.BASE)
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self._button(main=1)
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
 
 
 class TestHyundaiCanfdCameraHandback(unittest.TestCase):

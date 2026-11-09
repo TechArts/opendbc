@@ -60,6 +60,10 @@ class TestMainButtonEngage(unittest.TestCase):
 
   def test_set_resume_enable_unchanged(self):
     cs = self._carstate()
+    cs.main_available = True  # main on (set by update_canfd)
     for btn, expected in ((ButtonType.accelCruise, True), (ButtonType.decelCruise, True), (ButtonType.setCruise, False)):
       assert cs.update_button_enable([structs.CarState.ButtonEvent(type=btn, pressed=False)]) == expected
     assert not cs.update_button_enable([structs.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=True)])
+    cs.main_available = False  # SET/RES with main off never enables
+    for btn in (ButtonType.accelCruise, ButtonType.decelCruise):
+      assert not cs.update_button_enable([structs.CarState.ButtonEvent(type=btn, pressed=False)])
