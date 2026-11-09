@@ -117,15 +117,20 @@ class TestCarControllerHandback(unittest.TestCase):
     self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
     self.hud = structs.CarControl.HUDControl()
 
-  def _msgs(self, steer_req=False, enabled=False, brake=False, buttons=(), frame=None):
+  def _msgs(self, steer_req=False, enabled=False, brake=False, buttons=(), frame=None, lat_active=None):
     if frame is not None:
       self.cc.frame = frame
+    if self.cc.frame % 5 == 0:
+      self.cc.frame += 2  # off the icon cadence (needs real CCNC frames)
     self.cs.out.brakePressed = brake
     self.cs.out.buttonEvents = [structs.CarState.ButtonEvent(type=t, pressed=True) for t in buttons]
     cc = structs.CarControl()
     cc.enabled = enabled
+    cc.latActive = steer_req if lat_active is None else lat_active
     msgs = self.cc.create_canfd_msgs(steer_req, 0, 0.0, 0.0, False, self.hud, self.cs, cc)
     self.cc.frame += 2
+    self._last_cb = next((m[1] for m in msgs if m[0] == 0xCB), None)
+    self._last_scc = next((m[1] for m in msgs if m[0] == 0x1A0), None)
     return {m[0] for m in msgs}
 
   def test_flag_set(self):
@@ -165,16 +170,55 @@ class TestCarControllerHandback(unittest.TestCase):
     sent = self._msgs()
     self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
 
-  def test_lfa_button_ends_lateral_after_tail(self):
+  def test_lfa_button_never_ends_lateral(self):
+    # the panda keeps lateral for good, and so does openpilot: inactive frames only, never the camera's
     self._msgs(steer_req=True, enabled=True)
     self._msgs(steer_req=False, enabled=False, buttons=(ButtonType.lkas,))
-    self._msgs(frame=2 + TAIL_FRAMES + 10)
-    sent = self._msgs()
-    self.assertFalse(sent & {0xCB, 0xEA})
+    self._msgs(frame=2 + 10 * TAIL_FRAMES)
+    for _ in range(5):
+      sent = self._msgs()
+      self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def test_takeover_pause_sends_inactive_frames_and_takes_axis(self):
+    # LFA on while the driver pushes hard: MADS allows steering (latActive) but the takeover filter sends no request; the first frame is inactive
+    sent = self._msgs(lat_active=True, steer_req=False)
+    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+    dat = self._last_cb
+    parser = CANParser(DBC_NAME, [("LFA_ALT", 0)], 0)
+    parser.update([(0, [(0xCB, dat, 0)])])
+    self.assertEqual(parser.vl["LFA_ALT"]["ADAS_ActvACILvl2Sta"], 1)  # inactive
+    self.assertEqual(parser.vl["LFA_ALT"]["ADAS_ACIAnglTqRedcGainVal"], 0)
+
+  def test_silent_while_mads_off_and_never_owned(self):
+    for _ in range(10):
+      sent = self._msgs(lat_active=False)
+      self.assertFalse(sent & {0xCB, 0xEA})
+
+  def test_stock_acc_lock_sends_off_frames(self):
+    # camera ACC engaged (ACCMode 1) while openpilot is not: 0x1A0 'off' frames, also if openpilot never owned the axis
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}
+    sent = self._msgs(enabled=False)
+    self.assertIn(0x1A0, sent)
+    dat = self._last_scc
+    parser = CANParser(DBC_NAME, [("SCC_CONTROL", 0)], 0)
+    parser.update([(0, [(0x1A0, dat, 0)])])
+    self.assertEqual(parser.vl["SCC_CONTROL"]["ACCMode"], 0)
+    self.assertEqual(parser.vl["SCC_CONTROL"]["aReqValue"], 0)
+    self.cs.cruise_info["ACCMode"] = 4  # camera back in standby: silent again
+    self.assertNotIn(0x1A0, self._msgs(enabled=False, frame=2 + 5000))
+
+  def test_stock_acc_not_locked_while_openpilot_engaged(self):
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}
+    self._msgs(enabled=True)
+    dat = self._last_scc
+    parser = CANParser(DBC_NAME, [("SCC_CONTROL", 0)], 0)
+    parser.update([(0, [(0x1A0, dat, 0)])])
+    self.assertEqual(parser.vl["SCC_CONTROL"]["ACCMode"], 1)
+
 
   def test_counter_follows_camera(self):
     msgs = self.cc.create_canfd_msgs(True, 0, 0.0, 0.0, False, self.hud, self.cs, SimpleNamespace(
-      enabled=True, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
+      enabled=True, latActive=True, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
     by_addr = {m[0]: m[1] for m in msgs}
     parser = CANParser(DBC_NAME, [("LFA_ALT", 0), ("SCC_CONTROL", 0)], 0)
     parser.update([(0, [(0xCB, by_addr[0xCB], 0), (0x1A0, by_addr[0x1A0], 0)])])
@@ -183,14 +227,14 @@ class TestCarControllerHandback(unittest.TestCase):
 
   def test_mdps_echo_value(self):
     msgs = self.cc.create_canfd_msgs(True, 0, 0.0, 0.0, False, self.hud, self.cs, SimpleNamespace(
-      enabled=False, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
+      enabled=False, latActive=True, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
     dat = next(m[1] for m in msgs if m[0] == 0xEA)
     parser = CANParser(DBC_NAME, [("MDPS", 0)], 2)
     parser.update([(0, [(0xEA, dat, 2)])])
     self.assertEqual(parser.vl["MDPS"]["MDPS_ADASAciActvSta_Lv2"], 2)  # camera asks for ACI: echoed
     self.cs.cam_lfa_alt = {"COUNTER": 101, "ADAS_ActvACILvl2Sta": 1}
     msgs = self.cc.create_canfd_msgs(True, 0, 0.0, 0.0, False, self.hud, self.cs, SimpleNamespace(
-      enabled=False, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
+      enabled=False, latActive=True, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
     dat = next(m[1] for m in msgs if m[0] == 0xEA)
     parser.update([(0, [(0xEA, dat, 2)])])
     self.assertEqual(parser.vl["MDPS"]["MDPS_ADASAciActvSta_Lv2"], 1)
