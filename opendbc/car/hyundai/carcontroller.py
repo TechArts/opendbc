@@ -169,7 +169,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
                                    CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
                                    1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD))
-    self.lat_owner, self.long_owner = AxisOwner(), AxisOwner()
+    self.lat_owner, self.long_owner = AxisOwner(latch=True), AxisOwner()
     self.lfa_alt_counter, self.scc_counter = CounterFollower(1 << 16), CounterFollower(1 << 16)
     self.prev_brake_pressed = False
 
@@ -368,8 +368,13 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       self.prev_brake_pressed = CS.out.brakePressed
       pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
       driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
-      send_lat = self.lat_owner.update(bool(apply_steer_req), button_type.lkas in pressed, self.frame)
+      # lateral: from the first frame while MADS allows it (also while the takeover filter has paused our request: inactive frames keep the
+      # camera's own request off the EPS), and for good
+      send_lat = self.lat_owner.update(bool(CC.latActive), button_type.lkas in pressed, self.frame)
       send_long = self.long_owner.update(bool(CC.enabled and self.CP.openpilotLongitudinalControl), driver_cruise, self.frame)
+      # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
+      stock_acc_lock = bool(self.CP.openpilotLongitudinalControl and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
+      send_long = send_long or stock_acc_lock
 
     if send_lat:
       lfa_alt_counter = self.lfa_alt_counter.next(CS.cam_lfa_alt.get("COUNTER")) if self.handback else None

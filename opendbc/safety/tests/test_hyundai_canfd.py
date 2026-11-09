@@ -1176,8 +1176,9 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
 
 
 class TestHyundaiCanfdCameraHandback(unittest.TestCase):
-  """CAMERA_HANDBACK: the camera's 0xCB / 0xEA (MDPS) / 0x1A0 are forwarded unless openpilot owns that axis; ownership returns to the camera
-  only after a driver action (lateral: MADS button only; longitudinal: brake, cancel, main button), never because openpilot stalled."""
+  """CAMERA_HANDBACK: the camera's 0xCB / 0xEA (MDPS) / 0x1A0 are forwarded unless openpilot owns that axis. Lateral goes to openpilot on its first
+  accepted 0xCB frame (active or inactive, with permission) and never comes back; longitudinal returns to the camera after a driver action (brake,
+  cancel, main button), never because openpilot stalled; a camera ACC that engages without a driver engage for openpilot is locked out of the car."""
 
   BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING | HyundaiSafetyFlags.CCNC
   FLAG = HyundaiSafetyFlags.CAMERA_HANDBACK
@@ -1354,7 +1355,9 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertTrue(self._scc_fwd())
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
-  def test_lfa_button_hands_lateral_back_after_brake(self):
+  def test_lfa_button_never_hands_lateral_back(self):
+    # the camera's lane keeping (also enabled again by the Driving Assist/main press or by lane keeping assist) must not steer after the driver's
+    # LFA press: openpilot keeps sending its inactive frames until the next panda init
     self._init()
     self._engage_lat()
     self._engage_long()
@@ -1363,10 +1366,18 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertFalse(self._cb_fwd())
     self._lfa_button()
     self.safety.set_controls_allowed_lateral(False)
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
+    self.safety.set_timer(30 * self.S)
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+    self.assertTrue(self._cb(False) and self._mdps())  # our inactive frames and the MDPS copy keep flowing
+    for _ in range(3):
+      self._button(self.CANCEL)
+      self._button(main=1)
+      self._camera_main(1)
+      self._button(main=0)
+      self._lfa_button()
+      self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
-
-  def test_mads_button_then_permission_loss_hands_lateral_back(self):
+  def test_mads_button_then_permission_loss_keeps_lateral(self):
     self._init()
     self.safety.set_controls_allowed_lateral(True)
     self.assertTrue(self._cb(True))
@@ -1374,7 +1385,37 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertFalse(self._cb_fwd())
     self.safety.set_timer(3 * self.S)
     self.safety.set_controls_allowed_lateral(False)
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+
+  def test_inactive_frame_takes_lateral_under_permission(self):
+    # LFA on while the driver pushes hard: the takeover filter sends inactive frames (request 0), the camera's request must not reach the EPS
+    self._init()
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._cb_fwd())  # openpilot has not sent yet
+    self.assertTrue(self._cb(False))
+    self.assertFalse(self._cb_fwd())
+    self.assertFalse(self._mdps_fwd())
+    self.assertTrue(self._mdps())
+    self.assertTrue(self._scc_fwd())  # longitudinal untouched
+
+  def test_inactive_frame_rejected_without_permission(self):
+    self._init()
+    self.assertFalse(self._cb(False))
     self.assertTrue(self._cb_fwd() and self._mdps_fwd())
+    self.safety.set_controls_allowed_lateral(True)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertFalse(self._cb(False))
+    self.assertTrue(self._cb_fwd())
+
+  def test_takeover_pause_never_lets_camera_through(self):
+    self._init()
+    self._engage_lat()
+    for _ in range(50):  # paused: inactive frames only, for a long time and across a permission change
+      self.assertTrue(self._cb(False))
+      self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+    self.safety.set_controls_allowed_lateral(False)
+    self.safety.set_timer(10 * self.S)
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
   def test_heartbeat_loss_keeps_camera_blocked_until_driver_action(self):
     self._init()
@@ -1386,33 +1427,8 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self._brake(1)  # the next brake releases longitudinal only
     self.assertTrue(self._scc_fwd())
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
-    self._lfa_button()  # explicit steering disable releases lateral
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
-
-  def test_stale_driver_action_does_not_hand_back(self):
-    self._init()
-    self.safety.set_controls_allowed_lateral(True)
-    self.assertTrue(self._cb(True))
-    self._lfa_button()  # old LFA press
-    self.safety.set_mads_button_press(0)
-    self.assertFalse(self._cb_fwd())
-    self.safety.set_timer(30 * self.S)
-    self.safety.set_controls_allowed_lateral(False)
-    self.assertFalse(self._cb_fwd())
-    self._button(self.CANCEL)  # cancel never hands steering back
-    self.assertFalse(self._cb_fwd())
-    self._lfa_button()
-    self.assertTrue(self._cb_fwd())
-
-  def test_recent_lfa_button_before_permission_loss(self):
-    self._init()
-    self.safety.set_controls_allowed_lateral(True)
-    self.assertTrue(self._cb(True))
-    self._lfa_button()  # MADS continues until the heartbeat mismatch drops the permission
-    self.assertFalse(self._cb_fwd())
-    self.safety.set_timer(4 * self.S)
-    self.safety.set_controls_allowed_lateral(False)
-    self.assertTrue(self._cb_fwd())
+    self._lfa_button()  # lateral stays with openpilot
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
   def test_brake_while_steering_never_hands_lateral_back(self):
     self._init()
@@ -1423,20 +1439,132 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(False)
     self.assertFalse(self._cb_fwd())
 
-  def test_reengage_after_handback(self):
+  def test_reengage_after_longitudinal_handback(self):
     self._init()
     self._engage_lat()
     self._engage_long()
     self._brake(1)
     self._brake(0)
     self.assertTrue(self._scc_fwd())
-    self._lfa_button()
-    self.safety.set_controls_allowed_lateral(False)
-    self.assertTrue(self._cb_fwd())
-    self.safety.set_mads_button_press(0)
-    self._engage_lat()
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
     self._engage_long()
     self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
+
+  # --- stock ACC lock: the camera's own ACC engaged without a driver engage for openpilot (CANCEL tap in standby, route 2d 9:48.8 / 11:01.8)
+  def _camera_acc(self, mode, main=1):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": main, "ACCMode": mode}))
+
+  def _standby_after_brake(self):
+    """openpilot engaged (lateral and longitudinal), driver brakes: longitudinal goes back to the camera, which sits in standby with main on."""
+    self._init()
+    self._button(main=1)
+    self._camera_main(1)
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._cb(True) and self._scc(1))
+    self._camera_acc(1)  # camera engaged along with openpilot
+    self._brake(1)
+    self._brake(0)
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._camera_acc(4)  # camera: standby
+    self.assertTrue(self._scc_fwd())
+
+  def _cancel_tap(self):
+    for _ in range(7):
+      self._button(self.CANCEL)
+    self._button(0)
+
+  def test_cancel_tap_in_standby_is_locked_out(self):
+    self._standby_after_brake()
+    self._cancel_tap()
+    self.assertFalse(self.safety.get_controls_allowed())  # the panda sees a cancel: nothing of ours is engaged
+    self._camera_acc(1)  # the camera resumed its own ACC at the stale set speed
+    self.assertFalse(self._scc_fwd())  # from the next frame the car does not see the camera's 0x1A0
+    self.assertTrue(self._scc(0))  # openpilot's 'off' frames replace it
+    self.assertFalse(self._scc(1))  # but cannot engage anything
+    self.assertFalse(self._scc(2))
+    for _ in range(20):
+      self._camera_acc(1)
+      self.assertFalse(self._scc_fwd())
+      self.assertTrue(self._scc(0))
+
+  def test_stock_lock_ends_when_camera_is_back_in_standby(self):
+    self._standby_after_brake()
+    self._cancel_tap()
+    self._camera_acc(1)
+    self.assertFalse(self._scc_fwd())
+    self._camera_acc(4)
+    self._camera_acc(4)
+    self.assertFalse(self._scc_fwd())
+    self._camera_acc(1)  # a blip resets the count
+    self._camera_acc(4)
+    self._camera_acc(4)
+    self.assertFalse(self._scc_fwd())
+    self._camera_acc(4)
+    self.assertTrue(self._scc_fwd())  # camera frames flow again (standby, nothing to drive)
+    self.assertFalse(self._scc(0))  # and openpilot's frames are rejected as before
+
+  def test_stock_lock_ends_when_camera_main_goes_off(self):
+    self._standby_after_brake()
+    self._cancel_tap()
+    self._camera_acc(1)
+    for _ in range(3):
+      self._camera_acc(0, main=0)
+    self.assertTrue(self._scc_fwd())
+
+  def test_explicit_engage_is_not_locked(self):
+    # SET/RES press with main on: controls allowed at the press, the camera engages along: openpilot takes over, no lock
+    self._standby_after_brake()
+    self._button(2)
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._camera_acc(1)
+    self.assertTrue(self._scc_fwd())  # camera still supplies the car until openpilot's first engaged frame
+    self.assertFalse(self._scc(0))
+    self.assertTrue(self._scc(1))
+    self.assertFalse(self._scc_fwd())
+
+  def test_lock_releases_to_openpilot_on_explicit_engage(self):
+    self._standby_after_brake()
+    self._cancel_tap()
+    self._camera_acc(1)
+    self.assertFalse(self._scc_fwd())
+    self._button(2)  # now the driver engages on purpose
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._scc(1))
+    self._camera_acc(4)
+    self._camera_acc(4)
+    self._camera_acc(4)
+    self.assertFalse(self._scc_fwd())  # openpilot owns it, the lock is gone but the ownership stays
+    self.assertTrue(self._scc(1))
+
+  def test_first_camera_frame_is_not_an_engage_edge(self):
+    self._init()
+    self._camera_acc(1)  # openpilot restarted while the stock ACC was already driving: no lock, the camera keeps the car
+    self.assertTrue(self._scc_fwd())
+    self._camera_acc(1)
+    self.assertTrue(self._scc_fwd())
+
+  def test_stock_lock_needs_camera_main_engage_config(self):
+    self._init()
+    self.safety.set_controls_allowed(False)
+    self._camera_acc(4)
+    self._camera_acc(1)
+    self.assertFalse(self._scc_fwd())
+    self._init(long=False)
+    self._camera_acc(4)
+    self._camera_acc(1)
+    self.assertTrue(self._scc_fwd())  # without openpilot longitudinal 0x1A0 is the camera's alone
+
+  def test_cancel_button_still_reaches_camera_when_it_is_engaged(self):
+    # the stock pause key must keep working on a camera ACC that is engaged (the lock only blocks its 0x1A0 output)
+    self._standby_after_brake()
+    self._cancel_tap()
+    self._camera_acc(1)
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x1CF))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1CF))
 
 
   def test_init_resets_ownership(self):

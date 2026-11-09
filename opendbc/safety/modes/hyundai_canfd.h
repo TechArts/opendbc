@@ -81,37 +81,44 @@ static uint32_t hyundai_canfd_get_checksum(const CANPacket_t *msg) {
 }
 
 // CAMERA_HANDBACK (GV70 CCNC LFA_ALT camera SCC): the stock camera keeps control of 0xCB (LFA_ALT), 0xEA (MDPS to the camera) and, with
-// openpilot longitudinal, 0x1A0 (SCC_CONTROL) until openpilot takes an axis, and gets it back only after a driver action.
-//   stock -> openpilot: the first openpilot frame that passes the TX checks while the panda allows that axis (0xCB: active request;
-//                       0x1A0: ACCMode 1/2). From then on the camera's frame is blocked, so there is no gap and no second sender.
-//   openpilot -> stock: the panda no longer allows the axis AND the driver acted (lateral: MADS button only, a brake or takeover never hands steering back;
-//                       longitudinal: brake press, cancel, main button)
-//                       within HYUNDAI_CANFD_HB_ACTION_WINDOW_US of that moment (before or after). Losing the permission any other
-//                       way (heartbeat mismatch, lag, invalid rx, stalled openpilot) keeps the camera blocked until the next driver action.
-// While stock owns an axis, openpilot's frames for it are rejected, so the two never interleave.
+// openpilot longitudinal, 0x1A0 (SCC_CONTROL) until openpilot takes an axis.
+//   stock -> openpilot, lateral: the first openpilot 0xCB frame that passes the TX checks while the panda allows lateral (controls_allowed or
+//                       controls_allowed_lateral). An INACTIVE frame takes the axis too: during a driver takeover pause (steering request 0,
+//                       wheel pushed hard) openpilot sends inactive frames, and the camera's own request must not reach the EPS then.
+//                       openpilot never gives lateral back: after the driver's LFA press the camera's lane keeping only comes back with
+//                       the next panda init (ignition), because the car's own LFA also re-enables itself from the Driving Assist (main) press
+//                       and from lane keeping assist, which the driver did not ask for. A lost permission (heartbeat mismatch, lag, stalled
+//                       openpilot) keeps the camera blocked, too.
+//   stock -> openpilot, longitudinal: the first openpilot frame that passes the TX checks while controls are allowed (0x1A0: ACCMode 1/2).
+//   openpilot -> stock, longitudinal: the panda no longer allows it AND the driver acted (brake press, cancel, main button) within
+//                       HYUNDAI_CANFD_HB_ACTION_WINDOW_US of that moment (before or after). Losing the permission any other way keeps the
+//                       camera blocked until the next driver action.
+// STOCK ACC LOCK: after a hand-back the camera sits in standby (main on, ACCMode 4) and its cruise key is a pause/resume toggle, so a CANCEL
+// press makes the camera resume its own ACC at its stale set speed (route 2d 9:48.8, 11:01.8: 25 -> 49 mph). The panda cannot see the
+// button in the forward hook (fwd runs before rx and only gets bus and address), so it acts on the camera's own state instead: a rising
+// camera ACCMode 1/2 while controls are not allowed and openpilot does not own 0x1A0 is an engage the driver did not make for openpilot.
+// From the next frame the camera's 0x1A0 is blocked and openpilot's 'off' frames (ACCMode not 1/2) replace it, until the camera is back
+// in standby for HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES frames or openpilot takes the axis. At most one camera frame (aReq about 0) leaks.
+// While stock owns an axis, openpilot's frames for it are rejected (except the lock's 'off' frames), so the two never interleave.
 static bool hyundai_canfd_handback = false;
 static bool hyundai_canfd_hb_lat_op = false;
 static bool hyundai_canfd_hb_long_op = false;
-static bool hyundai_canfd_hb_lat_action = false;
 static bool hyundai_canfd_hb_long_action = false;
-static uint32_t hyundai_canfd_hb_lat_action_ts = 0U;
 static uint32_t hyundai_canfd_hb_long_action_ts = 0U;
 static bool hyundai_canfd_hb_brake_prev = false;
 static bool hyundai_canfd_hb_main_on_prev = false;
-static bool hyundai_canfd_hb_mads_prev = false;
 static bool hyundai_canfd_hb_cancel_prev = false;
 static bool hyundai_canfd_hb_main_button_prev = false;
+static bool hyundai_canfd_hb_cam_seen = false;      // a camera 0x1A0 was received since init (the first one is not an engage edge)
+static bool hyundai_canfd_hb_cam_engaged = false;   // camera ACCMode 1 or 2
+static bool hyundai_canfd_hb_stock_lock = false;
+static uint8_t hyundai_canfd_hb_cam_standby_frames = 0U;
 static const uint32_t HYUNDAI_CANFD_HB_ACTION_WINDOW_US = 10000000U;  // heartbeat mismatch exits MADS/controls ~3 s after openpilot disengages
+static const uint8_t HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES = 3U;
 
-static void hyundai_canfd_handback_note_action(uint32_t now, bool lat, bool lon) {
-  if (lat) {
-    hyundai_canfd_hb_lat_action = true;
-    hyundai_canfd_hb_lat_action_ts = now;
-  }
-  if (lon) {
-    hyundai_canfd_hb_long_action = true;
-    hyundai_canfd_hb_long_action_ts = now;
-  }
+static void hyundai_canfd_handback_note_action(uint32_t now) {
+  hyundai_canfd_hb_long_action = true;
+  hyundai_canfd_hb_long_action_ts = now;
 }
 
 static bool hyundai_canfd_handback_recent(bool valid, uint32_t ts, uint32_t now) {
@@ -120,30 +127,42 @@ static bool hyundai_canfd_handback_recent(bool valid, uint32_t ts, uint32_t now)
 
 static void hyundai_canfd_handback_step(void) {
   const uint32_t now = microsecond_timer_get();
-  const bool lat_allowed = controls_allowed || controls_allowed_lateral;
 
   const bool brake_edge = brake_pressed && !hyundai_canfd_hb_brake_prev;
   const bool main_off_edge = hyundai_canfd_hb_main_on_prev && !acc_main_on;
-  const bool mads_pressed = (mads_button_press == MADS_BUTTON_PRESSED);
-  const bool mads_edge = mads_pressed && !hyundai_canfd_hb_mads_prev;
   hyundai_canfd_hb_brake_prev = brake_pressed;
   hyundai_canfd_hb_main_on_prev = acc_main_on;
-  hyundai_canfd_hb_mads_prev = mads_pressed;
 
   if (brake_edge || main_off_edge) {
-    hyundai_canfd_handback_note_action(now, false, true);
-  }
-  if (mads_edge) {
-    hyundai_canfd_handback_note_action(now, true, false);
+    hyundai_canfd_handback_note_action(now);
   }
 
-  if (hyundai_canfd_hb_lat_op && !lat_allowed && hyundai_canfd_handback_recent(hyundai_canfd_hb_lat_action, hyundai_canfd_hb_lat_action_ts, now)) {
-    hyundai_canfd_hb_lat_op = false;
-    hyundai_canfd_hb_lat_action = false;
-  }
   if (hyundai_canfd_hb_long_op && !controls_allowed && hyundai_canfd_handback_recent(hyundai_canfd_hb_long_action, hyundai_canfd_hb_long_action_ts, now)) {
     hyundai_canfd_hb_long_op = false;
     hyundai_canfd_hb_long_action = false;
+  }
+}
+
+// the camera's own ACC state, from its 0x1A0 on bus 2
+static void hyundai_canfd_handback_camera_acc(int acc_mode) {
+  const bool engaged = (acc_mode == 1) || (acc_mode == 2);
+  const bool rising = engaged && !hyundai_canfd_hb_cam_engaged && hyundai_canfd_hb_cam_seen;
+  hyundai_canfd_hb_cam_engaged = engaged;
+  hyundai_canfd_hb_cam_seen = true;
+
+  if (rising && !controls_allowed && !hyundai_canfd_hb_long_op) {
+    hyundai_canfd_hb_stock_lock = true;
+    hyundai_canfd_hb_cam_standby_frames = 0U;
+  }
+  if (hyundai_canfd_hb_stock_lock) {
+    if (engaged) {
+      hyundai_canfd_hb_cam_standby_frames = 0U;
+    } else {
+      hyundai_canfd_hb_cam_standby_frames = (hyundai_canfd_hb_cam_standby_frames < 255U) ? (hyundai_canfd_hb_cam_standby_frames + 1U) : 255U;
+      if (hyundai_canfd_hb_cam_standby_frames >= HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES) {
+        hyundai_canfd_hb_stock_lock = false;
+      }
+    }
   }
 }
 
@@ -154,7 +173,7 @@ static void hyundai_canfd_handback_buttons(int cruise_button, bool main_button) 
   hyundai_canfd_hb_main_button_prev = main_button;
   if (hyundai_canfd_handback) {
     if (cancel_edge || main_edge) {
-      hyundai_canfd_handback_note_action(microsecond_timer_get(), false, true);
+      hyundai_canfd_handback_note_action(microsecond_timer_get());
     }
     hyundai_canfd_handback_step();
   }
@@ -235,6 +254,9 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     }
     if ((msg->addr == 0x1a0U) && hyundai_longitudinal && hyundai_long_main_button_engage) {
       hyundai_common_camera_main_update(GET_BIT(msg, 66U));
+      if (hyundai_canfd_handback) {
+        hyundai_canfd_handback_camera_acc((msg->data[8] >> 4) & 0x7U);
+      }
     }
   }
 
@@ -338,10 +360,9 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     if (hyundai_canfd_handback) {
       hyundai_canfd_handback_step();
       if (hyundai_canfd_hb_lat_op) {
-        // openpilot owns lateral: inactive frames pass too, so the car keeps getting 0xCB until the driver hands it back
-      } else if (tx && steer_angle_req && (controls_allowed || controls_allowed_lateral)) {
-        hyundai_canfd_hb_lat_op = true;
-        hyundai_canfd_hb_lat_action = false;
+        // openpilot owns lateral for good: inactive frames pass too, so the car keeps getting 0xCB and never the camera's
+      } else if (tx && (controls_allowed || controls_allowed_lateral)) {
+        hyundai_canfd_hb_lat_op = true;  // active or inactive frame: both keep the camera's request away from the EPS
       } else {
         tx = false;
       }
@@ -427,6 +448,9 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
         if (!violation && ((hb_acc_mode == 1) || (hb_acc_mode == 2)) && controls_allowed) {
           hyundai_canfd_hb_long_op = true;
           hyundai_canfd_hb_long_action = false;
+          hyundai_canfd_hb_stock_lock = false;
+        } else if (hyundai_canfd_hb_stock_lock && !violation && (hb_acc_mode != 1) && (hb_acc_mode != 2)) {
+          // stock ACC lock: 'off' frames replace the camera's, they cannot engage anything
         } else {
           violation = true;
         }
@@ -457,7 +481,8 @@ static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
       return hyundai_canfd_hb_lat_op;
     }
     if ((bus_num == 2) && (addr == 0x1A0) && hyundai_longitudinal) {
-      return hyundai_canfd_hb_long_op;
+      // also blocked while the stock ACC lock is on: the camera's ACC engaged without a driver engage for openpilot
+      return hyundai_canfd_hb_long_op || hyundai_canfd_hb_stock_lock;
     }
     return false;
   }
@@ -590,15 +615,16 @@ static safety_config hyundai_canfd_init(uint16_t param) {
                            !hyundai_canfd_alt_buttons && !hyundai_canfd_lka_steer_msg;
   hyundai_canfd_hb_lat_op = false;
   hyundai_canfd_hb_long_op = false;
-  hyundai_canfd_hb_lat_action = false;
   hyundai_canfd_hb_long_action = false;
-  hyundai_canfd_hb_lat_action_ts = 0U;
   hyundai_canfd_hb_long_action_ts = 0U;
   hyundai_canfd_hb_brake_prev = false;
   hyundai_canfd_hb_main_on_prev = false;
-  hyundai_canfd_hb_mads_prev = false;
   hyundai_canfd_hb_cancel_prev = false;
   hyundai_canfd_hb_main_button_prev = false;
+  hyundai_canfd_hb_cam_seen = false;
+  hyundai_canfd_hb_cam_engaged = false;
+  hyundai_canfd_hb_stock_lock = false;
+  hyundai_canfd_hb_cam_standby_frames = 0U;
 
   safety_config ret;
   if (hyundai_longitudinal) {
