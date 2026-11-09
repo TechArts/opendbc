@@ -10,7 +10,7 @@ accepted openpilot frame until the axis is no longer allowed AND the driver acte
     action (the heartbeat mismatch takes ~3 s), and rejects any frame of ours from then on, so a long tail is harmless and a short one is not.
 Without a driver action it keeps sending 'off' frames: the car sees a benign off state, the stock camera does not take over unannounced.
 """
-from opendbc.car import DT_CTRL
+from opendbc.car import DT_CTRL, structs
 
 TAIL_FRAMES = int(6.0 / DT_CTRL)         # > the panda's ~3 s heartbeat mismatch + margin
 RECENT_ACTION_FRAMES = int(1.0 / DT_CTRL)  # a driver action this close before the axis went inactive is its reason
@@ -93,3 +93,30 @@ class CounterFollower:
       self.last_out = (self.last_out + 1) % self.modulus
     self.last_camera = camera_counter
     return self.last_out
+
+
+class CameraHandback:
+  """Per-frame hand-back state of the car controller: which axes openpilot sends this frame, and the counters it continues."""
+  def __init__(self):
+    self.long_owner = AxisOwner()
+    self.lka_window = LkaWindow()
+    self.lfa_alt_counter = CounterFollower(1 << 16)
+    self.scc_counter = CounterFollower(1 << 16)
+    self.prev_brake_pressed = False
+
+  def update(self, CC, CS, openpilot_long: bool, frame: int) -> tuple[bool, bool]:
+    """Returns (send lateral, send longitudinal) for this frame."""
+    button_type = structs.CarState.ButtonEvent.Type
+    brake_edge = CS.out.brakePressed and not self.prev_brake_pressed
+    self.prev_brake_pressed = CS.out.brakePressed
+    pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
+    driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
+    # lateral: always ours from the start (inactive frames too: the camera's own request, LFA lane centering included, must not reach the EPS,
+    # also after a main press that turns the car's LFA on), except while the car's own lane-keeping nudge (LKA) steers with openpilot
+    # steering off: then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we send nothing (the panda decides the same, see LkaWindow)
+    lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, frame)
+    send_lat = not (lka_nudge and not CC.latActive)
+    send_long = self.long_owner.update(bool(CC.enabled and openpilot_long), driver_cruise, frame)
+    # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
+    stock_acc_lock = bool(openpilot_long and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
+    return send_lat, send_long or stock_acc_lock
