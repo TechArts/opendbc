@@ -203,9 +203,10 @@ ICON_OFF, ICON_PAUSED, ICON_ACTIVE = 0, 1, 2
 
 
 def create_ccnc(packer, CAN, openpilotLongitudinalControl, long_state, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
-                is_metric, out, main_cruise_enabled, lat_state, cluster_alert=None, passthrough_lat=False, passthrough_long=False):
+                is_metric, out, main_cruise_enabled, lat_state, cluster_alert=None, passthrough_lat=False, passthrough_long=False, camera_lfa_on=False):
   """lat_state / long_state: ICON_*. passthrough_lat / passthrough_long: openpilot does not own that axis, so the camera's own dash fields
-  for it (its real LFA / cruise state) are kept as received."""
+  for it (its real LFA / cruise state) are kept as received. camera_lfa_on: the car's own LFA is on but cannot steer (openpilot steering is off
+  and the panda blocks its lane centering): its icon is shown grey, never green, while openpilot's lateral state is OFF."""
   stock_161 = dict(msg_161)
   if msg_161["ALERTS_2"] == 5:
     msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
@@ -225,7 +226,7 @@ def create_ccnc(packer, CAN, openpilotLongitudinalControl, long_state, hud, left
   if not passthrough_lat:
     # green wheel/centre line/lane lines only while openpilot steers; paused is a gray wheel with plain white lane lines
     msg_161.update({
-      "LFA_ICON": lat_state,
+      "LFA_ICON": ICON_PAUSED if lat_off and camera_lfa_on else lat_state,
       "CENTERLINE": 1 if lat_active else 0,
       "LANELINE_CURVATURE": curvature.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14) if lat_active and not anyBlinker else 15,
       "LANELINE_LEFT": (0 if lat_off else 1 if not hud.leftLaneVisible else 4 if hud.leftLaneDepart else 6 if anyBlinker and lat_active else 2),
