@@ -59,12 +59,19 @@ class TestIconMapping(unittest.TestCase):
       (ICON_ACTIVE, True): (2, 2, 2, 1, 2, 2, 2),
       (ICON_PAUSED, True): (1, 1, 2, 1, 1, 1, 1),  # gas override: gray
       (ICON_OFF, True): (1, 1, 0, 0, 0, 0, 1),     # main on, not engaged: gray standby, no gap bars
-      (ICON_OFF, False): (1, 0, 0, 0, 0, 0, 0),    # main off: hidden
+      (ICON_OFF, False): (0, 0, 0, 0, 0, 0, 0),    # main off (also the hand-back tail, long_control on): hidden, no set speed
     }
     for (state, main), expected in table.items():
       with self.subTest(state=state, main=main):
         m161, m162 = ccnc(long=state, main=main, lead=True, bars=2)
         self.assertEqual(tuple(m161[k] for k in keys) + (m162["LEAD"],), expected)
+
+  def test_set_speed_hidden_during_hand_back_tail_after_main_off(self):
+    m161, m162 = ccnc(long=ICON_OFF, main=False, long_control=True, lead=True, bars=2)
+    self.assertEqual((m161["SETSPEED"], m161["SETSPEED_HUD"], m161["SETSPEED_SPEED"], m161["DISTANCE"], m161["DISTANCE_CAR"]), (0, 0, 255, 0, 0))
+    self.assertEqual((m161["DISTANCE_SPACING"], m161["DISTANCE_LEAD"], m162["LEAD"]), (0, 0, 0))
+    self.assertEqual(ccnc(long=ICON_OFF, main=True)[0]["SETSPEED"], 1)  # main on, standby
+    self.assertEqual(ccnc(long=ICON_ACTIVE, main=True)[0]["SETSPEED"], 2)
 
   def test_gap_bars_follow_personality_only_while_engaged(self):
     for bars in (1, 2, 3):
