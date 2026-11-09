@@ -99,6 +99,7 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_ANGLE_STEERING = 1024
   CCNC = 2048
   CANFD_LFA_ALT_STEERING = 4096
+  LONG_MAIN_BUTTON_ENGAGE = 8192  # the cruise main button engages/disengages openpilot longitudinal (CCNC LFA_ALT camera-SCC long only)
 
 
 # Hyundai/Kia/Genesis SCC (Smart Cruise Control) and steering architecture:

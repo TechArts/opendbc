@@ -6,7 +6,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, create_button_events, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams
+from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, CAR, DBC, Buttons, CarControllerParams
 from opendbc.car.interfaces import CarStateBase
 
 from opendbc.sunnypilot.car.hyundai.carstate_ext import CarStateExt
@@ -37,6 +37,10 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     self.cruise_buttons: deque = deque([Buttons.NONE] * PREV_BUTTON_SAMPLES, maxlen=PREV_BUTTON_SAMPLES)
     self.main_buttons: deque = deque([Buttons.NONE] * PREV_BUTTON_SAMPLES, maxlen=PREV_BUTTON_SAMPLES)
     self.lda_button = 0
+    # the cruise main button engages openpilot longitudinal (same flag the panda safety uses, so both transition on the same edge)
+    self.long_main_button_engage = bool(CP.openpilotLongitudinalControl and CP.safetyConfigs and
+                                        CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE)
+    self.main_button_enable = False
 
     self.gear_msg_canfd = "ACCELERATOR" if CP.flags & HyundaiFlags.EV else \
                           "GEAR_ALT" if CP.flags & HyundaiFlags.CANFD_ALT_GEARS else \
@@ -80,6 +84,11 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     # To avoid re-engaging when openpilot cancels, check user engagement intention via buttons
     # Main button also can trigger an engagement on these cars
     return any(btn in ENABLE_BUTTONS for btn in self.cruise_buttons) or any(self.main_buttons)
+
+  def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
+    # a main press that turns the main cruise state on is an enable request, on the same (rising) edge as the panda safety.
+    # a press that turns it off leaves cruiseState.available false, so no enable and the usual main-off disengage applies
+    return self.main_button_enable or super().update_button_enable(buttonEvents)
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
@@ -337,6 +346,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
 
     if self.CP.openpilotLongitudinalControl:
       ret.cruiseState.available = self.get_main_cruise(ret)
+    self.main_button_enable = self.long_main_button_engage and bool(ret.cruiseState.available) and \
+                              any(be.type == ButtonType.mainCruise and be.pressed for be in ret.buttonEvents)
 
     CarStateExt.update_canfd_ext(self, ret, ret_sp, can_parsers, speed_factor)
 

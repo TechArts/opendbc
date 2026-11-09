@@ -7,6 +7,7 @@ from opendbc.car import ACCELERATION_DUE_TO_GRAVITY
 from opendbc.car.hyundai.carcontroller import ANGLE_SAFETY_BASELINE_MODEL
 from opendbc.car.hyundai.values import HyundaiSafetyFlags, CAR, HyundaiFlags, CarControllerParams
 from opendbc.car.structs import CarParams
+from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
 from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
@@ -800,6 +801,236 @@ class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
     self._rx(0xEA, 2, 24)
     self.assertTrue(self.safety.get_relay_malfunction())
 
+
+class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
+  """Openpilot longitudinal (SCC_CONTROL) on top of HDA1 LFA_ALT angle steering with camera SCC."""
+
+  BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING
+  LONG = HyundaiSafetyFlags.LONG
+  CCNC = HyundaiSafetyFlags.CCNC
+
+  # superset of both variants; read by common.test_tx_hook_on_wrong_safety_mode
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
+
+  # (addr, bus, length) openpilot may send; 0x1CF is gated on button state, covered separately
+  TX_CCNC = {(0x1E0, 0, 16), (0xCB, 0, 24), (0x1A0, 0, 32), (0x161, 0, 32), (0x162, 0, 32), (0x7C4, 2, 8), (0xEA, 2, 24)}
+  TX_NON_CCNC = {(0x1E0, 0, 16), (0xCB, 0, 24), (0x1A0, 0, 32), (0x160, 0, 16)}
+  CANDIDATES = {(0x12A, 0, 16), (0x1CF, 2, 8), (0x160, 0, 16), (0x7D0, 0, 8), (0x51, 0, 32)} | TX_CCNC | TX_NON_CCNC
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def _init(self, ccnc=True, long=True):
+    param = self.BASE | (self.CCNC if ccnc else 0) | (self.LONG if long else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+
+  def _tx_zero(self, addr, bus, length):
+    if addr == 0x1A0:
+      return self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", bus, {"aReqRaw": 0, "aReqValue": 0}))
+    return self.safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def _rx(self, addr, bus, length):
+    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def test_tx_set(self):
+    for ccnc, expected in ((True, self.TX_CCNC), (False, self.TX_NON_CCNC)):
+      self._init(ccnc)
+      for msg in self.CANDIDATES:
+        with self.subTest(ccnc=ccnc, msg=tuple(map(hex, msg[:1])) + msg[1:]):
+          self.assertEqual(msg in expected, self._tx_zero(*msg))
+
+  def test_openpilot_never_sends_0x12a(self):
+    for ccnc in (True, False):
+      self._init(ccnc)
+      self.assertFalse(self._tx_zero(0x12A, 0, 16))
+
+  def test_camera_0x12a_forwarded_scc_control_blocked(self):
+    for ccnc in (True, False):
+      with self.subTest(ccnc=ccnc):
+        self._init(ccnc)
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x12A))  # lane/FCA/ESA status from the camera still reaches the car
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x1A0))  # the camera's SCC_CONTROL is replaced by ours
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0xCB))
+        self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x1E0))
+
+  def test_ccnc_camera_frames(self):
+    self._init(ccnc=True)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x161))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x162))
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x160))  # not ours on CCNC: the camera's stock FCA warning light frame stays
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0x7C4))
+    self._init(ccnc=False)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x160))  # ours on non-CCNC
+
+  def test_mdps_copy_in_long(self):
+    self._init()
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+    self.assertTrue(self._tx_zero(0xEA, 2, 24))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0xEA))
+    self._init(ccnc=False)
+    self.assertFalse(self._tx_zero(0xEA, 2, 24))
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+
+  def test_relay_malfunction(self):
+    for ccnc, addr, length, expected in ((True, 0x1A0, 32, True), (True, 0x161, 32, True), (True, 0xCB, 24, True), (True, 0x12A, 16, False),
+                                         (True, 0x160, 16, False), (False, 0x160, 16, True), (False, 0x1A0, 32, True)):
+      with self.subTest(ccnc=ccnc, addr=hex(addr)):
+        self._init(ccnc)
+        self._rx(addr, 0, length)
+        self.assertEqual(expected, self.safety.get_relay_malfunction())
+
+  def test_camera_mdps_relay_malfunction(self):
+    self._init()
+    self._rx(0xEA, 2, 24)
+    self.assertTrue(self.safety.get_relay_malfunction())
+
+  def test_accel_limited_by_longitudinal_checks(self):
+    self._init()
+    self.assertTrue(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 0, "aReqValue": 0})))
+    # controls not allowed: only the inactive accel value goes out
+    self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 1.0, "aReqValue": 1.0})))
+
+  def test_cruise_buttons_still_gated(self):
+    self._init()
+    self.assertFalse(self._tx_zero(0x1CF, 2, 8))  # no button / main-button pulses are not allowed
+
+  def test_default_is_stock_scc(self):
+    # toggle off: openpilot may only cancel via SCC_CONTROL, the camera's SCC_CONTROL and 0x12A are forwarded, no MDPS copy until sent
+    for ccnc in (True, False):
+      with self.subTest(ccnc=ccnc):
+        self._init(ccnc, long=False)
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x12A))
+        self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1A0))
+        self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"aReqRaw": 1.0, "aReqValue": 1.0})))
+        self.assertEqual(ccnc, self._tx_zero(0xEA, 2, 24))
+
+
+class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
+  """CCNC LFA_ALT camera-SCC longitudinal: a cruise main button press engages (main on) / disengages (main off) openpilot longitudinal."""
+
+  # superset of the CCNC LFA_ALT long variants; read by common.test_tx_hook_on_wrong_safety_mode
+  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
+
+  BASE = (HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING |
+          HyundaiSafetyFlags.CCNC | HyundaiSafetyFlags.LONG)
+  FLAG = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
+  SET, RESUME, CANCEL = 2, 1, 4
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def _init(self, param=None, toggleable=True):
+    param = self.BASE | self.FLAG if param is None else param
+    self.safety.set_current_safety_param_sp(HyundaiSafetyFlagsSP.LONG_MAIN_CRUISE_TOGGLEABLE if toggleable else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+
+  def _button(self, buttons=0, main=0):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
+
+  def _press_main(self, frames=3):
+    for _ in range(frames):
+      self._button(main=1)
+    self._button(main=0)
+
+  def _brake(self, pressed):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
+
+  def test_main_press_engages(self):
+    self._init()
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(main=1)  # rising edge, like the main toggle
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_second_main_press_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(main=1)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._press_main()  # and again: engage
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_long_press_is_one_transition(self):
+    self._init()
+    self._press_main(frames=200)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())
+
+  def test_main_press_engages_at_standstill_and_moving(self):
+    for speed in (0, 20):
+      with self.subTest(speed=speed):
+        self._init()
+        self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": speed * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+        self._press_main()
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_without_flag_main_never_engages(self):
+    self._init(self.BASE)
+    self._press_main()
+    self.assertTrue(self.safety.get_acc_main_on())  # main still toggles (MADS)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_flag_requires_ccnc_lfa_alt_long(self):
+    # flag alone, without the rest of the config, is ignored
+    for param in (self.BASE & ~HyundaiSafetyFlags.LONG, self.BASE & ~HyundaiSafetyFlags.CCNC, self.BASE & ~HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING,
+                  self.BASE & ~HyundaiSafetyFlags.CAMERA_SCC, self.BASE & ~HyundaiSafetyFlags.CANFD_ANGLE_STEERING):
+      with self.subTest(param=int(param)):
+        self._init(param | self.FLAG)
+        self._press_main()
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_requires_main_toggleable(self):
+    self._init(toggleable=False)
+    self._press_main()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_cancel_still_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())  # pause: main stays on
+
+  def test_cancel_wins_over_simultaneous_main(self):
+    self._init()
+    self._button(self.CANCEL, main=1)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_brake_still_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._brake(1)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_set_resume_unchanged(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        for param in (self.BASE | self.FLAG, self.BASE):
+          self._init(param)
+          self._button(btn)
+          self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
+          self._button(0)
+          self.assertTrue(self.safety.get_controls_allowed())
+          self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_init_resets_flag(self):
+    self._init()
+    self._init(self.BASE)
+    self._press_main()
+    self.assertFalse(self.safety.get_controls_allowed())
 
 
 if __name__ == "__main__":
