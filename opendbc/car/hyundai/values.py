@@ -759,6 +759,15 @@ class CAR(Platforms):
     CarSpecs(mass=1950, wheelbase=2.87, steerRatio=14.6),
     flags=HyundaiFlags.CANFD_RADAR_SCC,
   )
+  GENESIS_GV70_2ND_GEN = HyundaiCanFDPlatformConfig(
+    [
+      HyundaiCarDocs("Genesis GV70 (2.5T Trim, without HDA II) 2026", "Lane Follow Assist 2", car_parts=CarParts.common([CarHarness.hyundai_a])),
+    ],
+    # 2.5T AWD: wheelbase 113.2 in, base curb weight 4,275 lb (Car and Driver); variable-ratio steering,
+    # so steerRatio is the value learned on the car (liveParameters 15.17, 2026-11-07)
+    CarSpecs(mass=1950, wheelbase=2.875, steerRatio=15.2),
+    flags=HyundaiFlags.CANFD_ANGLE_STEERING | HyundaiFlags.CCNC,
+  )
   GENESIS_GV70_ELECTRIFIED_1ST_GEN = HyundaiCanFDPlatformConfig(
     [
       HyundaiCarDocs("Genesis GV70 Electrified (Australia Only) 2022", "All", car_parts=CarParts.common([CarHarness.hyundai_q])),

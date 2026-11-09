@@ -884,6 +884,16 @@
     ],
     "package": "All"
   },
+  "Genesis GV70 (2.5T Trim, without HDA II) 2026": {
+    "platform": "GENESIS_GV70_2ND_GEN",
+    "make": "Genesis",
+    "brand": "hyundai",
+    "model": "GV70 (2.5T Trim, without HDA II)",
+    "year": [
+      "2026"
+    ],
+    "package": "Lane Follow Assist 2"
+  },
   "Genesis GV70 (3.5T Trim, without HDA II) 2022-23": {
     "platform": "GENESIS_GV70_1ST_GEN",
     "make": "Genesis",
