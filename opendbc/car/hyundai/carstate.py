@@ -17,7 +17,7 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 ButtonType = structs.CarState.ButtonEvent.Type
 
 PREV_BUTTON_SAMPLES = 8
-MAIN_DESYNC_FRAMES = 50  # 0.5 s at 100 Hz: longer than the camera needs to follow a main press
+MAIN_PRESS_FRAMES = 50  # 0.5 s at 100 Hz: a main press and the camera's main change this close belong together
 CLUSTER_SAMPLE_RATE = 20  # frames
 STANDSTILL_THRESHOLD = 12 * 0.03125
 
@@ -43,8 +43,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
                                         CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE)
     self.main_button_enable = False
     self.main_available = False
-    self.main_desync = False
-    self.main_desync_frames = 0
+    self.camera_main = False
+    self.main_press_age = self.camera_rise_age = MAIN_PRESS_FRAMES + 1
 
     self.gear_msg_canfd = "ACCELERATOR" if CP.flags & HyundaiFlags.EV else \
                           "GEAR_ALT" if CP.flags & HyundaiFlags.CANFD_ALT_GEARS else \
@@ -90,22 +90,23 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     # Main button also can trigger an engagement on these cars
     return any(btn in ENABLE_BUTTONS for btn in self.cruise_buttons) or any(self.main_buttons)
 
-  def update_main_desync(self, camera_main: bool | None, main_pressed: bool):
-    """The camera's own MainMode_ACC (readable even while the panda blocks its SCC_CONTROL) is the car's main cruise state. Our flag only
-    toggles on button presses, so a restart or a lost frame can invert it. Flag a mismatch that outlives the camera's reaction to a press;
-    SET/RES then never starts longitudinal while our flag and the car disagree (the flag itself is not synced: the panda toggles its own
-    copy on the same presses and a one-sided correction would trip the main-state heartbeat)."""
-    if camera_main is None or main_pressed or camera_main == self.main_cruise_enabled:
-      self.main_desync_frames = 0
-    else:
-      self.main_desync_frames += 1
-    self.main_desync = self.main_desync_frames > MAIN_DESYNC_FRAMES
+  def update_camera_main(self, camera_main: bool | None, main_pressed: bool) -> bool:
+    """The camera's own MainMode_ACC (readable even while the panda blocks its SCC_CONTROL) is the car's main cruise state, the single source
+    of truth shared with the panda. Returns the engage request: a rising edge of it with a main press within MAIN_PRESS_FRAMES (either
+    order). A press the camera ignores (e.g. brake held at low speed) or a camera change without a press engages nothing."""
+    if camera_main is None:
+      camera_main = self.camera_main  # not seen yet: keep the last state
+    rising = camera_main and not self.camera_main
+    self.camera_main = camera_main
+    self.main_press_age = 0 if main_pressed else min(self.main_press_age + 1, MAIN_PRESS_FRAMES + 1)
+    self.camera_rise_age = 0 if rising else min(self.camera_rise_age + 1, MAIN_PRESS_FRAMES + 1)
+    return camera_main and ((rising and self.main_press_age <= MAIN_PRESS_FRAMES) or (main_pressed and self.camera_rise_age <= MAIN_PRESS_FRAMES))
 
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
     # a main press that turns the main cruise state on is an enable request, on the same (rising) edge as the panda safety.
     # a press that turns it off leaves cruiseState.available false, so no enable and the usual main-off disengage applies
-    if self.long_main_button_engage and (self.main_desync or not self.main_available):
-      return self.main_button_enable  # SET/RES need main on and agreeing with the car
+    if self.long_main_button_engage and not self.main_available:
+      return self.main_button_enable  # SET/RES need the camera's main on
     return self.main_button_enable or super().update_button_enable(buttonEvents)
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
@@ -365,15 +366,18 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
                         *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise}),
                         *create_button_events(self.lda_button, prev_lda_button, {1: ButtonType.lkas})]
 
-    if self.CP.openpilotLongitudinalControl:
-      ret.cruiseState.available = self.get_main_cruise(ret)
     main_pressed = any(be.type == ButtonType.mainCruise and be.pressed for be in ret.buttonEvents)
-    self.main_button_enable = self.long_main_button_engage and bool(ret.cruiseState.available) and main_pressed
-    self.main_available = bool(ret.cruiseState.available)
     if self.long_main_button_engage:
       cp_scc = cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp
       camera_main = cp_scc.vl["SCC_CONTROL"]["MainMode_ACC"] == 1 if cp_scc.ts_nanos["SCC_CONTROL"]["MainMode_ACC"] else None
-      self.update_main_desync(camera_main, main_pressed)
+      self.main_button_enable = self.update_camera_main(camera_main, main_pressed)
+      self.main_cruise_enabled = self.camera_main
+      ret.cruiseState.available = self.camera_main
+    else:
+      if self.CP.openpilotLongitudinalControl:
+        ret.cruiseState.available = self.get_main_cruise(ret)
+      self.main_button_enable = False
+    self.main_available = bool(ret.cruiseState.available)
 
     CarStateExt.update_canfd_ext(self, ret, ret_sp, can_parsers, speed_factor)
 
