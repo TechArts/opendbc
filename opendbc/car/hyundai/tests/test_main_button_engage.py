@@ -1,22 +1,12 @@
 import unittest
 
-from opendbc.car import gen_empty_fingerprint, structs
-from opendbc.car.hyundai.carstate import CarState
+from opendbc.car import structs
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.interface import CarInterface
+from opendbc.car.hyundai.tests.gv70 import car_params, gv70_controller
 from opendbc.car.hyundai.values import CAR, HyundaiFlags, HyundaiSafetyFlags
 
 ButtonType = structs.CarState.ButtonEvent.Type
 FLAG = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
-
-
-def _cp(candidate, alpha_long, lfa_alt=True):
-  fingerprint = gen_empty_fingerprint()
-  can = CanBus(None, fingerprint)
-  fingerprint[can.ECAN] = {0x1CF: 8}
-  if lfa_alt:
-    fingerprint[can.CAM] = {0xCB: 24}
-  return CarInterface.get_params(candidate, fingerprint, [], alpha_long, False, False)
 
 
 def _flag(cp):
@@ -25,21 +15,19 @@ def _flag(cp):
 
 class TestMainButtonEngage(unittest.TestCase):
   def test_flag_only_for_long_ccnc_lfa_alt(self):
-    gv70_long = _cp(CAR.GENESIS_GV70_2ND_GEN, True)
+    gv70_long = car_params(CAR.GENESIS_GV70_2ND_GEN, True)
     assert gv70_long.openpilotLongitudinalControl
     assert gv70_long.safetyConfigs[-1].safetyParam == 7180 | FLAG | HyundaiSafetyFlags.CAMERA_HANDBACK
 
     # stock longitudinal, no LFA_ALT, other CAN FD cars: unchanged
-    assert not _flag(_cp(CAR.GENESIS_GV70_2ND_GEN, False))
-    assert _cp(CAR.GENESIS_GV70_2ND_GEN, False).safetyConfigs[-1].safetyParam == 7176 | HyundaiSafetyFlags.CAMERA_HANDBACK
-    assert not _flag(_cp(CAR.GENESIS_GV70_2ND_GEN, True, lfa_alt=False))
+    assert not _flag(car_params(CAR.GENESIS_GV70_2ND_GEN, False))
+    assert car_params(CAR.GENESIS_GV70_2ND_GEN, False).safetyConfigs[-1].safetyParam == 7176 | HyundaiSafetyFlags.CAMERA_HANDBACK
+    assert not _flag(car_params(CAR.GENESIS_GV70_2ND_GEN, True, lfa_alt=False))
     for candidate in (CAR.KIA_EV6, CAR.HYUNDAI_IONIQ_5, CAR.HYUNDAI_SONATA_HEV_2024):
-      assert not _flag(_cp(candidate, True))
+      assert not _flag(car_params(candidate, True))
 
   def _carstate(self, alpha_long=True):
-    cp = _cp(CAR.GENESIS_GV70_2ND_GEN, alpha_long)
-    cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
-    return CarState(cp, cp_sp)
+    return gv70_controller(alpha_long)[3]
 
   @staticmethod
   def _main_event(pressed):
@@ -76,9 +64,7 @@ class TestStockAccEngaged(unittest.TestCase):
     from opendbc.can.packer import CANPacker
     from opendbc.car import Bus
     from opendbc.car.hyundai.values import DBC
-    cp = _cp(CAR.GENESIS_GV70_2ND_GEN, alpha_long)
-    cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
-    cs = CarState(cp, cp_sp)
+    cp, cp_sp, _, cs = gv70_controller(alpha_long)
     parsers = cs.get_can_parsers(cp, cp_sp)
     packer = CANPacker(DBC[CAR.GENESIS_GV70_2ND_GEN][Bus.pt])
     can = CanBus(cp)
