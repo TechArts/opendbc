@@ -154,10 +154,16 @@ def create_lfahda_cluster(packer, CAN, enabled, lfa_icon):
   return packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values)
 
 
+def create_ccnc_mdps(packer, CAN, mdps):
+  # The camera compares its own LFA request (LFA_ALT ADAS_ActvACILvl2Sta) with the MDPS's ACI state and reports System Fail
+  # ~0.5 s after they disagree (GV70: camera requested + MDPS inactive, and MDPS active for openpilot + camera not requesting).
+  # openpilot, not the camera, owns steering here, so tell the camera the MDPS is not executing an ACI request for it.
+  # LkaToi fields: from sunnypilot ccnc-port-sp (torque-path cars).
+  return packer.make_can_msg("MDPS", CAN.CAM, {**mdps, "MDPS_LkaToiActvSta": 0, "MDPS_LkaToiUnblSta": 1, "MDPS_ADASAciActvSta_Lv2": 1})
+
+
 def create_ccnc(packer, CAN, openpilotLongitudinalControl, enabled, hud, leftBlinker, rightBlinker, msg_161, msg_162, msg_1b5,
                 is_metric, out, main_cruise_enabled, lfa_icon):
-  for f in {"FAULT_LSS", "FAULT_HDA", "FAULT_DAS", "FAULT_LFA", "FAULT_DAW", "FAULT_ESS"}:
-    msg_162[f] = 0
   if msg_161["ALERTS_2"] == 5:
     msg_161.update({"ALERTS_2": 0, "SOUNDS_2": 0})
   if msg_161["ALERTS_3"] == 17:
