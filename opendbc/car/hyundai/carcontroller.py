@@ -177,11 +177,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       if lat_active and apply_angle is not None:
         apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo)
 
-      curve_hold = None
-      if self.takeover.curve_hold and self.takeover.enabled:
-        curve_hold = (self.takeover.hold_load, self.takeover.opposing, self.takeover.paused or self.takeover.resuming)
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
-                                                   self.steer_feel_blend, self.steer_feel_all_speeds, curve_hold)
+                                                   self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
       apply_steer_req = lat_active and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
