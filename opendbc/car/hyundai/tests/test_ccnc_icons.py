@@ -29,15 +29,36 @@ def _defaults(msg):
 
 
 def ccnc(lat=ICON_OFF, long=ICON_OFF, main=True, long_control=True, lead=False, bars=2, blinker=False, passthrough_lat=False, passthrough_long=False,
-         msg_161=None, msg_162=None, **out_kw):
+         msg_161=None, msg_162=None, camera_lfa_on=False, **out_kw):
   hud = structs.CarControl.HUDControl(leadDistanceBars=bars, leadVisible=lead, leftLaneVisible=True, rightLaneVisible=True)
   out = structs.CarState(vEgo=20.0, vCruiseCluster=100.0, **out_kw)
   msgs = dict(hyundaicanfd.create_ccnc(FakePacker(), FakeCAN(), long_control, long, hud, blinker, False,
                                        msg_161 if msg_161 is not None else _defaults("CCNC_0x161"),
                                        msg_162 if msg_162 is not None else _defaults("CCNC_0x162"),
                                        _defaults("FR_CMR_03_50ms"), False, out, main, lat,
-                                       passthrough_lat=passthrough_lat, passthrough_long=passthrough_long))
+                                       passthrough_lat=passthrough_lat, passthrough_long=passthrough_long, camera_lfa_on=camera_lfa_on))
   return msgs["CCNC_0x161"], msgs["CCNC_0x162"]
+
+
+class TestCameraLfaIcon(unittest.TestCase):
+  def test_blocked_camera_lfa_shows_grey_never_green(self):
+    # openpilot steering is off but the car's own LFA is on (it cannot steer: the panda blocks its lane centering): grey wheel, no centre line
+    m161, _ = ccnc(lat=ICON_OFF, camera_lfa_on=True)
+    self.assertEqual((m161["LFA_ICON"], m161["CENTERLINE"]), (1, 0))
+    m161, _ = ccnc(lat=ICON_OFF, camera_lfa_on=False)
+    self.assertEqual((m161["LFA_ICON"], m161["CENTERLINE"]), (0, 0))
+
+  def test_openpilot_state_wins_when_it_steers_or_pauses(self):
+    for state, expected in ((ICON_PAUSED, 1), (ICON_ACTIVE, 2)):
+      with self.subTest(state=state):
+        self.assertEqual(ccnc(lat=state, camera_lfa_on=True)[0]["LFA_ICON"], expected)
+
+  def test_lka_nudge_keeps_the_cameras_own_fields(self):
+    # the camera's lane-keeping nudge steers (no frame of ours): its dash fields, LKA icon and warning included, pass through as received
+    cam = _defaults("CCNC_0x161")
+    cam.update({"LFA_ICON": 0, "LKA_ICON": 4, "LANELINE_LEFT": 4})
+    m161, _ = ccnc(lat=ICON_OFF, passthrough_lat=True, camera_lfa_on=True, msg_161=dict(cam))
+    self.assertEqual((m161["LFA_ICON"], m161["LANELINE_LEFT"]), (0, 4))
 
 
 class TestIconMapping(unittest.TestCase):
@@ -195,8 +216,8 @@ class TestDashStates(unittest.TestCase):
 
   def test_camera_icons_pass_through_until_openpilot_claims_an_axis(self):
     self.cs.msg_161.update({"LFA_ICON": 2, "SETSPEED_HUD": 2, "SETSPEED": 2, "SETSPEED_SPEED": 33})
-    out = self._frame(False, False, False, False)  # nothing ours: stock LFA and stock cruise show
-    self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["SETSPEED_SPEED"]), (2, 2, 33))
+    out = self._frame(False, False, False, False)  # nothing ours on cruise: stock cruise shows; lateral is always ours (the car's LFA is blocked)
+    self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["SETSPEED_SPEED"]), (0, 2, 33))
 
     self.cs.msg_161.update({"LFA_ICON": 2, "SETSPEED_HUD": 2})
     out = self._frame(True, True, False, True, steer_req=True)  # openpilot steers (active) and cruise engaged but overridden
