@@ -737,25 +737,38 @@ class TestHyundaiCanfdLFASteeringLongCCNC(TestHyundaiCanfdLFASteeringLongBase):
           self.assertFalse(self._tx(make_msg(bus, addr)), f"allowed TX {addr=:#x} {bus=}")
 
 
-class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
-  """HDA1 angle steering through LFA_ALT (0xCB) only: the camera keeps 0x12A (status/warnings, no actuation)."""
+class CcncLfaAltCase(unittest.TestCase):
+  """Shared fixtures of the LFA_ALT camera-SCC safety tests that drive libsafety directly."""
 
-  # CCNC variant (superset); read by common.test_tx_hook_on_wrong_safety_mode
+  # CCNC variant (superset of the LFA_ALT variants); read by common.test_tx_hook_on_wrong_safety_mode
   TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
+
+  def setUp(self):
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def _rx(self, addr, bus, length):
+    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
+
+  def _button(self, buttons=0, main=0):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
+
+  def _brake(self, pressed):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
+
+
+class TestHyundaiCanfdLFAAltSteering(CcncLfaAltCase):
+  """HDA1 angle steering through LFA_ALT (0xCB) only: the camera keeps 0x12A (status/warnings, no actuation)."""
 
   BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC
   FLAG = HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING
 
   def _init(self, param):
-    self.safety = libsafety_py.libsafety
     self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
     self.safety.init_tests()
 
   def _tx(self, addr, bus, length):
     return self.safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
-
-  def _rx(self, addr, bus, length):
-    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
 
   def test_camera_lfa_forwarded_and_not_sendable(self):
     for ccnc in (0, HyundaiSafetyFlags.CCNC):
@@ -802,24 +815,17 @@ class TestHyundaiCanfdLFAAltSteering(unittest.TestCase):
     self.assertTrue(self.safety.get_relay_malfunction())
 
 
-class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
+class TestHyundaiCanfdLFAAltSteeringLong(CcncLfaAltCase):
   """Openpilot longitudinal (SCC_CONTROL) on top of HDA1 LFA_ALT angle steering with camera SCC."""
 
   BASE = HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING
   LONG = HyundaiSafetyFlags.LONG
   CCNC = HyundaiSafetyFlags.CCNC
 
-  # superset of both variants; read by common.test_tx_hook_on_wrong_safety_mode
-  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
-
   # (addr, bus, length) openpilot may send; 0x1CF is gated on button state, covered separately
   TX_CCNC = {(0x1E0, 0, 16), (0xCB, 0, 24), (0x1A0, 0, 32), (0x161, 0, 32), (0x162, 0, 32), (0x7C4, 2, 8), (0xEA, 2, 24)}
   TX_NON_CCNC = {(0x1E0, 0, 16), (0xCB, 0, 24), (0x1A0, 0, 32), (0x160, 0, 16)}
   CANDIDATES = {(0x12A, 0, 16), (0x1CF, 2, 8), (0x160, 0, 16), (0x7D0, 0, 8), (0x51, 0, 32)} | TX_CCNC | TX_NON_CCNC
-
-  def setUp(self):
-    self.packer = CANPackerSafety("hyundai_canfd_generated")
-    self.safety = libsafety_py.libsafety
 
   def _init(self, ccnc=True, long=True):
     param = self.BASE | (self.CCNC if ccnc else 0) | (self.LONG if long else 0)
@@ -830,9 +836,6 @@ class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
     if addr == 0x1A0:
       return self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", bus, {"aReqRaw": 0, "aReqValue": 0}))
     return self.safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
-
-  def _rx(self, addr, bus, length):
-    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
 
   def test_tx_set(self):
     for ccnc, expected in ((True, self.TX_CCNC), (False, self.TX_NON_CCNC)):
@@ -907,22 +910,15 @@ class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
         self.assertEqual(ccnc, self._tx_zero(0xEA, 2, 24))
 
 
-class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
+class TestHyundaiCanfdLongMainButtonEngage(CcncLfaAltCase):
   """CCNC LFA_ALT camera-SCC longitudinal: the camera's own MainMode_ACC (bus 2 0x1A0) is the main cruise state. Its rising edge with a main
   button press nearby engages openpilot longitudinal, its falling edge disengages. A press the camera ignores or a camera change without a
   press does nothing."""
-
-  # superset of the CCNC LFA_ALT long variants; read by common.test_tx_hook_on_wrong_safety_mode
-  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
 
   BASE = (HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING |
           HyundaiSafetyFlags.CCNC | HyundaiSafetyFlags.LONG)
   FLAG = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
   SET, RESUME, CANCEL = 2, 1, 4
-
-  def setUp(self):
-    self.packer = CANPackerSafety("hyundai_canfd_generated")
-    self.safety = libsafety_py.libsafety
 
   def _init(self, param=None, toggleable=True):
     param = self.BASE | self.FLAG if param is None else param
@@ -936,9 +932,6 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.cam = on
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": int(on)}))
 
-  def _button(self, buttons=0, main=0):
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
-
   def _press_main(self, frames=3, camera=True):
     """A main press; the camera toggles its main state on the first frame of it (unless it ignores the press)."""
     for i in range(frames):
@@ -946,9 +939,6 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
       if i == 0 and camera:
         self._camera_main(not self.cam)
     self._button(main=0)
-
-  def _brake(self, pressed):
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
 
   def test_main_press_engages(self):
     self._init()
@@ -1176,7 +1166,7 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.assertFalse(self.safety.get_controls_allowed_lateral())
 
 
-class TestHyundaiCanfdCameraHandback(unittest.TestCase):
+class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
   """CAMERA_HANDBACK: the camera's 0xCB / 0xEA (MDPS) / 0x1A0 are forwarded unless openpilot owns that axis. Lateral goes to openpilot on its first
   accepted 0xCB frame (active or inactive, with permission) and never comes back; longitudinal returns to the camera after a driver action (brake,
   cancel, main button), never because openpilot stalled; a camera ACC that engages without a driver engage for openpilot is locked out of the car."""
@@ -1187,13 +1177,6 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
   MAIN = HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE
   CANCEL = 4
   S = 1_000_000  # us
-
-  # superset of the variants; read by common.test_tx_hook_on_wrong_safety_mode
-  TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
-
-  def setUp(self):
-    self.packer = CANPackerSafety("hyundai_canfd_generated")
-    self.safety = libsafety_py.libsafety
 
   def _init(self, long=True, flag=True, base=None):
     param = (self.BASE if base is None else base) | (self.FLAG if flag else 0) | ((self.LONG | self.MAIN) if long else 0)
@@ -1210,15 +1193,6 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
 
   def _scc(self, mode):
     return self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": mode, "aReqRaw": 0, "aReqValue": 0}))
-
-  def _rx(self, addr, bus, length):
-    self.safety.safety_rx_hook(libsafety_py.make_CANPacket(addr, bus, b"\x00" * length))
-
-  def _button(self, buttons=0, main=0):
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
-
-  def _brake(self, pressed):
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
 
   def _camera_main(self, on):
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": on}))
