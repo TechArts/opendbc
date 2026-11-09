@@ -156,6 +156,10 @@ class CarInterface(CarInterfaceBase):
 
     if ret.openpilotLongitudinalControl:
       ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.LONG.value
+      if ret.flags & HyundaiFlags.CANFD and ret.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING and \
+         ret.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CCNC:
+        # CCNC + LFA_ALT: engage on the cruise main button like the stock cruise, carstate and panda safety both key off this flag
+        ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.LONG_MAIN_BUTTON_ENGAGE.value
     if ret.flags & HyundaiFlags.HYBRID:
       ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.HYBRID_GAS.value
     elif ret.flags & HyundaiFlags.EV:
