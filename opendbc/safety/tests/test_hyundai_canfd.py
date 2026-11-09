@@ -909,7 +909,8 @@ class TestHyundaiCanfdLFAAltSteeringLong(unittest.TestCase):
 
 class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
   """CCNC LFA_ALT camera-SCC longitudinal: the camera's own MainMode_ACC (bus 2 0x1A0) is the main cruise state. Its rising edge with a main
-  button press nearby engages openpilot longitudinal, its falling edge disengages. A press the camera ignores or a camera change without a press does nothing."""
+  button press nearby engages openpilot longitudinal, its falling edge disengages. A press the camera ignores or a camera change without a
+  press does nothing."""
 
   # superset of the CCNC LFA_ALT long variants; read by common.test_tx_hook_on_wrong_safety_mode
   TX_MSGS = [[0x1CF, 2], [0x1E0, 0], [0xCB, 0], [0x1A0, 0], [0x160, 0], [0x161, 0], [0x162, 0], [0x7C4, 2], [0xEA, 2]]
@@ -1446,7 +1447,6 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self._cam_run(4_000_000, 4_300_000, 0, 3)
     self.assertTrue(self._cb_fwd())
 
-
   def test_long_takeover_on_first_active_frame(self):
     self._init()
     self.assertFalse(self._scc(0))
@@ -1709,7 +1709,6 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self._camera_acc(1)
     self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x1CF))
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1CF))
-
 
   def test_init_resets_lka_window(self):
     self._init()

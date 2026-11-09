@@ -313,7 +313,6 @@ class TestCarControllerHandback(unittest.TestCase):
     parser.update([(0, [(0x1A0, dat, 0)])])
     self.assertEqual(parser.vl["SCC_CONTROL"]["ACCMode"], 1)
 
-
   def test_counter_follows_camera(self):
     msgs = self.cc.create_canfd_msgs(True, 0, 0.0, 0.0, False, self.hud, self.cs, SimpleNamespace(
       enabled=True, latActive=True, cruiseControl=SimpleNamespace(override=False), hudControl=self.hud, leftBlinker=False, rightBlinker=False))
