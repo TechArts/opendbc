@@ -2,17 +2,13 @@ import unittest
 from types import SimpleNamespace
 
 from opendbc.can import CANParser
-from opendbc.car import gen_empty_fingerprint, structs
+from opendbc.car import structs
 from opendbc.car.hyundai import hyundaicanfd
-from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.camera_main import MAIN_PRESS_FRAMES
-from opendbc.car.hyundai.carstate import CarState
-from opendbc.car.hyundai.hyundaicanfd import CanBus, ICON_OFF, ICON_PAUSED, ICON_ACTIVE
-from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.values import CAR, DBC
+from opendbc.car.hyundai.hyundaicanfd import ICON_OFF, ICON_PAUSED, ICON_ACTIVE
+from opendbc.car.hyundai.tests.gv70 import DBC_NAME, dbc_defaults, gv70_controller
 from opendbc.sunnypilot.car.hyundai.mads import MadsDataSP
 
-DBC_NAME = "hyundai_canfd_generated"
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
@@ -25,18 +21,14 @@ class FakeCAN:
   ECAN = 0
 
 
-def _defaults(msg):
-  return dict(CANParser(DBC_NAME, [(msg, 0)], 0).vl[msg])
-
-
 def ccnc(lat=ICON_OFF, long=ICON_OFF, main=True, long_control=True, lead=False, bars=2, blinker=False, passthrough_lat=False, passthrough_long=False,
          msg_161=None, msg_162=None, camera_lfa_on=False, **out_kw):
   hud = structs.CarControl.HUDControl(leadDistanceBars=bars, leadVisible=lead, leftLaneVisible=True, rightLaneVisible=True)
   out = structs.CarState(vEgo=20.0, vCruiseCluster=100.0, **out_kw)
   msgs = dict(hyundaicanfd.create_ccnc(FakePacker(), FakeCAN(), long_control, long, hud, blinker, False,
-                                       msg_161 if msg_161 is not None else _defaults("CCNC_0x161"),
-                                       msg_162 if msg_162 is not None else _defaults("CCNC_0x162"),
-                                       _defaults("FR_CMR_03_50ms"), False, out, main, lat,
+                                       msg_161 if msg_161 is not None else dbc_defaults("CCNC_0x161"),
+                                       msg_162 if msg_162 is not None else dbc_defaults("CCNC_0x162"),
+                                       dbc_defaults("FR_CMR_03_50ms"), False, out, main, lat,
                                        passthrough_lat=passthrough_lat, passthrough_long=passthrough_long, camera_lfa_on=camera_lfa_on))
   return msgs["CCNC_0x161"], msgs["CCNC_0x162"]
 
@@ -56,7 +48,7 @@ class TestCameraLfaIcon(unittest.TestCase):
 
   def test_lka_nudge_keeps_the_cameras_own_fields(self):
     # the camera's lane-keeping nudge steers (no frame of ours): its dash fields, LKA icon and warning included, pass through as received
-    cam = _defaults("CCNC_0x161")
+    cam = dbc_defaults("CCNC_0x161")
     cam.update({"LFA_ICON": 0, "LKA_ICON": 4, "LANELINE_LEFT": 4})
     m161, _ = ccnc(lat=ICON_OFF, passthrough_lat=True, camera_lfa_on=True, msg_161=dict(cam))
     self.assertEqual((m161["LFA_ICON"], m161["LANELINE_LEFT"]), (0, 4))
@@ -115,10 +107,10 @@ class TestIconMapping(unittest.TestCase):
 
 class TestPassthrough(unittest.TestCase):
   def _camera(self):
-    m161 = _defaults("CCNC_0x161")
+    m161 = dbc_defaults("CCNC_0x161")
     m161.update({"LFA_ICON": 2, "CENTERLINE": 1, "LANELINE_LEFT": 6, "SETSPEED": 2, "SETSPEED_HUD": 2, "SETSPEED_SPEED": 33, "DISTANCE": 3,
                  "DISTANCE_CAR": 2, "DISTANCE_SPACING": 3, "DISTANCE_LEAD": 2})
-    m162 = _defaults("CCNC_0x162")
+    m162 = dbc_defaults("CCNC_0x162")
     m162["LEAD"] = 4
     return m161, m162
 
@@ -140,26 +132,16 @@ class TestPassthrough(unittest.TestCase):
     self.assertEqual((out["ALERTS_1"], out["FAULT_SCC"]), (3, 1))
 
 
-def _carcontroller():
-  fingerprint = gen_empty_fingerprint()
-  can = CanBus(None, fingerprint)
-  fingerprint[can.ECAN] = {0x1CF: 8}
-  fingerprint[can.CAM] = {0xCB: 24}
-  cp = CarInterface.get_params(CAR.GENESIS_GV70_2ND_GEN, fingerprint, [], True, False, False)
-  cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
-  return cp, cp_sp, CarController(DBC[cp.carFingerprint], cp, cp_sp), CarState(cp, cp_sp)
-
-
 class TestDashStates(unittest.TestCase):
   """Per-axis state from the real control state, independent of each other (MadsUnifiedEngagementMode=0: either axis alone)."""
 
   def setUp(self):
-    self.cp, self.cp_sp, self.cc, self.cs = _carcontroller()
+    self.cp, self.cp_sp, self.cc, self.cs = gv70_controller()
     self.cs.out = structs.CarState()
     self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
-    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
+    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
     self.cs.main_cruise_enabled = True
     self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
     self.cc.frame = 5  # icon cadence
@@ -233,7 +215,7 @@ class TestCameraMain(unittest.TestCase):
   """The camera's MainMode_ACC is the main cruise state; a main press only pairs with its rising edge into an engage request."""
 
   def setUp(self):
-    _, _, _, self.cs = _carcontroller()
+    _, _, _, self.cs = gv70_controller()
 
   def _step(self, camera_main, pressed=False, frames=1):
     out = False

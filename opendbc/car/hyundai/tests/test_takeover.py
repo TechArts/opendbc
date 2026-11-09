@@ -1,19 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from opendbc.can import CANParser
-from opendbc.car import gen_empty_fingerprint, structs
-from opendbc.car.hyundai.carcontroller import CarController
-from opendbc.car.hyundai.carstate import CarState
-from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.interface import CarInterface
+from opendbc.car import structs
 from opendbc.car.hyundai.takeover import TakeoverFilter, ENTER_FRAMES, RESUME_FRAMES, FAULT_FRAMES, GUARD_FRAMES, CONVERGE_DEG
-from opendbc.car.hyundai.values import CAR, DBC
+from opendbc.car.hyundai.tests.gv70 import dbc_defaults, gv70_controller
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
-
-
-def _defaults(msg):
-  return dict(CANParser("hyundai_canfd_generated", [(msg, 0)], 0).vl[msg])
 
 
 def make(enter=150, release=100, hold_ms=500, rate=10):
@@ -148,18 +139,14 @@ class TestLowSpeedGuard(unittest.TestCase):
 
 
 def _carcontroller(takeover_torque, curve_hold=False):
-  fingerprint = gen_empty_fingerprint()
-  can = CanBus(None, fingerprint)
-  fingerprint[can.ECAN] = {0x1CF: 8}
-  fingerprint[can.CAM] = {0xCB: 24}
-  cp = CarInterface.get_params(CAR.GENESIS_GV70_2ND_GEN, fingerprint, [], True, False, False)
-  cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
-  cp_sp.hyundaiTakeoverTorque = takeover_torque
-  cp_sp.hyundaiTakeoverReleaseTorque, cp_sp.hyundaiTakeoverHoldMs, cp_sp.hyundaiResumeAngleRateX10 = 100, 500, 10
-  cp_sp.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK | HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS
-  if curve_hold:
-    cp_sp.flags |= HyundaiFlagsSP.CURVE_HOLD
-  return CarController(DBC[cp.carFingerprint], cp, cp_sp), CarState(cp, cp_sp)
+  def tweak_sp(cp_sp):
+    cp_sp.hyundaiTakeoverTorque = takeover_torque
+    cp_sp.hyundaiTakeoverReleaseTorque, cp_sp.hyundaiTakeoverHoldMs, cp_sp.hyundaiResumeAngleRateX10 = 100, 500, 10
+    cp_sp.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK | HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS
+    if curve_hold:
+      cp_sp.flags |= HyundaiFlagsSP.CURVE_HOLD
+  _, _, cc, cs = gv70_controller(tweak_sp=tweak_sp)
+  return cc, cs
 
 
 class TestControllerTakeover(unittest.TestCase):
@@ -167,7 +154,7 @@ class TestControllerTakeover(unittest.TestCase):
     cs.out = structs.CarState(vEgo=10.0, vEgoRaw=10.0, steeringTorque=torque, steeringAngleDeg=angle)
     cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
-    cs.msg_161, cs.msg_162, cs.msg_1b5 = (_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
+    cs.msg_161, cs.msg_162, cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
     cs.main_cruise_enabled = True
     cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
     cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)

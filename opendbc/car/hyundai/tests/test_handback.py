@@ -4,14 +4,12 @@ from types import SimpleNamespace
 from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, gen_empty_fingerprint, structs
 from opendbc.car.hyundai import hyundaicanfd
-from opendbc.car.hyundai.carcontroller import CarController
-from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow, TAIL_FRAMES, RECENT_ACTION_FRAMES, LKA_ICON_SETTLE_FRAMES, LKA_HOLD_FRAMES
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.values import CAR, HyundaiSafetyFlags, DBC
+from opendbc.car.hyundai.tests.gv70 import DBC_NAME, gv70_controller
+from opendbc.car.hyundai.values import CAR, HyundaiSafetyFlags
 
-DBC_NAME = "hyundai_canfd_generated"
 ButtonType = structs.CarState.ButtonEvent.Type
 
 
@@ -118,7 +116,7 @@ class TestCarStateCameraLka(unittest.TestCase):
     # recorded camera frames (route 2f): 0x12A with LKA_SysIndReq 3 (lane departure), 0x161 with LFA_ICON 2
     f12a = bytes.fromhex("9c0b0158c00000000082080004000000")
     f161 = bytes.fromhex("3a93b1c000000000c1fff2c803000040000000000000000000ff000002000000")
-    cp, cp_sp, _, cs = _carcontroller()
+    cp, cp_sp, _, cs = gv70_controller()
     parsers = cs.get_can_parsers(cp, cp_sp)
     for t in (10_000_000, 20_000_000):  # the first update registers the messages
       parsers[Bus.cam].update([(t, [(0x12A, f12a, 2), (0x161, f161, 2)])])
@@ -159,19 +157,9 @@ class TestMdpsEcho(unittest.TestCase):
         self.assertEqual(out["MDPS_LkaToiActvSta"], 1)
 
 
-def _carcontroller(alpha_long=True):
-  fingerprint = gen_empty_fingerprint()
-  can = CanBus(None, fingerprint)
-  fingerprint[can.ECAN] = {0x1CF: 8}
-  fingerprint[can.CAM] = {0xCB: 24}
-  cp = CarInterface.get_params(CAR.GENESIS_GV70_2ND_GEN, fingerprint, [], alpha_long, False, False)
-  cp_sp = CarInterface.get_non_essential_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN)
-  return cp, cp_sp, CarController(DBC[cp.carFingerprint], cp, cp_sp), CarState(cp, cp_sp)
-
-
 class TestCarControllerHandback(unittest.TestCase):
   def setUp(self):
-    self.cp, self.cp_sp, self.cc, self.cs = _carcontroller()
+    self.cp, self.cp_sp, self.cc, self.cs = gv70_controller()
     self.packer = CANPacker(DBC_NAME)
     self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
