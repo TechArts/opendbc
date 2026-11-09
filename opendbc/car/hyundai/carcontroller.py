@@ -12,6 +12,7 @@ from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons, CarControllerParams, CAR
 from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow
+from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
 from opendbc.car.hyundai.takeover import TakeoverFilter
 from opendbc.car.interfaces import CarControllerBase
 
@@ -41,34 +42,8 @@ def get_baseline_safety_cp():
   return CarInterface.get_non_essential_params(ANGLE_SAFETY_BASELINE_MODEL)
 
 
-# GV70 CCNC LFA_ALT: the stock camera's own 0xCB gain vs driver torque, bin medians (placed at bin midpoints) from route 00000002
-# above 5 m/s. The generic curve held 3-6x more gain against the driver. Experimental, chosen per drive with the HyundaiSteerFeel
-# param (0 generic, 1 halfway, 2 stock above 6 m/s, 3 stock at every speed). Below 4 m/s there is no stock data (the stock LFA
-# is barely active there), so 1 and 2 keep the generic curve at low speed; 3 uses the stock curve there too.
-LFA_ALT_GAIN_TORQUE_BP = [25, 75, 125, 175, 250, 400]
-LFA_ALT_GAIN_V = [0.85, 0.55, 0.25, 0.15, 0.10, 0.07]
-LFA_ALT_GAIN_SPEED_BP = [4, 6]  # m/s: blend from the generic curve to the stock-matched one
-
-
-def steer_feel_blend(CP, CP_SP) -> tuple[float, bool]:
-  """Returns (weight of the stock curve, whether it applies at every speed)."""
-  if CP.carFingerprint != CAR.GENESIS_GV70_2ND_GEN or not CP.flags & HyundaiFlags.SEND_LFA:
-    return 0.0, False
-  all_speeds = bool(CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS)
-  if CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_STOCK:
-    return 1.0, all_speeds
-  if CP_SP.flags & HyundaiFlagsSP.STEER_FEEL_HALFWAY:
-    return 0.5, all_speeds
-  return 0.0, False
-
-
-# HyundaiCurveHold (research/curve-hold.md Q3): in a curve the gain never falls below this share of the model's lateral demand a = v^2 * |desired| * k
-CURVE_HOLD_A_BP = [0.3, 1.0, 2.0]  # m/s^2
-CURVE_HOLD_FLOOR = [0.0, 0.30, 0.55]
-
-
 def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0, all_speeds=False, curve_hold=None):
-  """curve_hold: None (off) or (lateral demand a_hold in m/s^2, hand opposes the turn, filter paused or resuming)."""
+  """stock_blend, all_speeds, curve_hold: GV70 steer feel and curve hold, see steer_feel.py."""
   if lat_active:
     ceiling = np.interp(v_ego, [0.5, 1.5], [1.0, 0.85])
     shelf = np.interp(v_ego, [2, 11], [0.45, 0.6])
@@ -78,16 +53,7 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain,
     bp3 = np.interp(v_ego, [2, 11], [175, 275])
     bp4 = np.interp(v_ego, [2, 22], [400, 700])
     target = np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor])
-    if stock_blend > 0.0:
-      # first point at the ceiling, so the no-hands gain is unchanged at any speed (the ceiling is 0.85 above 1.5 m/s)
-      stock = min(np.interp(abs(steering_torque), LFA_ALT_GAIN_TORQUE_BP, [ceiling, *LFA_ALT_GAIN_V[1:]]), ceiling)
-      w = stock_blend * (1.0 if all_speeds else np.interp(v_ego, LFA_ALT_GAIN_SPEED_BP, [0.0, 1.0]))
-      target = (1.0 - w) * target + w * stock
-    if curve_hold is not None and stock_blend > 0.0:
-      a_hold, opposing, paused = curve_hold
-      if not opposing and not paused:
-        generic = float(np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor]))
-        target = max(target, min(float(np.interp(a_hold, CURVE_HOLD_A_BP, CURVE_HOLD_FLOOR)), generic))
+    target = apply_steer_feel(target, ceiling, steering_torque, v_ego, stock_blend, all_speeds, curve_hold)
   else:
     target = 0.0
   gain = rate_limit(target, last_gain, -0.014, 0.004)
