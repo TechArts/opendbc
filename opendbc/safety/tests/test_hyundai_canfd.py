@@ -1255,30 +1255,28 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
         self._init(base=base)
         self.assertFalse(self._cb_fwd())
 
-  def test_startup_stock_owns_everything(self):
+  def test_startup_openpilot_owns_lateral_stock_owns_longitudinal(self):
     for long in (True, False):
       with self.subTest(long=long):
         self._init(long)
-        self.assertTrue(self._cb_fwd())
-        self.assertTrue(self._mdps_fwd())
+        self.assertFalse(self._cb_fwd())
+        self.assertFalse(self._mdps_fwd())
         self.assertTrue(self._scc_fwd())
         self.assertTrue(self.safety.safety_fwd_hook(2, 0x12A) == 0)
 
-  def test_openpilot_rejected_while_stock_owns(self):
+  def test_longitudinal_rejected_while_stock_owns(self):
     self._init()
-    self.assertFalse(self._cb(False))  # no inactive frame, no MDPS copy: a second sender would interleave with the camera
-    self.assertFalse(self._mdps())
     self.assertFalse(self._scc(0))
     self.assertFalse(self._cb(True))  # controls not allowed
     self.assertFalse(self._scc(1))
-    self.assertTrue(self._cb_fwd() and self._scc_fwd() and self._mdps_fwd())
+    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
-  def test_lateral_takeover_on_first_active_frame(self):
+  def test_lateral_active_frame_with_permission(self):
     self._init()
     self.safety.set_controls_allowed(True)
-    self.assertTrue(self._cb_fwd())  # allowed, but openpilot has not sent yet: camera keeps the car supplied
-    self.assertTrue(self._cb(True))
     self.assertFalse(self._cb_fwd())
+    self.assertTrue(self._cb(True))
     self.assertFalse(self._mdps_fwd())
     self.assertTrue(self._mdps())
     self.assertTrue(self._cb(False))  # inactive frames continue (the car must not see a gap)
@@ -1399,21 +1397,55 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
       self._cam_ind(3 if t % 200_000 == 0 else 2)
       self.assertNotEqual(self._cb_fwd(), self._cb(False))
 
-  def test_lka_window_resets_at_init(self):
-    self._own_lat_then_off()
+  def test_lfa_blocked_from_boot(self):
+    # nothing ever set a lateral permission: the camera's LFA (icon 1/2/blink, also with a lane departure) never passes, e.g. after a main press
+    self._init()
+    for n, (icon, ind) in enumerate(((2, 2), (1, 1), (2, 3), (3, 3), (1, 3))):
+      with self.subTest(icon=icon, ind=ind):
+        base = n * 10_000_000
+        self._cam_run(base, base + 3_000_000, icon, ind)
+        self.assertFalse(self._cb_fwd())
+        self.assertFalse(self._mdps_fwd())
+        self.assertTrue(self._cb(False))
+        self.assertTrue(self._mdps())
+
+  def test_no_mixed_sender_from_boot(self):
+    self._init()
+    for t in range(0, 6_000_000, 10_000):  # icon 0 / LFA / blink, ind 3 on and off: either the camera's frame or openpilot's, never both or neither
+      self.safety.set_timer(t)
+      icon = 2 if 2_000_000 <= t < 3_000_000 else 3 if 3_000_000 <= t < 3_050_000 else 0
+      if t % 50_000 == 0:
+        self._cam_icon(icon)
+      self._cam_ind(3 if t % 100_000 < 60_000 else 2)
+      self.assertNotEqual(self._cb_fwd(), self._cb(False))
+      self.assertEqual(self._cb_fwd(), self._mdps_fwd())
+
+  def test_lka_passes_from_boot(self):
+    self._init()
+    self._cam_run(0, 1_400_000, 0, 3)
+    self.assertFalse(self._cb_fwd())  # icon 0 for less than the settle time
+    self._cam_run(1_400_000, 1_600_000, 0, 3)
+    self.assertTrue(self._cb_fwd())  # controls_allowed_lateral was never set
+    self.assertTrue(self._mdps_fwd())
+    self.assertFalse(self._cb(False))  # one sender
+    self.assertFalse(self._mdps())
+    self.assertTrue(self._scc_fwd())
+
+  def test_missing_icon_frames_close_the_window(self):
+    self._init()
     self._cam_run(0, 2_000_000, 0, 3)
     self.assertTrue(self._cb_fwd())
-    self._init()
-    self.safety.set_timer(2_000_000)
-    self.safety.set_controls_allowed_lateral(True)
-    self.assertTrue(self._cb(True))
-    self.safety.set_controls_allowed_lateral(False)
-    self.assertFalse(self._cb_fwd())  # no camera frames seen since init
+    for t in range(2_000_000, 2_700_000, 10_000):  # 0x12A keeps coming, 0x161 stops
+      self.safety.set_timer(t)
+      self._cam_ind(3)
+    self.assertFalse(self._cb_fwd())
+    self.assertTrue(self._cb(False))
+    self._cam_icon(0)  # 0x161 is back: the run restarts, no window until it settled again
+    self._cam_run(2_700_000, 4_000_000, 0, 3)
+    self.assertFalse(self._cb_fwd())
+    self._cam_run(4_000_000, 4_300_000, 0, 3)
+    self.assertTrue(self._cb_fwd())
 
-  def test_stock_owns_before_openpilot_takes_lateral(self):
-    self._init()
-    self._cam_run(0, 2_000_000, 2, 2)
-    self.assertTrue(self._cb_fwd())  # before the first openpilot frame the camera is untouched (LFA included)
 
   def test_long_takeover_on_first_active_frame(self):
     self._init()
@@ -1424,7 +1456,7 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertTrue(self._scc(1))
     self.assertFalse(self._scc_fwd())
     self.assertTrue(self._scc(0))  # off frames pass once openpilot owns it
-    self.assertTrue(self._cb_fwd())
+    self.assertFalse(self._cb_fwd())
 
   def test_non_long_scc_always_forwarded(self):
     self._init(long=False)
@@ -1510,25 +1542,14 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(False)
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
 
-  def test_inactive_frame_takes_lateral_under_permission(self):
-    # LFA on while the driver pushes hard: the takeover filter sends inactive frames (request 0), the camera's request must not reach the EPS
+  def test_inactive_frame_passes_from_boot(self):
+    # no permission yet (MADS never on): openpilot's inactive frame and MDPS copy still replace the camera's, which would be LFA
     self._init()
-    self.safety.set_controls_allowed_lateral(True)
-    self.assertTrue(self._cb_fwd())  # openpilot has not sent yet
-    self.assertTrue(self._cb(False))
     self.assertFalse(self._cb_fwd())
     self.assertFalse(self._mdps_fwd())
+    self.assertTrue(self._cb(False))
     self.assertTrue(self._mdps())
     self.assertTrue(self._scc_fwd())  # longitudinal untouched
-
-  def test_inactive_frame_rejected_without_permission(self):
-    self._init()
-    self.assertFalse(self._cb(False))
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
-    self.safety.set_controls_allowed_lateral(True)
-    self.safety.set_controls_allowed_lateral(False)
-    self.assertFalse(self._cb(False))
-    self.assertTrue(self._cb_fwd())
 
   def test_takeover_pause_never_lets_camera_through(self):
     self._init()
@@ -1690,11 +1711,13 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1CF))
 
 
-  def test_init_resets_ownership(self):
+  def test_init_resets_lka_window(self):
     self._init()
-    self._engage_lat()
+    self._cam_run(0, 2_000_000, 0, 3)
+    self.assertTrue(self._cb_fwd())
     self._init()
-    self.assertTrue(self._cb_fwd() and self._mdps_fwd())
+    self.safety.set_timer(2_000_000)
+    self.assertFalse(self._cb_fwd())  # no camera frames seen since init: the camera stays blocked
 
   def test_relay_malfunction(self):
     for long in (True, False):
@@ -1708,7 +1731,7 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
   def test_camera_frames_forwarded_do_not_trip_relay(self):
     self._init()
     for _ in range(10):
-      self.assertTrue(self._cb_fwd() and self._scc_fwd())
+      self.assertTrue(self._scc_fwd())
     self.assertFalse(self.safety.get_relay_malfunction())
 
   def test_relay_malfunction_blocks_all_forwarding(self):
@@ -1721,7 +1744,7 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.safety.set_controls_allowed(True)
     # steering request far from the measured angle is still refused, and does not take the axis
     self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2, "ADAS_StrAnglReqVal": 300})))
-    self.assertTrue(self._cb_fwd())
+    self.assertFalse(self._cb_fwd())  # openpilot owns lateral from init anyway
     # accel above the limit is refused
     self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": 1, "aReqRaw": 3.5, "aReqValue": 3.5})))
     self.assertTrue(self._scc_fwd())

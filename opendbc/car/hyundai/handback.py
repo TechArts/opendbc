@@ -3,9 +3,8 @@ Camera hand-back (GV70 CCNC LFA_ALT camera SCC): which side sends an axis, mirro
 
 The panda blocks the camera's frame of an axis (LFA_ALT 0xCB + MDPS 0xEA for lateral, SCC_CONTROL 0x1A0 for longitudinal) from the first
 accepted openpilot frame until the axis is no longer allowed AND the driver acted. openpilot therefore:
-  - lateral: sends from the first frame while MADS allows steering, active or inactive (the camera's request must not reach the EPS while the
-    takeover filter has paused ours), and never stops, except while the car's own lane-keeping nudge steers with MADS off (LkaWindow): the camera's
-    LFA lane centering only comes back at the next panda init
+  - lateral: always ours from the start (the panda blocks the camera's 0xCB / MDPS from init), active or inactive frames, so the car's own LFA
+    lane centering never steers; the only exception is the car's own lane-keeping nudge while MADS is off (LkaWindow), where we send nothing
   - longitudinal: sends the axis only while it is active, and keeps sending 'off' frames after that (the car must not see a gap) until a driver
     action, and stops TAIL_FRAMES after the driver action: the panda hands the axis back at the first moment the permission is gone after the
     action (the heartbeat mismatch takes ~3 s), and rejects any frame of ours from then on, so a long tail is harmless and a short one is not.
@@ -18,8 +17,7 @@ RECENT_ACTION_FRAMES = int(1.0 / DT_CTRL)  # a driver action this close before t
 
 
 class AxisOwner:
-  def __init__(self, latch: bool = False):
-    self.latch = latch  # once owner, always owner (lateral)
+  def __init__(self):
     self.owner = False
     self.active_prev = False
     self.release_frame: int | None = None
@@ -27,10 +25,6 @@ class AxisOwner:
 
   def update(self, active: bool, driver_action: bool, frame: int) -> bool:
     """Returns True if openpilot should send this axis' frames now."""
-    if self.latch:
-      self.owner = self.owner or active
-      return self.owner
-
     if driver_action:
       if self.owner and not active and self.release_frame is None:
         self.release_frame = frame

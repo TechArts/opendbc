@@ -216,8 +216,8 @@ class TestDashStates(unittest.TestCase):
 
   def test_camera_icons_pass_through_until_openpilot_claims_an_axis(self):
     self.cs.msg_161.update({"LFA_ICON": 2, "SETSPEED_HUD": 2, "SETSPEED": 2, "SETSPEED_SPEED": 33})
-    out = self._frame(False, False, False, False)  # nothing ours: stock LFA and stock cruise show
-    self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["SETSPEED_SPEED"]), (2, 2, 33))
+    out = self._frame(False, False, False, False)  # nothing ours on cruise: stock cruise shows; lateral is always ours (the car's LFA is blocked)
+    self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["SETSPEED_SPEED"]), (0, 2, 33))
 
     self.cs.msg_161.update({"LFA_ICON": 2, "SETSPEED_HUD": 2})
     out = self._frame(True, True, False, True, steer_req=True)  # openpilot steers (active) and cruise engaged but overridden

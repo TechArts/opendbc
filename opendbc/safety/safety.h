@@ -318,20 +318,24 @@ void safety_tick(const safety_config *cfg) {
   uint32_t ts = microsecond_timer_get();
   if (cfg != NULL) {
     for (int i=0; i < cfg->rx_checks_len; i++) {
-      uint32_t elapsed_time = safety_get_ts_elapsed(ts, cfg->rx_checks[i].status.last_timestamp);
-      // lag threshold is max of: 1s and MAX_MISSED_MSGS * expected timestep.
-      // Quite conservative to not risk false triggers.
-      // 2s of lag is worse case, since the function is called at 1Hz
-      uint32_t timestep = 1e6 / cfg->rx_checks[i].msg[cfg->rx_checks[i].status.index].frequency;
-      bool lagging = elapsed_time > SAFETY_MAX(timestep * MAX_MISSED_MSGS, 1e6);
-      cfg->rx_checks[i].status.lagging = lagging;
-      if (lagging) {
-        controls_allowed = false;
-        mads_exit_controls(MADS_DISENGAGE_REASON_LAG);
-      }
+      if (cfg->rx_checks[i].msg[cfg->rx_checks[i].status.index].optional) {
+        cfg->rx_checks[i].status.lagging = false;  // read in the rx hook only; the hook's own staleness rules apply
+      } else {
+        uint32_t elapsed_time = safety_get_ts_elapsed(ts, cfg->rx_checks[i].status.last_timestamp);
+        // lag threshold is max of: 1s and MAX_MISSED_MSGS * expected timestep.
+        // Quite conservative to not risk false triggers.
+        // 2s of lag is worse case, since the function is called at 1Hz
+        uint32_t timestep = 1e6 / cfg->rx_checks[i].msg[cfg->rx_checks[i].status.index].frequency;
+        bool lagging = elapsed_time > SAFETY_MAX(timestep * MAX_MISSED_MSGS, 1e6);
+        cfg->rx_checks[i].status.lagging = lagging;
+        if (lagging) {
+          controls_allowed = false;
+          mads_exit_controls(MADS_DISENGAGE_REASON_LAG);
+        }
 
-      if (lagging || !is_msg_valid(cfg->rx_checks, i)) {
-        rx_checks_invalid = true;
+        if (lagging || !is_msg_valid(cfg->rx_checks, i)) {
+          rx_checks_invalid = true;
+        }
       }
     }
   }
