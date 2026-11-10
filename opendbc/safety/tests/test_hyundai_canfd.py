@@ -1057,6 +1057,52 @@ class TestHyundaiCanfdLongMainButtonEngage(CcncLfaAltCase):
     self.assertFalse(self.safety.get_controls_allowed())
     self.assertTrue(self.safety.get_acc_main_on())  # pause: main stays on
 
+  def _tap(self, btn, frames=3):
+    for _ in range(frames):
+      self._button(btn)
+    self._button(0)
+
+  def test_pause_key_is_a_pause_resume_toggle(self):
+    self._init()
+    self._press_main()
+    self._tap(self.CANCEL)  # pause: the release does not resume
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())  # resume on release, not on press
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._tap(self.CANCEL)  # and pause again
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pause_key_does_not_resume_with_main_off(self):
+    self._init()
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._press_main()
+    self._tap(self.CANCEL)
+    self._button(self.CANCEL)
+    self._camera_main(False)  # main goes off while the key is down
+    self._button(0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pause_key_does_not_resume_on_a_held_brake(self):
+    self._init()
+    self._press_main()
+    self._tap(self.CANCEL)
+    self._brake(1)  # held at standstill: no rising-edge or moving exit after this
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._brake(0)
+    self._tap(self.CANCEL)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pause_key_without_flag_only_cancels(self):
+    self._init(self.BASE)
+    self._press_main()  # main toggles (MADS), no engage
+    self.assertTrue(self.safety.get_acc_main_on())
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+
   def test_cancel_wins_over_simultaneous_main(self):
     self._init()
     self._button(self.CANCEL, main=1)
@@ -1568,7 +1614,8 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._engage_long()
     self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
 
-  # --- stock ACC lock: the camera's own ACC engaged without a driver engage for openpilot (CANCEL tap in standby, route 2d 9:48.8 / 11:01.8)
+  # --- stock ACC lock: the camera's own ACC engaged without a driver engage for openpilot (the car's ACC starting by itself; before the
+  # pause key resumed openpilot, a CANCEL tap in standby did it: route 2d 9:48.8 / 11:01.8)
   def _camera_acc(self, mode, main=1):
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": main, "ACCMode": mode}))
 
@@ -1588,16 +1635,10 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._camera_acc(4)  # camera: standby
     self.assertTrue(self._scc_fwd())
 
-  def _cancel_tap(self):
-    for _ in range(7):
-      self._button(self.CANCEL)
-    self._button(0)
-
-  def test_cancel_tap_in_standby_is_locked_out(self):
+  def test_camera_acc_on_its_own_is_locked_out(self):
     self._standby_after_brake()
-    self._cancel_tap()
-    self.assertFalse(self.safety.get_controls_allowed())  # the panda sees a cancel: nothing of ours is engaged
-    self._camera_acc(1)  # the camera resumed its own ACC at the stale set speed
+    self._camera_acc(1)  # the camera resumed its own ACC at the stale set speed, no engage for openpilot
+    self.assertFalse(self.safety.get_controls_allowed())
     self.assertFalse(self._scc_fwd())  # from the next frame the car does not see the camera's 0x1A0
     self.assertTrue(self._scc(0))  # openpilot's 'off' frames replace it
     self.assertFalse(self._scc(1))  # but cannot engage anything
@@ -1607,9 +1648,21 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
       self.assertFalse(self._scc_fwd())
       self.assertTrue(self._scc(0))
 
+  def test_pause_key_in_standby_resumes_openpilot_not_the_camera(self):
+    self._standby_after_brake()
+    for _ in range(7):
+      self._button(self.CANCEL)
+    self._camera_acc(1)  # the camera resumes its own ACC while the key is still down
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self._scc_fwd())  # locked out
+    self._button(0)  # release: openpilot resumes, like RES
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._scc(1))
+    self._camera_acc(1)
+    self.assertFalse(self._scc_fwd())  # openpilot owns it: the camera's frames stay out
+
   def test_stock_lock_ends_when_camera_is_back_in_standby(self):
     self._standby_after_brake()
-    self._cancel_tap()
     self._camera_acc(1)
     self.assertFalse(self._scc_fwd())
     self._camera_acc(4)
@@ -1625,7 +1678,6 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
 
   def test_stock_lock_ends_when_camera_main_goes_off(self):
     self._standby_after_brake()
-    self._cancel_tap()
     self._camera_acc(1)
     for _ in range(3):
       self._camera_acc(0, main=0)
@@ -1645,7 +1697,6 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
 
   def test_lock_releases_to_openpilot_on_explicit_engage(self):
     self._standby_after_brake()
-    self._cancel_tap()
     self._camera_acc(1)
     self.assertFalse(self._scc_fwd())
     self._button(2)  # now the driver engages on purpose
@@ -1679,7 +1730,6 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
   def test_cancel_button_still_reaches_camera_when_it_is_engaged(self):
     # the stock pause key must keep working on a camera ACC that is engaged (the lock only blocks its 0x1A0 output)
     self._standby_after_brake()
-    self._cancel_tap()
     self._camera_acc(1)
     self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x1CF))
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1CF))
