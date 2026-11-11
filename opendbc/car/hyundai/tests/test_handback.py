@@ -7,7 +7,7 @@ from opendbc.car.hyundai import hyundaicanfd
 from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow, TAIL_FRAMES, RECENT_ACTION_FRAMES, LKA_ICON_SETTLE_FRAMES, LKA_HOLD_FRAMES
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.tests.gv70 import DBC_NAME, gv70_controller
+from opendbc.car.hyundai.tests.gv70 import DBC_NAME, dbc_defaults, gv70_controller
 from opendbc.car.hyundai.values import CAR, HyundaiSafetyFlags
 
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -108,6 +108,45 @@ class TestLkaWindow(unittest.TestCase):
     self.assertTrue(w.lfa_on)
     for icon, f in ((3, 501), (0, 502), (3, 503), (1, 504)):  # lane lost blink 3,0,3,1: stays on
       w.update(icon, 1, f)
+    self.assertTrue(w.lfa_on)
+
+  def test_lfa_off_press_clears_lfa_on_at_once(self):
+    # route 34 5:46.5: LFA button press at t, the camera still shows 2 for 0.25 s, blinks 3,0,3,0, settles 0 1.7 s later: ours was grey for 2.5 s
+    w = LkaWindow()
+    w.update(2, 1, 0)
+    self.assertTrue(w.lfa_on)
+    w.lfa_pressed(10)
+    self.assertFalse(w.lfa_on)
+    for f in range(10, 10 + 12):  # the camera still shows its old icon
+      w.update(2, 1, f)
+      self.assertFalse(w.lfa_on)
+    for icon, f in ((3, 40), (0, 70), (3, 90), (0, 120)):
+      w.update(icon, 1, f)
+      self.assertFalse(w.lfa_on)
+    self._run(w, 0, 1, 121, LKA_ICON_SETTLE_FRAMES)
+    self.assertFalse(w.lfa_on)
+
+  def test_lfa_press_that_the_camera_ignores_or_turns_on_again(self):
+    w = LkaWindow()
+    w.update(1, 1, 0)
+    w.lfa_pressed(5)
+    self.assertFalse(w.lfa_on)
+    for f in range(5, 5 + 160):  # no blink within 1.5 s: the press changed nothing, the camera's LFA is still on
+      w.update(1, 1, f)
+    self.assertTrue(w.lfa_on)
+    w.lfa_pressed(200)  # off blink, then on again (another press)
+    w.update(3, 1, 210)
+    w.update(0, 1, 230)
+    self.assertFalse(w.lfa_on)
+    w.update(1, 1, 260)
+    self.assertTrue(w.lfa_on)
+
+  def test_lfa_press_with_lfa_off_changes_nothing(self):
+    w = LkaWindow()
+    w.lfa_pressed(5)  # turning on: not a state we show
+    self.assertFalse(w.lfa_on)
+    w.update(3, 1, 10)
+    w.update(1, 1, 40)
     self.assertTrue(w.lfa_on)
 
 
@@ -279,6 +318,29 @@ class TestCarControllerHandback(unittest.TestCase):
     for _ in range(10):
       sent = self._msgs(lat_active=False)
       self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+
+  def _lfa_icon(self, buttons=()):
+    """the LFA_ICON of the 0x161 frame we send (the icon cadence needs frame % 5 == 0 and real CCNC frames)"""
+    self.cc.frame = (self.cc.frame // 5 + 1) * 5
+    self.cs.out.buttonEvents = [structs.CarState.ButtonEvent(type=t, pressed=True) for t in buttons]
+    cc = structs.CarControl()
+    msgs = self.cc.create_canfd_msgs(False, 0, 0.0, 0.0, False, self.hud, self.cs, cc)
+    self.cc.frame += 1
+    parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], 0)
+    parser.update([(0, [(m[0], m[1], 0) for m in msgs if m[0] == 0x161])])
+    return parser.vl["CCNC_0x161"]["LFA_ICON"]
+
+  def test_icon_off_at_the_lfa_off_press_not_after_the_blink(self):
+    msg_161 = dbc_defaults("CCNC_0x161")
+    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = msg_161, dict(dbc_defaults("CCNC_0x162")), dict(dbc_defaults("FR_CMR_03_50ms"))
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = 2, 1
+    for _ in range(4):
+      self.assertEqual(1, self._lfa_icon())  # MADS off, the car's LFA on and green: ours grey (the real state of the car's LFA)
+    self.assertEqual(0, self._lfa_icon((ButtonType.lkas,)))  # LFA button: ours is off at once
+    self.cs.cam_lfa_icon = 3  # the camera blinks, then settles at 0
+    for icon in (3, 0, 3, 0):
+      self.cs.cam_lfa_icon = icon
+      self.assertEqual(0, self._lfa_icon())
 
   def test_stock_acc_lock_sends_off_frames(self):
     # camera ACC engaged (ACCMode 1) while openpilot is not: 0x1A0 'off' frames, also if openpilot never owned the axis
