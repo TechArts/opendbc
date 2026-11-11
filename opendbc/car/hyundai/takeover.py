@@ -42,7 +42,8 @@ BEYOND_DEG = 3.0  # ... and the wheel at least this far past the model's angle i
 # (gain 0.03, request = wheel) through under a holding hand and the EPS faulted (AciFltSig_Lv2 = 2, then the camera's FAULT_*), 4 of 4 times.
 # In the low-speed, large-angle region (step_capped) the straight-road rule applies whatever the curve: any hand on the wheel is a pause,
 # released only by torque below the release value and no steeringPressed for the hold time. An EPS fault in the region latches the same rule
-# until the next release, so there is no fixed-time retry under a holding hand, even if the wheel unwinds out of the region meanwhile.
+# until the hand has been off for the hold time (across lateral-inactive frames too), so there is no fixed-time retry under a holding hand, even if
+# the wheel unwinds out of the region or latActive drops with the fault.
 
 
 class TakeoverFilter:
@@ -60,7 +61,8 @@ class TakeoverFilter:
     self.release_frames = 0
     self.resume_frames = 0
     self.fault_frames = 0
-    self.strict = False  # an EPS fault in the guard region latched the straight-road rule until the next release
+    self.strict = False  # an EPS fault in the guard region latched the straight-road rule until the hand has been off for the hold time
+    self.strict_calm_frames = 0
     self.bind_frames = 0
     self.lat_active_last = False
     self.unsendable_frames = 0  # consecutive frames lateral was on without a sendable ACTIVE request, from the controller
@@ -84,7 +86,6 @@ class TakeoverFilter:
   def _reset(self):
     self.paused = False
     self.resuming = False
-    self.strict = False
     self.grab_frames = self.release_frames = self.resume_frames = self.bind_frames = self.unsendable_frames = 0
 
   @staticmethod
@@ -103,6 +104,13 @@ class TakeoverFilter:
     fast = self.resume_rate > 0 and wheel_rate > self.resume_rate
 
     self.fault_frames = FAULT_FRAMES if fault else max(0, self.fault_frames - 1)
+    # the strict latch lives across inactive frames (controlsd drops latActive on the fault itself, test_fault_guard): set by a fault in the guard
+    # region, cleared only by a hand off (below the release torque, not pressed) for the hold time with the fault gone
+    if fault and self.step_capped(angle, v_ego):
+      self.strict = True
+    self.strict_calm_frames = self.strict_calm_frames + 1 if abs(torque) < self.release_torque and not pressed else 0
+    if self.strict and self.strict_calm_frames >= self.hold_frames and self.fault_frames == 0:
+      self.strict = False
     if not lat_active:
       self._reset()
       self.lat_active_last = False
@@ -129,8 +137,6 @@ class TakeoverFilter:
         turn = int(math.copysign(1, desired))
     along = torque * turn  # > 0: along the requested turn (assisting), < 0: opposing
     self.opposing = turn != 0 and along <= -OPPOSE_RELEASE
-    if fault and self.step_capped(angle, v_ego):
-      self.strict = True
     if self.strict or self.step_capped(angle, v_ego):
       turn = 0  # route 3a: a hand on the wheel in the guard region is never "holding the curve"
 
@@ -157,7 +163,6 @@ class TakeoverFilter:
       self.release_frames = self.release_frames + 1 if calm else 0
       if self.release_frames >= self.hold_frames and self.fault_frames == 0 and not binds:
         self.paused = False
-        self.strict = False
         self.resuming = True
         self.resume_frames = RESUME_FRAMES
 

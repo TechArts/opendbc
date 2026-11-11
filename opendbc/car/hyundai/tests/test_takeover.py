@@ -290,13 +290,19 @@ class TestCurveTakeover(unittest.TestCase):
     f = make_curve()
     kw = dict(angle=250.0, desired=250.0, v=2.68)
     run(f, 20, **kw)
-    run(f, FAULT_FRAMES, torque=300, pressed=True, fault=True, **kw)
+    run(f, FAULT_FRAMES, torque=300, pressed=True, fault=True, active=False, **kw)  # controlsd drops latActive on the fault itself (R1Guard)
     self.assertTrue(f.strict)
-    out = dict(angle=100.0, desired=100.0, v=2.68)  # wheel unwound out of the region, the hand still holds along the turn (a = 0.28 + hand)
+    out = dict(angle=120.0, desired=120.0, v=2.68)  # wheel unwound out of the region but still a curve for F22 (a = 0.34), the hand still holds
     self.assertTrue(all(run(f, 5 * FAULT_FRAMES, torque=300, pressed=True, **out)))
     self.assertTrue(all(run(f, f.hold_frames - 1, **out)))
     self.assertFalse(run(f, 1, **out)[-1])
     self.assertFalse(f.strict)
+    h = make_curve()  # the latch survives lateral toggling, and is not stuck when the hand stays off
+    run(h, FAULT_FRAMES, torque=300, pressed=True, fault=True, active=False, **kw)
+    run(h, 1, torque=300, pressed=True, active=False, **out)
+    self.assertTrue(h.strict)
+    run(h, h.hold_frames + FAULT_FRAMES + 2, active=False, **out)
+    self.assertFalse(h.strict)
     g = make_curve()  # a fault outside the region does not latch anything
     run(g, 5, torque=300, fault=True, v=15.0, angle=17.0, desired=17.0)
     self.assertFalse(g.strict)
@@ -707,12 +713,12 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     wheel, v = 250.0, 2.68
     counts = self._warm(wheel, v)
     for i in range(61):
-      cb, ok, active, icon, _ = self._frame(True, wheel, wheel, wheel_counts=counts, torque=361.0, pressed=True, fault=True)
+      cb, ok, active, icon, _ = self._frame(False, wheel, wheel, wheel_counts=counts, torque=361.0, pressed=True, fault=True)
       self.assertEqual((ok, active), ([True], [False]))
     self.assertTrue(self.cc.takeover.strict)
     unwind = 250.0
-    for i in range(300):  # hand on, wheel unwinds from 250 to 100 deg (below the region)
-      unwind = max(100.0, unwind - 0.7)
+    for i in range(300):  # hand on, wheel unwinds from 250 to 120 deg (out of the region, still a curve for F22)
+      unwind = max(120.0, unwind - 0.7)
       cb, ok, active, icon, _ = self._frame(True, unwind, unwind, wheel_counts=counts, torque=300.0, pressed=True)
       self.assertEqual((ok, active, icon), ([True], [False], hyundaicanfd.ICON_PAUSED), f"frame {i}")
     self.assertTrue(self.cc.takeover.paused)
