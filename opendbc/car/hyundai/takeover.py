@@ -53,6 +53,7 @@ class TakeoverFilter:
     self.fault_frames = 0
     self.bind_frames = 0
     self.lat_active_last = False
+    self.unsendable_frames = 0  # consecutive frames lateral was on without a sendable ACTIVE request, from the controller
     self.angle_hist: deque[float] = deque(maxlen=WHEEL_RATE_FRAMES + 1)
     self.k = angle_to_lat_accel
     self.curve_hold = curve_hold and angle_to_lat_accel > 0.0
@@ -73,7 +74,7 @@ class TakeoverFilter:
   def _reset(self):
     self.paused = False
     self.resuming = False
-    self.grab_frames = self.release_frames = self.resume_frames = self.bind_frames = 0
+    self.grab_frames = self.release_frames = self.resume_frames = self.bind_frames = self.unsendable_frames = 0
 
   @staticmethod
   def guard_active(angle: float, v_ego: float) -> bool:
@@ -128,7 +129,7 @@ class TakeoverFilter:
     self.grab_frames = self.grab_frames + 1 if grab else 0
 
     if not self.paused:
-      if press or self.grab_frames >= ENTER_FRAMES or self.fault_frames > 0 or self.bind_frames > GUARD_FRAMES:
+      if press or self.grab_frames >= ENTER_FRAMES or self.fault_frames > 0 or self.bind_frames > GUARD_FRAMES or self.unsendable_frames > GUARD_FRAMES:
         self.paused = True
         self.resuming = False
         self.release_frames = 0
@@ -156,15 +157,23 @@ class TakeoverFilter:
     must not be pulled to the cap, that is a step of tens of degrees the panda rejects frame after frame. The request still never goes outward."""
     return max(GUARD_MAX_ANGLE, abs(angle))
 
-  def limit(self, request: float, last: float, angle: float, v_ego: float) -> float:
-    """Applies the resume blend and the low-speed cap to a request that already passed the vehicle-model limits."""
+  def limit(self, request: float, last: float, angle: float, v_ego: float) -> float | None:
+    """Applies the low-speed cap and the resume blend to a request that already passed the vehicle-model limits. The resume step limit runs last, so
+    it always holds. None: no request satisfies both the step limit and the cap (a wheel that moves against the cap), send inactive instead."""
     if not self.enabled:
       return request
+    guard = self.guard_active(angle, v_ego)
+    cap = self.guard_max_angle(angle)
+    if guard:
+      request = float(np.clip(request, angle - GUARD_MAX_ERROR, angle + GUARD_MAX_ERROR))
+      request = float(np.clip(request, -cap, cap))
     if self.resuming:
       request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
       request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
-    if self.guard_active(angle, v_ego):
-      request = float(np.clip(request, angle - GUARD_MAX_ERROR, angle + GUARD_MAX_ERROR))
-      cap = self.guard_max_angle(angle)
-      request = float(np.clip(request, -cap, cap))
+      if guard and (abs(request - angle) > GUARD_MAX_ERROR or abs(request) > cap):
+        return None
     return request
+
+  def note_unsendable(self, unsendable: bool):
+    """Once per frame by the controller: True when lateral is on but no ACTIVE request exists (inactive frame sent instead)."""
+    self.unsendable_frames = self.unsendable_frames + 1 if unsendable else 0
