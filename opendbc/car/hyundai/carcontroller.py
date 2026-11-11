@@ -13,7 +13,7 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons, CarControllerParams, CAR
 from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
-from opendbc.car.hyundai.takeover import TakeoverFilter
+from opendbc.car.hyundai.takeover import TakeoverFilter, STEP_CAP_DEG
 from opendbc.car.hyundai.panda_angle import PandaAngleCheck
 from opendbc.car.interfaces import CarControllerBase
 
@@ -178,13 +178,15 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
         apply_angle = apply_steer_angle_limits_vm(apply_angle or desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, lat_active,
                                                   self.params, self.BASELINE_VM)
 
+      # the low-speed, large-angle guard region (takeover.step_capped): steps are capped at 1 deg per frame there (takeover.limit), and as a backstop
+      # the request is moved into what the panda accepts at the largest recent speed + 1 m/s; inactive at the measured angle only if nothing fits. Outside
+      # the region nothing of this runs: the road-proven path.
+      in_region = self.takeover.enabled and self.takeover.step_capped(CS.out.steeringAngleDeg, CS.out.vEgo)
       if lat_active and apply_angle is not None:
         apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo)
-        # the guard clips run last and can undo the rate limit above: never send an ACTIVE frame the panda rejects (its per-frame step is checked
-        # against the last frame it saw, the measured angle after an inactive frame), send inactive at the measured angle instead
-        if apply_angle is not None and not self.panda_check.accepts(apply_angle, self.apply_angle_last):
-          apply_angle = None
-      self.takeover.note_unsendable(lat_active and apply_angle is None)
+        if apply_angle is not None and in_region:
+          apply_angle = self.panda_check.clamp(apply_angle, self.apply_angle_last, STEP_CAP_DEG)
+      self.takeover.note_unsendable(lat_active and apply_angle is None and in_region)
 
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
