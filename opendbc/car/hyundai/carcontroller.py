@@ -347,7 +347,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
         lat_state, long_state = self.dash_states(CS, CC)
         # hand-back: an axis openpilot doesn't own and doesn't claim shows the camera's own real state
         can_sends.extend(hyundaicanfd.create_ccnc(self.packer, self.CAN, self.CP.openpilotLongitudinalControl, long_state, CC.hudControl, CC.leftBlinker,
-                                                  CC.rightBlinker, CS.msg_161, CS.msg_162, CS.msg_1b5, CS.is_metric, CS.out, CS.main_cruise_enabled,
+                                                  CC.rightBlinker, CS.msg_161, CS.msg_162, CS.msg_1b5, CS.is_metric, CS.out,
+                                                  # our 0x1A0 'off' frames only (the hand-back tail after a disengage, the stock ACC lock): the cruise is off
+                                                  CS.main_cruise_enabled and not (self.handback and send_long and long_state == hyundaicanfd.ICON_OFF),
                                                   lat_state, self.cluster_alert,
                                                   passthrough_lat=not send_lat and lat_state == hyundaicanfd.ICON_OFF,
                                                   passthrough_long=not send_long and long_state == hyundaicanfd.ICON_OFF,

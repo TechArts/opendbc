@@ -342,6 +342,42 @@ class TestCarControllerHandback(unittest.TestCase):
       self.cs.cam_lfa_icon = icon
       self.assertEqual(0, self._lfa_icon())
 
+  def _cruise_icon(self, enabled=False):
+    """(SETSPEED, SETSPEED_HUD, DISTANCE, SETSPEED_SPEED) of the 0x161 frame we send, main cruise on"""
+    self.cs.main_cruise_enabled = True
+    self.cs.out.cruiseState.available = True
+    self.cc.frame = (self.cc.frame // 5 + 1) * 5
+    self.cs.out.buttonEvents = []
+    cc = structs.CarControl()
+    cc.enabled = enabled
+    cc.longActive = enabled
+    msgs = self.cc.create_canfd_msgs(False, 0, 0.0, 0.0, False, self.hud, self.cs, cc)
+    self.cc.frame += 1
+    parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], 0)
+    parser.update([(0, [(m[0], m[1], 0) for m in msgs if m[0] == 0x161])])
+    v = parser.vl["CCNC_0x161"]
+    return v["SETSPEED"], v["SETSPEED_HUD"], v["DISTANCE"], v["SETSPEED_SPEED"]
+
+  def _dash_fixture(self):
+    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = dbc_defaults("CCNC_0x161"), dbc_defaults("CCNC_0x162"), dbc_defaults("FR_CMR_03_50ms")
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = 0, 1
+    self.cs.out.vCruiseCluster = 40.0
+
+  def test_cruise_icon_off_during_tail_and_stock_lock(self):
+    # route 34 17:43.4 / 18:05.2: after a brake disengage and while the stock ACC is locked out we send 0x1A0 'off' frames; the cruise icon is off then
+    self._dash_fixture()
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
+    self.cs.msg_161.update({"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE": 4, "SETSPEED_SPEED": 35})
+    self.assertEqual(self._cruise_icon(), (1, 1, 4, 35))  # the camera owns the axis: its own standby look is passed through
+    self._msgs(steer_req=True, enabled=True)  # openpilot engaged and owner
+    self._msgs(steer_req=False, enabled=False, brake=True)  # brake: disengaged, the tail starts
+    self.assertEqual(self._cruise_icon(), (0, 0, 0, 255))
+    self.cs.cruise_info["ACCMode"] = 1  # camera ACC engaged on its own (lock): off as well
+    self.cc.handback.long_owner.owner = False
+    self.cc.handback.long_owner.release_frame = None
+    self.assertEqual(self._cruise_icon(), (0, 0, 0, 255))
+    self.assertEqual(self._cruise_icon(enabled=True)[:2], (2, 2))  # engaged by openpilot: green
+
   def test_stock_acc_lock_sends_off_frames(self):
     # camera ACC engaged (ACCMode 1) while openpilot is not: 0x1A0 'off' frames, also if openpilot never owned the axis
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}
