@@ -1846,8 +1846,9 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
       self.safety.safety_tick_current_safety_config()
     self.assertFalse(self._hold_resume_released(interrupt))
 
-  def test_hold_heartbeat_fault_disarms(self):
-    self.assertFalse(self._hold_resume_released(lambda: self.safety.set_heartbeat_engaged_mismatches(2)))
+  def test_hold_safety_reinit_disarms(self):
+    # a lost heartbeat re-initializes the safety: the pending resume is gone with it
+    self.assertFalse(self._hold_resume_released(lambda: self._init(flag=True) or self.safety.set_controls_allowed(False)))
 
   def test_hold_without_fault_still_resumes(self):
     self.assertTrue(self._hold_resume_released(lambda: None))

@@ -33,10 +33,6 @@ bool safety_config_valid() {
   return true;
 }
 
-void set_heartbeat_engaged_mismatches(uint32_t c) {
-  heartbeat_engaged_mismatches = c;
-}
-
 void set_controls_allowed(bool c){
   controls_allowed = c;
 }
