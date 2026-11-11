@@ -270,6 +270,37 @@ class TestCurveTakeover(unittest.TestCase):
   def test_opposing_pressed_pauses_at_once(self):
     self.assertTrue(self.curve(make_curve(), 1, -200, pressed=True)[0])
 
+  def test_guard_region_hand_along_the_turn_pauses_and_releases_like_straight(self):
+    """Route 3a: v 2.68 m/s, wheel and model 250: a = 0.7 m/s^2, a turn. In the region any torque or steeringPressed pauses, along the turn too."""
+    for sign in (1, -1):
+      a = 250.0 * sign
+      kw = dict(v=2.68, angle=a, desired=a)
+      f = make_curve()
+      self.assertTrue(run(f, 1, torque=0.0, pressed=True, **kw)[0])
+      f = make_curve()
+      self.assertTrue(run(f, ENTER_FRAMES, torque=250 * sign, **kw)[-1])  # along-turn torque from the 3rd frame, unpressed
+      hold = f.hold_frames
+      self.assertTrue(all(run(f, hold + 50, torque=300 * sign, pressed=True, **kw)))
+      self.assertTrue(all(run(f, hold - 1, torque=0.0, **kw)))
+      self.assertFalse(run(f, 1, torque=0.0, **kw)[-1])
+    f = make_curve()  # the same hand above the region's speed: not a grab (F22)
+    self.assertFalse(any(run(f, 100, torque=300, pressed=True, v=8.0, angle=250.0, desired=250.0)))
+
+  def test_fault_in_the_region_latches_the_straight_release_until_the_hand_is_off(self):
+    f = make_curve()
+    kw = dict(angle=250.0, desired=250.0, v=2.68)
+    run(f, 20, **kw)
+    run(f, FAULT_FRAMES, torque=300, pressed=True, fault=True, **kw)
+    self.assertTrue(f.strict)
+    out = dict(angle=100.0, desired=100.0, v=2.68)  # wheel unwound out of the region, the hand still holds along the turn (a = 0.28 + hand)
+    self.assertTrue(all(run(f, 5 * FAULT_FRAMES, torque=300, pressed=True, **out)))
+    self.assertTrue(all(run(f, f.hold_frames - 1, **out)))
+    self.assertFalse(run(f, 1, **out)[-1])
+    self.assertFalse(f.strict)
+    g = make_curve()  # a fault outside the region does not latch anything
+    run(g, 5, torque=300, fault=True, v=15.0, angle=17.0, desired=17.0)
+    self.assertFalse(g.strict)
+
   def test_straight_is_unchanged(self):
     for kw in (dict(angle=1.0, desired=1.0), dict(angle=17.0, desired=1.0, v=0.5)):
       f = make_curve()
@@ -348,7 +379,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(True)
     self.t = 0
 
-  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None, extra_counts=(), v_ego=None):
+  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None, extra_counts=(), v_ego=None, torque=0.0, pressed=False, fault=False):
     """One controller cycle into the real panda. Returns (0xCB frames, accepted, active, icon, request angle). extra_counts: wheel-speed RX frames
     the panda gets before this cycle's one, which the controller never reads."""
     v = self.V if v is None else v
@@ -362,7 +393,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), extra)}))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, wheels))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": angle}))
-    self.cs.out = structs.CarState(vEgo=v if v_ego is None else v_ego, vEgoRaw=v, steeringTorque=0.0, steeringAngleDeg=angle)
+    self.cs.out = structs.CarState(vEgo=v if v_ego is None else v_ego, vEgoRaw=v, steeringTorque=torque, steeringPressed=pressed,
+                                 steerFaultTemporary=fault, steeringAngleDeg=angle)
     self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
     self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
@@ -628,12 +660,95 @@ class TestBlockedResumeRoute39(unittest.TestCase):
             self.assertLessEqual(abs(req - wheel), 10.0 + 1e-3, f"seed {seed} frame {i}: guard band")
             self.assertLessEqual(abs(req), max(170.0, abs(wheel)) + 1e-3, f"seed {seed} frame {i}: guard cap")
           self.assertLessEqual(abs(req - last), 1.0 + 1e-3, f"seed {seed} frame {i}: step cap")
+          if self.cc.takeover.resuming:  # R1Guard round 6 nit: the resume window too (limit() saw resuming whenever it is still set after update())
+            self.assertLessEqual(abs(req - last), self.cc.takeover.resume_rate + 1e-3, f"seed {seed} frame {i}: resume rate")
+            self.assertLessEqual(abs(req - wheel), CONVERGE_DEG + 1e-3, f"seed {seed} frame {i}: resume convergence")
 
   def test_sendable_turn_is_not_paused(self):
     """Negative counterpart: wheel 300 at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
     out = self._replay(lambda i: 300.0, wheel0=300.0, model=300.0, v=4.9, frames=150)
     self.assertFalse(self.cc.takeover.paused)
     self.assertGreater(sum(a for a, _, _ in out), 20)
+
+  # --- route 3a: a hand on the wheel in the guard region (v < 6 m/s, |wheel| > 140 deg) is a pause, never "holding the curve" ---
+
+  def _warm(self, wheel, v, frames=150, model=None):
+    model = wheel if model is None else model
+    counts = (round(v * 3.6 / 0.03125),) * 4
+    for _ in range(100):
+      self._frame(False, wheel, model, wheel_counts=counts)
+    for _ in range(frames):
+      self._frame(True, wheel, model, wheel_counts=counts)
+    return counts
+
+  def test_route_3a_1_31_3_hand_along_the_turn_pauses_without_active_frames(self):
+    """1:31.3: 6 mph (2.68 m/s), wheel 250 deg, curve hold on, torque 250-520 along the turn with steeringPressed. Before: ACTIVE for 13-14 frames
+    (gain 0.03, request = wheel), then the EPS faulted. Now: paused within the frame, INACTIVE at the measured angle, grey icon, no ACTIVE frame."""
+    from opendbc.car.hyundai import hyundaicanfd
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        wheel, v = sign * 250.0, 2.68
+        counts = self._warm(wheel, v)
+        self.assertFalse(self.cc.takeover.paused)
+        for i, tq in enumerate([250.0, 300.0, 361.0, 450.0, 520.0] * 40):
+          cb, ok, active, icon, req = self._frame(True, wheel, wheel, wheel_counts=counts, torque=sign * tq, pressed=True)
+          self.assertEqual((len(cb), ok, active), (1, [True], [False]), f"frame {i}")
+          self.assertEqual(icon, hyundaicanfd.ICON_PAUSED, f"frame {i}")
+          self.assertAlmostEqual(req, wheel, places=4, msg=f"frame {i}: INACTIVE at the measured angle")
+          self.assertTrue(self.cc.takeover.paused)
+          self.assertEqual(self.cc.apply_torque_last, 0)
+
+  def test_route_3a_after_the_eps_flag_no_retry_while_the_hand_holds(self):
+    """The flag (steerFaultTemporary 61 frames) in the region, the hand still holds along the turn, also after the wheel unwinds out of the region:
+    no ACTIVE frame for 3 s; once the hand is off for the hold time (and the fault 1 s) steering comes back."""
+    from opendbc.car.hyundai import hyundaicanfd
+    self.setUp()
+    wheel, v = 250.0, 2.68
+    counts = self._warm(wheel, v)
+    for i in range(61):
+      cb, ok, active, icon, _ = self._frame(True, wheel, wheel, wheel_counts=counts, torque=361.0, pressed=True, fault=True)
+      self.assertEqual((ok, active), ([True], [False]))
+    self.assertTrue(self.cc.takeover.strict)
+    unwind = 250.0
+    for i in range(300):  # hand on, wheel unwinds from 250 to 100 deg (below the region)
+      unwind = max(100.0, unwind - 0.7)
+      cb, ok, active, icon, _ = self._frame(True, unwind, unwind, wheel_counts=counts, torque=300.0, pressed=True)
+      self.assertEqual((ok, active, icon), ([True], [False], hyundaicanfd.ICON_PAUSED), f"frame {i}")
+    self.assertTrue(self.cc.takeover.paused)
+    n_active = 0
+    for i in range(250):  # hand off
+      cb, ok, active, icon, _ = self._frame(True, unwind, unwind, wheel_counts=counts)
+      self.assertEqual(ok, [True])
+      n_active += active[0]
+    self.assertFalse(self.cc.takeover.paused)
+    self.assertFalse(self.cc.takeover.strict)
+    self.assertGreater(n_active, 100)
+
+  def test_inactive_beyond_360_is_clipped_because_the_panda_demands_it(self):
+    """Route 3a 1:28.3-1:29.7: wheel 362-409 deg, INACTIVE request fixed at 360.0 (49 deg off). The panda clamps the INACTIVE band to
+    clamp(measured, 360) +- 0.1 deg, so the clip is what it accepts; the unclipped measured angle is rejected (and would reset its angle state)."""
+    from opendbc.car.hyundai import hyundaicanfd
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        for wheel in (361.0, 380.0, 409.0):
+          cb, ok, active, icon, req = self._frame(False, sign * wheel, sign * wheel, 4.9)
+          self.assertEqual((len(cb), ok, active), (1, [True], [False]))
+          self.assertEqual(req, sign * 360.0)
+        raw = hyundaicanfd.create_steering_messages(self.cc.packer, self.cc.CP, self.cc.CAN, False, False, 0, sign * 409.0, 0, 0)
+        msg = next(m for m in raw if m[0] == self.ADDR)
+        self.assertFalse(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(msg[0], msg[2], msg[1])))
+
+  def test_outside_the_region_the_along_turn_hold_is_unchanged(self):
+    """Above 6 m/s, or a wheel within 140 deg, the F22 along-turn exemption still holds: same controller, hand 300 along the turn, pressed."""
+    for v, wheel in ((8.0, 250.0), (2.68, 120.0)):
+      with self.subTest(v=v, wheel=wheel):
+        self.setUp()
+        counts = self._warm(wheel, v)
+        for i in range(200):
+          self._frame(True, wheel, wheel, wheel_counts=counts, torque=300.0, pressed=True)
+        self.assertFalse(self.cc.takeover.paused)
 
 
 class TestPandaAngleCheck(unittest.TestCase):

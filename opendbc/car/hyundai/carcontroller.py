@@ -191,7 +191,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
       apply_steer_req = lat_active and apply_torque != 0 and apply_angle is not None
 
-      # Failsafe if we detected we'd violate safety
+      # Failsafe if we detected we'd violate safety. The measured angle is clipped to +-STEER_ANGLE_MAX (360 deg) on purpose: the panda
+      # (lateral.h steer_angle_cmd_checks_vm, HYUNDAI_CANFD_ANGLE_STEERING_LIMITS.max_angle 3600) clamps the allowed INACTIVE band to
+      # [clamp(measured) -+ 1], so an INACTIVE request at a wheel beyond 360 deg (route 3a 1:28.3-1:29.7, 362-409 deg) is only accepted at 360.0.
+      # The EPS/camera did not react to those 2 runs (no AciFltSig, no FAULT_*, no block); the signal itself (14 bit, 0.1 deg) would carry +-819 deg.
+      # Pinned by test_inactive_beyond_360_is_clipped_because_the_panda_demands_it.
       if apply_angle is None:
         apply_torque = 0
         apply_angle = float(np.clip(CS.out.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
