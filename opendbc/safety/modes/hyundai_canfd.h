@@ -147,6 +147,16 @@ static bool hyundai_canfd_handback_recent(bool valid, uint32_t ts, uint32_t now)
 static void hyundai_canfd_handback_step(void) {
   const uint32_t now = microsecond_timer_get();
 
+  // a pause-key release granted controls_allowed but openpilot does not own 0x1A0 yet: the camera's own ACC must not drive in the meantime,
+  // so the lock is on from the grant (before the camera's ACCMode rises, or while it is already engaged) until an accepted active openpilot frame
+  if (hyundai_pause_resume_granted) {
+    hyundai_pause_resume_granted = false;
+    if (!hyundai_canfd_hb_long_op && controls_allowed) {
+      hyundai_canfd_hb_stock_lock = true;
+      hyundai_canfd_hb_cam_standby_frames = 0U;
+    }
+  }
+
   const bool brake_edge = brake_pressed && !hyundai_canfd_hb_brake_prev;
   const bool main_off_edge = hyundai_canfd_hb_main_on_prev && !acc_main_on;
   hyundai_canfd_hb_brake_prev = brake_pressed;
@@ -169,7 +179,7 @@ static void hyundai_canfd_handback_camera_acc(int acc_mode) {
   hyundai_canfd_hb_cam_engaged = engaged;
   hyundai_canfd_hb_cam_seen = true;
 
-  if (rising && !controls_allowed && !hyundai_canfd_hb_long_op) {
+  if (rising && !hyundai_canfd_hb_long_op) {
     hyundai_canfd_hb_stock_lock = true;
     hyundai_canfd_hb_cam_standby_frames = 0U;
   }
@@ -178,7 +188,8 @@ static void hyundai_canfd_handback_camera_acc(int acc_mode) {
       hyundai_canfd_hb_cam_standby_frames = 0U;
     } else {
       hyundai_canfd_hb_cam_standby_frames = (hyundai_canfd_hb_cam_standby_frames < 255U) ? (hyundai_canfd_hb_cam_standby_frames + 1U) : 255U;
-      if (hyundai_canfd_hb_cam_standby_frames >= HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES) {
+      // while controls are allowed openpilot is about to take the axis (a camera standby must not reopen the gap)
+      if ((hyundai_canfd_hb_cam_standby_frames >= HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES) && !controls_allowed) {
         hyundai_canfd_hb_stock_lock = false;
       }
     }
@@ -276,6 +287,9 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     // brake press
     if (msg->addr == 0x175U) {
       brake_pressed = GET_BIT(msg, 81U);
+      if (brake_pressed && hyundai_long_main_button_engage) {
+        hyundai_common_cancel_resume_disarm();  // a brake press during a pause-key hold cancels the resume, also when released again before the key
+      }
     }
 
     // vehicle moving
