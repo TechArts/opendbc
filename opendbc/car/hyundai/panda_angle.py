@@ -57,16 +57,13 @@ class PandaAngleCheck:
     request_can, last_can = _to_can(request), _to_can(last)
     return abs(request_can - last_can) <= step - COUNT_MARGIN and abs(request_can) <= max_angle - COUNT_MARGIN
 
-  def clamp(self, request: float, last: float, max_step_deg: float = 1e9) -> float | None:
-    """The request moved toward `last` to the largest step (and within the largest angle) the backstop accepts, in CAN counts; the request itself when
-    it is accepted already; max_step_deg bounds the step too (a caller's own cap). None only when no angle is both within the step of `last` and within the angle limit."""
+  def window(self, last: float, max_step_deg: float = 1e9) -> tuple[float, float] | None:
+    """The angles (deg) the backstop accepts after a frame with angle `last`: within its step (and the caller's max_step_deg) of `last`, and within its
+    angle limit, in CAN counts (multiples of 0.1 deg). None when no angle is."""
     step, max_angle = limits_can((max(self.speeds) if self.speeds else 0.0) + SPEED_MARGIN)
     step, max_angle = min(step - COUNT_MARGIN, int(max_step_deg * DEG_TO_CAN)), max_angle - COUNT_MARGIN
     last_can = _to_can(last)
     low, high = max(last_can - step, -max_angle), min(last_can + step, max_angle)
     if low > high:
       return None
-    request_can = _to_can(request)
-    if low <= request_can <= high:
-      return request
-    return (low if request_can < low else high) / DEG_TO_CAN
+    return low / DEG_TO_CAN, high / DEG_TO_CAN
