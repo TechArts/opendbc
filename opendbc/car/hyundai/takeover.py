@@ -105,7 +105,7 @@ class TakeoverFilter:
         self.release_frames = 0
     self.lat_active_last = True
 
-    binds = self.guard_active(angle, v_ego) and (abs(desired - angle) > GUARD_MAX_ERROR or abs(desired) > GUARD_MAX_ANGLE)
+    binds = self.guard_active(angle, v_ego) and (abs(desired - angle) > GUARD_MAX_ERROR or abs(desired) > self.guard_max_angle(angle))
     self.bind_frames = self.bind_frames + 1 if binds else 0
 
     turn, load, beyond = 0, 0.0, False
@@ -150,6 +150,12 @@ class TakeoverFilter:
         self.resuming = False
     return self.paused
 
+  @staticmethod
+  def guard_max_angle(angle: float) -> float:
+    """|request| cap of the guard. Never below the wheel itself: a wheel already past GUARD_MAX_ANGLE (a tight turn, route 39 29:19.6, -216 deg)
+    must not be pulled to the cap, that is a step of tens of degrees the panda rejects frame after frame. The request still never goes outward."""
+    return max(GUARD_MAX_ANGLE, abs(angle))
+
   def limit(self, request: float, last: float, angle: float, v_ego: float) -> float:
     """Applies the resume blend and the low-speed cap to a request that already passed the vehicle-model limits."""
     if not self.enabled:
@@ -159,5 +165,6 @@ class TakeoverFilter:
       request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
     if self.guard_active(angle, v_ego):
       request = float(np.clip(request, angle - GUARD_MAX_ERROR, angle + GUARD_MAX_ERROR))
-      request = float(np.clip(request, -GUARD_MAX_ANGLE, GUARD_MAX_ANGLE))
+      cap = self.guard_max_angle(angle)
+      request = float(np.clip(request, -cap, cap))
     return request

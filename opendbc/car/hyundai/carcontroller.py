@@ -119,6 +119,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.VM = VehicleModel(CP)
     self.BASELINE_VM = VehicleModel(get_baseline_safety_cp())
     self.apply_angle_last = 0
+    self.lat_unsent = False
 
     self.accel_last = 0
     self.apply_torque_last = 0
@@ -176,10 +177,15 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
       if lat_active and apply_angle is not None:
         apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo)
+        # the guard clips run last and can undo the rate limit above: never send a frame the panda rejects (its per-frame step is checked against
+        # the last frame it saw, which is the measured angle after an inactive frame), send inactive at the measured angle instead
+        checked = apply_steer_angle_limits_vm(apply_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, True, self.params, self.BASELINE_VM)
+        if checked is None or abs(checked - apply_angle) > 1e-3:
+          apply_angle = None
 
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
-      apply_steer_req = lat_active and apply_torque != 0
+      apply_steer_req = lat_active and apply_torque != 0 and apply_angle is not None
 
       # Failsafe if we detected we'd violate safety
       if apply_angle is None:
@@ -198,6 +204,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       apply_torque = 0
 
     self.apply_torque_last = apply_torque
+    self.lat_unsent = CC.latActive and not apply_steer_req  # latActive, but no ACTIVE frame goes out (gain 0, taken over, or a frame the panda would reject)
 
     # accel + longitudinal
     accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
@@ -299,6 +306,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     if CC.latActive and self.takeover.paused:
       lat = ICON_PAUSED  # driver takeover: a pause, the system resumes by itself
+    elif CC.latActive and self.lat_unsent:
+      lat = ICON_PAUSED  # nothing steers: grey until an ACTIVE frame is sent
     elif CC.latActive:
       lat = ICON_ACTIVE
     elif CS.out.steerFaultTemporary or CS.out.steerFaultPermanent:
