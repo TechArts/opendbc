@@ -348,7 +348,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(True)
     self.t = 0
 
-  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None, extra_counts=()):
+  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None, extra_counts=(), v_ego=None):
     """One controller cycle into the real panda. Returns (0xCB frames, accepted, active, icon, request angle). extra_counts: wheel-speed RX frames
     the panda gets before this cycle's one, which the controller never reads."""
     v = self.V if v is None else v
@@ -362,7 +362,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), extra)}))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, wheels))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": angle}))
-    self.cs.out = structs.CarState(vEgo=v, vEgoRaw=v, steeringTorque=0.0, steeringAngleDeg=angle)
+    self.cs.out = structs.CarState(vEgo=v if v_ego is None else v_ego, vEgoRaw=v, steeringTorque=0.0, steeringAngleDeg=angle)
     self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
     self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
@@ -575,18 +575,59 @@ class TestBlockedResumeRoute39(unittest.TestCase):
           self.assertGreaterEqual(n_active, 390)
           self.assertGreater(req, 4.9 if torque else 9.9)
 
-  def test_guard_region_backstop_clamps_instead_of_dropping(self):
-    """A candidate beyond what the backstop accepts is moved to the largest accepted step, not dropped (no reset of the last angle)."""
+  def test_backstop_window(self):
+    """The backstop's window from `last`: the largest accepted steps, within its angle limit, None when nothing fits."""
     from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
     check = PandaAngleCheck()
     for _ in range(6):
       check.add_speed(18.0)
     step, _ = limits_can(19.0)
-    out = check.clamp(10.0, 0.0)
-    self.assertIsNotNone(out)
-    self.assertAlmostEqual(out, (step - 1) / 10)
-    self.assertEqual(check.clamp(0.1, 0.0), 0.1)  # already accepted: unchanged
-    self.assertIsNone(check.clamp(0.0, 400.0))  # last beyond the angle limit by more than a step: nothing fits
+    lo, hi = check.window(0.0)
+    self.assertAlmostEqual(hi, (step - 1) / 10)
+    self.assertAlmostEqual(lo, -(step - 1) / 10)
+    self.assertEqual(check.window(0.0, 0.1), (-0.1, 0.1))  # the caller's own cap
+    self.assertIsNone(check.window(400.0))  # last beyond the angle limit by more than a step: nothing fits
+
+  def test_limit_intersects_guard_resume_step_and_backstop(self):
+    """R1Guard round 5: last 189.64, wheel 199.6, model 189.64 at 4.9 m/s; the backstop's angle limit (about 188.6) would put the request 11 deg from
+    the wheel (guard max 10): the intersection is empty, so inactive. A resume rate of 0.5 deg bounds the step too."""
+    f = TakeoverFilter(150, 100, 500, 5)  # resume rate 0.5 deg per frame
+    self.assertIsNone(f.limit(189.64, 189.64, 199.6, 4.9, backstop=(180.0, 188.6)))
+    self.assertEqual(f.limit(189.64, 189.64, 199.6, 4.9, backstop=(180.0, 190.2)), 189.64)  # already inside
+    self.assertEqual(f.limit(195.0, 189.64, 199.6, 4.9, backstop=(180.0, 190.2)), 190.2)  # nearest point of the intersection
+    f.resuming = True
+    self.assertIsNone(f.limit(195.0, 189.64, 199.6, 4.9, backstop=(180.0, 200.0)))  # resume window (last +- 0.5) and wheel +- 5 do not meet
+    self.assertEqual(f.limit(195.0, 189.64, 190.0, 4.9, backstop=(180.0, 200.0)), 190.0)  # the guard's cap |request| <= |wheel| binds, inside the 0.5 window
+    self.assertEqual(f.limit(180.0, 189.64, 190.0, 4.9, backstop=(180.0, 200.0)), 189.14)  # the 0.5 resume step, tighter than the 1 deg cap
+    self.assertIsNone(f.limit(195.0, 189.64, 199.6, 4.9, backstop=None))
+
+  def test_every_accepted_active_frame_satisfies_every_constraint(self):
+    """Property over random inputs, filtered speed != raw speed, panda samples out of step: any ACTIVE frame the controller sends is inside the guard
+    band, the cap, the resume window, the 1 deg step cap and the panda's real limits (libsafety accepts it)."""
+    import random
+    for seed in range(6):
+      rng = random.Random(100 + seed)
+      self.setUp()
+      sign = rng.choice((1, -1))
+      wheel = sign * rng.uniform(150.0, 240.0)
+      counts = rng.randint(300, 750)
+      for _ in range(100):
+        self._frame(False, wheel, wheel, wheel_counts=(counts,) * 4)
+      last = None
+      for i in range(250):
+        counts = max(250, min(760, counts + rng.randint(-5, 5)))
+        extra = [(max(250, min(760, counts + rng.randint(-10, 10))),) * 4 for _ in range(rng.randint(0, 4))]
+        wheel = sign * max(145.0, abs(wheel + rng.uniform(-0.9, 0.9)))
+        last = self.cc.apply_angle_last
+        v_filtered = rng.choice((4.9, 5.4, 5.95))
+        cb, ok, active, icon, req = self._frame(True, wheel, wheel + rng.uniform(-15, 15), wheel_counts=(counts,) * 4, extra_counts=extra,
+                                                 v_ego=v_filtered)  # filtered speed differs from vEgoRaw
+        self.assertEqual((len(cb), ok), (1, [True]), f"seed {seed} frame {i}")
+        if active[0]:
+          if v_filtered < 5.0:  # the guard itself
+            self.assertLessEqual(abs(req - wheel), 10.0 + 1e-3, f"seed {seed} frame {i}: guard band")
+            self.assertLessEqual(abs(req), max(170.0, abs(wheel)) + 1e-3, f"seed {seed} frame {i}: guard cap")
+          self.assertLessEqual(abs(req - last), 1.0 + 1e-3, f"seed {seed} frame {i}: step cap")
 
   def test_sendable_turn_is_not_paused(self):
     """Negative counterpart: wheel 300 at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""

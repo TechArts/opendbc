@@ -164,33 +164,44 @@ class TakeoverFilter:
   def step_capped(angle: float, v_ego: float) -> bool:
     return v_ego < STEP_CAP_SPEED and abs(angle) > STEP_CAP_ANGLE
 
-  def limit(self, request: float, last: float, angle: float, v_ego: float) -> float | None:
-    """Applies the low-speed cap and the resume blend to a request that already passed the vehicle-model limits. The resume step limit runs before the
-    final step cap, so both always hold. None: no request satisfies the clips and the step limit (a wheel that moves against the cap), send inactive
-    instead; the next frame then starts from the measured angle."""
+  def window(self, last: float, angle: float, v_ego: float) -> tuple[float, float]:
+    """Inside the guard region: the intersection (lo, hi), empty when lo > hi, of every constraint on the request: the guard band (wheel +-10 deg,
+    |request| <= guard_max_angle), the resume window (wheel +-CONVERGE_DEG and last +-resume rate) and the step cap (last +-STEP_CAP_DEG).
+
+    The step cap holds whatever the source of the change (guard clips, resume, tracking). Proof that the panda accepts it whatever its speed history is
+    (lateral.h:303-322, steer_angle_cmd_checks_vm): the step limit is max_angle_delta = jerk / v^2 * k / 100 Hz with v = min of the panda's last six
+    speed samples - 1 m/s, decreasing in v. Here our speed is < STEP_CAP_SPEED (6 m/s); the panda's samples are the same wheel speeds, at most 1 m/s
+    above ours (100 Hz samples, a car below 6 m/s cannot change 1 m/s between two reads), so v < 6 m/s: at v = 6 m/s the limit is 2.3 deg per frame
+    (23 CAN counts, panda_angle.limits_can(7.0), checked against libsafety) > STEP_CAP_DEG = 1 deg, and it only grows below. The panda reads the
+    previous frame we sent, which is `last` (the measured angle after an inactive frame)."""
+    lo, hi = last - STEP_CAP_DEG, last + STEP_CAP_DEG
+    if self.guard_active(angle, v_ego):
+      cap = self.guard_max_angle(angle)
+      lo, hi = max(lo, angle - GUARD_MAX_ERROR, -cap), min(hi, angle + GUARD_MAX_ERROR, cap)
+    if self.resuming:
+      lo, hi = max(lo, angle - CONVERGE_DEG, last - self.resume_rate), min(hi, angle + CONVERGE_DEG, last + self.resume_rate)
+    return lo, hi
+
+  def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
+    """Applies the low-speed cap and the resume blend to a request that already passed the vehicle-model limits.
+
+    Outside the guard region (step_capped false): the resume blend only, as it always was. Inside: the request moved to the nearest point of window()
+    intersected with `backstop` (the panda backstop's window from the controller, None when it has none). None: the intersection is empty (a wheel that
+    moves against the band, a step the panda would not accept): send inactive at the measured angle, the next frame starts from there."""
     if not self.enabled:
       return request
-    guard = self.guard_active(angle, v_ego)
-    cap = self.guard_max_angle(angle)
-    if guard:
-      request = float(np.clip(request, angle - GUARD_MAX_ERROR, angle + GUARD_MAX_ERROR))
-      request = float(np.clip(request, -cap, cap))
-    if self.resuming:
-      request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
-      request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
-      if guard and (abs(request - angle) > GUARD_MAX_ERROR or abs(request) > cap):
-        return None
-    if self.step_capped(angle, v_ego):
-      # Whatever the source of the change (guard clips, resume, tracking): at most STEP_CAP_DEG per frame. Proof that the panda accepts it whatever its
-      # speed history is (lateral.h:303-322, steer_angle_cmd_checks_vm): the step limit is max_angle_delta = jerk / v^2 * k / 100 Hz, v = min of the
-      # panda's last six speed samples - 1 m/s, decreasing in v. Here our speed is < STEP_CAP_SPEED (6 m/s); the panda's samples are the same wheel
-      # speeds, at most 1 m/s above ours (100 Hz samples, a car below 6 m/s cannot change 1 m/s between two reads), so v < 6 m/s: at v = 6 m/s the
-      # limit is 2.3 deg per frame (23 CAN counts, panda_angle.limits_can(7.0), checked against libsafety) > STEP_CAP_DEG = 1 deg, and it only grows
-      # below. The panda reads the previous frame we sent, which is `last` (the measured angle after an inactive frame).
-      request = float(np.clip(request, last - STEP_CAP_DEG, last + STEP_CAP_DEG))
-      if guard and (abs(request - angle) > GUARD_MAX_ERROR or abs(request) > cap):
-        return None  # the capped step cannot reach the guard's band: inactive at the measured angle, the next frame starts inside it
-    return request
+    if not self.step_capped(angle, v_ego):
+      if self.resuming:
+        request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
+        request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
+      return request
+    if backstop is None:
+      return None
+    lo, hi = self.window(last, angle, v_ego)
+    lo, hi = max(lo, backstop[0]), min(hi, backstop[1])
+    if lo > hi:
+      return None
+    return float(np.clip(request, lo, hi))
 
   def note_unsendable(self, unsendable: bool):
     """Once per frame by the controller: True when lateral is on but no ACTIVE request exists (inactive frame sent instead)."""
