@@ -1,10 +1,13 @@
 """GV70 angle steering: a driver takeover (wheel) is a pause, not a fight.
 
 While paused the controller sends 0xCB INACTIVE at the measured angle with gain 0 (no counter-force, no angle error for the EPS to fault on).
-When the driver lets go the request is blended back to the model: angle step limited, gain ramped by the controller, and never further than
-CONVERGE_DEG from the measured angle. Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding.
+When the driver lets go the request is blended back to the model: angle step limited (never more than the resume rate per frame, whatever the
+wheel does), gain ramped by the controller, and kept within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
+Lateral never starts (engage, blinker pause end, takeover release) while the wheel still moves faster than that: it stays paused until it calms.
+Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding.
 """
 import math
+from collections import deque
 
 import numpy as np
 
@@ -14,6 +17,7 @@ ENTER_FRAMES = 3  # |torque| above the enter threshold for this many frames star
 RESUME_FRAMES = int(1.0 / DT_CTRL)  # angle step limit after a pause
 FAULT_FRAMES = int(1.0 / DT_CTRL)  # stay paused this long after steerFaultTemporary clears
 CONVERGE_DEG = 5.0  # request stays this close to the measured angle while resuming
+WHEEL_RATE_FRAMES = 5  # frames the wheel's angular speed is measured over
 
 # low-speed guard: both short EPS faults had a request 19-29 deg ahead of the wheel at 174-182 deg and 3-4 m/s
 GUARD_SPEED = 5.0  # m/s
@@ -49,6 +53,7 @@ class TakeoverFilter:
     self.fault_frames = 0
     self.bind_frames = 0
     self.lat_active_last = False
+    self.angle_hist: deque[float] = deque(maxlen=WHEEL_RATE_FRAMES + 1)
     self.k = angle_to_lat_accel
     self.curve_hold = curve_hold and angle_to_lat_accel > 0.0
     self.hold_load = 0.0  # v^2 * |desired| * k, the model's lateral demand (gain floor input)
@@ -79,6 +84,12 @@ class TakeoverFilter:
     if not self.enabled:
       return False
 
+    self.angle_hist.append(angle)
+    wheel_rate = abs(angle - self.angle_hist[0]) / max(1, len(self.angle_hist) - 1)  # deg per frame
+    # a wheel that still moves faster than the resume rate (route 34 3:25.3: the driver unwinding a turn at 1.5-2.3 deg per frame as the blinker pause
+    # ended) cannot be blended with: a request limited to the rate falls behind it and fights, one that follows it exceeds the rate
+    fast = self.resume_rate > 0 and wheel_rate > self.resume_rate
+
     self.fault_frames = FAULT_FRAMES if fault else max(0, self.fault_frames - 1)
     if not lat_active:
       self._reset()
@@ -88,6 +99,10 @@ class TakeoverFilter:
       # lateral just came back (engage, blinker pause, MADS pause, fault): blend in like after a takeover, never snap to the model
       self.resuming = True
       self.resume_frames = RESUME_FRAMES
+      if fast:
+        self.paused = True
+        self.resuming = False
+        self.release_frames = 0
     self.lat_active_last = True
 
     binds = self.guard_active(angle, v_ego) and (abs(desired - angle) > GUARD_MAX_ERROR or abs(desired) > GUARD_MAX_ANGLE)
@@ -122,6 +137,7 @@ class TakeoverFilter:
         calm = abs(torque) < self.release_torque and not pressed
       else:
         calm = along > -self.release_torque and not beyond  # however hard the hand holds along the turn (data: 270-490 at 0.5-2 m/s^2)
+      calm = calm and not fast
       self.release_frames = self.release_frames + 1 if calm else 0
       if self.release_frames >= self.hold_frames and self.fault_frames == 0 and not binds:
         self.paused = False
@@ -139,8 +155,8 @@ class TakeoverFilter:
     if not self.enabled:
       return request
     if self.resuming:
-      request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))
       request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
+      request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
     if self.guard_active(angle, v_ego):
       request = float(np.clip(request, angle - GUARD_MAX_ERROR, angle + GUARD_MAX_ERROR))
       request = float(np.clip(request, -GUARD_MAX_ANGLE, GUARD_MAX_ANGLE))
