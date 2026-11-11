@@ -96,6 +96,7 @@ bool get_cruise_engaged_prev(void);
 void set_cruise_engaged_prev(bool engaged);
 bool get_vehicle_moving(void);
 void set_timer(uint32_t t);
+void set_heartbeat_engaged_mismatches(uint32_t c);
 
 void safety_tick_current_safety_config();
 bool safety_config_valid();

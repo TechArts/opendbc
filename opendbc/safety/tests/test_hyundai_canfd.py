@@ -1683,15 +1683,16 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
       self._camera_acc(0, main=0)
     self.assertTrue(self._scc_fwd())
 
-  def test_explicit_engage_is_not_locked(self):
-    # SET/RES press with main on: controls allowed at the press, the camera engages along: openpilot takes over, no lock
+  def test_explicit_engage_keeps_camera_out_until_openpilot_owns(self):
+    # SET/RES press with main on: controls allowed at the release, the camera engages along: it stays out of the car, openpilot's off frames
+    # replace it, and only the first accepted active openpilot frame takes the axis
     self._standby_after_brake()
     self._button(2)
     self._button(0)
     self.assertTrue(self.safety.get_controls_allowed())
     self._camera_acc(1)
-    self.assertTrue(self._scc_fwd())  # camera still supplies the car until openpilot's first engaged frame
-    self.assertFalse(self._scc(0))
+    self.assertFalse(self._scc_fwd())
+    self.assertTrue(self._scc(0))
     self.assertTrue(self._scc(1))
     self.assertFalse(self._scc_fwd())
 
@@ -1733,6 +1734,124 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._camera_acc(1)
     self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x1CF))
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1CF))
+
+  # --- pause-key release grants controls_allowed without openpilot owning 0x1A0: the camera must stay out in every ordering (R1 F1)
+  def _release_pause(self):
+    self._standby_after_brake()
+    for _ in range(7):
+      self._button(self.CANCEL)
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pause_release_then_camera_engages_stays_blocked(self):
+    for mode in (1, 2):
+      with self.subTest(mode=mode):
+        self._release_pause()
+        self._camera_acc(mode)  # camera resumes only after the release, openpilot has sent nothing active
+        for _ in range(20):
+          self._camera_acc(mode)
+          self.assertFalse(self._scc_fwd())
+          self.assertTrue(self._scc(0))  # off frames replace the camera's
+
+  def test_pause_release_camera_stays_blocked_without_openpilot_tx(self):
+    # Python cannot or does not enable (no remembered speed, NO_ENTRY, delayed enable): the panda permission alone never hands the car to the camera
+    for mode in (1, 2):
+      with self.subTest(mode=mode):
+        self._release_pause()
+        self.assertFalse(self._scc_fwd())  # even before the camera moves
+        self._camera_acc(mode)
+        for _ in range(50):
+          self._camera_acc(mode)
+          self.assertFalse(self._scc_fwd())
+
+  def test_camera_before_and_after_release_with_openpilot_tx_absent_or_rejected(self):
+    for mode in (1, 2):
+      for before in (True, False):
+        with self.subTest(mode=mode, before=before):
+          self._standby_after_brake()
+          for _ in range(7):
+            self._button(self.CANCEL)
+          if before:
+            self._camera_acc(mode)
+          self._button(0)
+          if not before:
+            self._camera_acc(mode)
+          self.assertTrue(self.safety.get_controls_allowed())
+          for _ in range(5):
+            self._camera_acc(mode)
+            self.assertFalse(self._scc_fwd())  # openpilot's TX absent
+          # rejected TX: an active frame with an accel outside the limits does not take the axis and the camera stays out
+          rejected = self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": mode, "aReqRaw": 3.5, "aReqValue": 3.5}))
+          self.assertFalse(rejected)
+          self.assertFalse(self._scc_fwd())
+          self._camera_acc(mode)
+          self.assertFalse(self._scc_fwd())
+          self.assertTrue(self._scc(0))
+          self.assertTrue(self._scc(mode))  # accepted active frame: openpilot owns the axis
+          self.assertFalse(self._scc_fwd())
+
+  def test_permission_lost_before_openpilot_owns_keeps_lock(self):
+    self._release_pause()
+    self._camera_acc(1)  # rising after the release
+    self._brake(1)
+    self._brake(0)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self._scc_fwd())  # the lock armed on the camera's rising edge survives the lost permission
+    self.assertTrue(self._scc(0))
+    self.assertFalse(self._scc(1))
+
+  def test_release_with_camera_in_standby_blocks_camera_until_permission_ends(self):
+    self._release_pause()
+    for _ in range(10):
+      self._camera_acc(4)
+    self.assertFalse(self._scc_fwd())  # permission without ownership: no stock frames even in standby
+    self._brake(1)
+    self._brake(0)
+    for _ in range(3):
+      self._camera_acc(4)
+    self.assertTrue(self._scc_fwd())
+
+  # --- policy: during a pause-key hold any brake press, main change or heartbeat/lag fault disarms the pending resume; the release only pauses
+  def _hold_resume_released(self, interrupt):
+    self._standby_after_brake()
+    for _ in range(7):
+      self._button(self.CANCEL)
+    interrupt()
+    self._button(0)
+    return self.safety.get_controls_allowed()
+
+  def test_hold_brake_pressed_and_released_disarms(self):
+    def interrupt():
+      self._brake(1)
+      self._brake(0)
+    self.assertFalse(self._hold_resume_released(interrupt))
+    # pause only: a fresh press starts clean
+    for _ in range(3):
+      self._button(self.CANCEL)
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_hold_main_off_then_on_disarms(self):
+    def interrupt():
+      self._camera_main(0)
+      self._camera_main(1)
+    self.assertFalse(self._hold_resume_released(interrupt))
+
+  def test_hold_main_off_disarms(self):
+    self.assertFalse(self._hold_resume_released(lambda: self._camera_main(0)))
+
+  def test_hold_lag_fault_disarms(self):
+    def interrupt():
+      self.safety.set_timer(5 * self.S)
+      self.safety.safety_tick_current_safety_config()
+    self.assertFalse(self._hold_resume_released(interrupt))
+
+  def test_hold_heartbeat_fault_disarms(self):
+    self.assertFalse(self._hold_resume_released(lambda: self.safety.set_heartbeat_engaged_mismatches(2)))
+
+  def test_hold_without_fault_still_resumes(self):
+    self.assertTrue(self._hold_resume_released(lambda: None))
+
 
   def test_init_resets_lka_window(self):
     self._init()

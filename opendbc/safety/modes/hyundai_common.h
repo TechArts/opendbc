@@ -82,6 +82,7 @@ static uint32_t camera_main_rise_ts;
 // main-button engage: the pause key (CANCEL) is a pause/resume toggle like the stock cruise. A press that starts with controls off and main on
 // resumes controls on its release (like RES); a press that starts with controls on only exits them
 static bool cancel_resume_armed;
+static bool hyundai_pause_resume_granted;  // a pause-key release just set controls_allowed (read once by the CAMERA_HANDBACK lock)
 
 void hyundai_common_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_EV_GAS = 1;
@@ -113,6 +114,7 @@ void hyundai_common_init(uint16_t param) {
   main_press_valid = false;
   camera_main_rise_valid = false;
   cancel_resume_armed = false;
+  hyundai_pause_resume_granted = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
   acc_main_on_mismatches = 0U;
@@ -142,6 +144,18 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
   }
 }
 
+// main-button engage: a pause-key resume request lives only for one uninterrupted hold. A brake press, a main change (off, or off and on again) or a
+// heartbeat/lag fault while the key is down cancels it: the release then only pauses, the driver has to start a new press
+static void hyundai_common_cancel_resume_disarm(void) {
+  cancel_resume_armed = false;
+}
+
+static void hyundai_common_cancel_resume_fault_check(void) {
+  if (safety_rx_checks_invalid || (heartbeat_engaged_mismatches > 0U) || (heartbeat_engaged_mads_mismatches > 0U)) {
+    hyundai_common_cancel_resume_disarm();
+  }
+}
+
 void hyundai_common_cruise_buttons_check(const int cruise_button, const bool main_button) {
   if ((cruise_button == HYUNDAI_BTN_RESUME) || (cruise_button == HYUNDAI_BTN_SET) || (cruise_button == HYUNDAI_BTN_CANCEL) || main_button) {
     hyundai_last_button_interaction = 0U;
@@ -150,6 +164,8 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
   }
 
   if (hyundai_longitudinal) {
+    hyundai_common_cancel_resume_fault_check();
+
     // enter controls on falling edge of resume or set
     bool set = (cruise_button != HYUNDAI_BTN_SET) && (cruise_button_prev == HYUNDAI_BTN_SET);
     bool res = (cruise_button != HYUNDAI_BTN_RESUME) && (cruise_button_prev == HYUNDAI_BTN_RESUME);
@@ -171,6 +187,7 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
     if ((cruise_button != HYUNDAI_BTN_CANCEL) && (cruise_button_prev == HYUNDAI_BTN_CANCEL)) {
       if (cancel_resume_armed && acc_main_on && !brake_pressed) {
         controls_allowed = true;
+        hyundai_pause_resume_granted = true;
       }
       cancel_resume_armed = false;
     }
@@ -203,6 +220,10 @@ void hyundai_common_camera_main_update(const bool camera_main) {
   const bool rising = camera_main && !acc_main_on;
   const bool falling = !camera_main && acc_main_on;
   acc_main_on = camera_main;
+
+  if (rising || falling) {
+    hyundai_common_cancel_resume_disarm();  // main changed during a pause-key hold
+  }
 
   if (rising) {
     camera_main_rise_valid = true;
