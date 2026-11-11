@@ -488,11 +488,12 @@ class TestPandaAngleCheck(unittest.TestCase):
         for _ in range(6):
           check.add_speed(round(v * 3.6 / 0.03125) * 0.03125 / 3.6)
         for d in range(-step - 3, step + 4):
-          request = last + d / 10
-          if abs(request * 10) > max_angle + 3:
-            continue
-          with self.subTest(v=v, last=last, d=d):
-            self.assertEqual(check.accepts(request, last), self._panda(v, last, request))
+          for frac in (0.0, 0.05, 0.03, 0.07):  # half counts too: the packer rounds half up, Python's round() to even
+            request = last + d / 10 + frac
+            if abs(request * 10) > max_angle + 3:
+              continue
+            with self.subTest(v=v, last=last, d=d, frac=frac):
+              self.assertEqual(check.accepts(request, last), self._panda(v, last, request))
 
   def test_panda_legal_step_is_accepted_where_the_python_limiter_is_stricter(self):
     """last 146, wheel 160, request 150 at 4.76 m/s: a 4 deg step, legal for the panda (about 5.6 deg per frame)."""
