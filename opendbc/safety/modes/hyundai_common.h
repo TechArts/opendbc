@@ -145,13 +145,14 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
 }
 
 // main-button engage: a pause-key resume request lives only for one uninterrupted hold. A brake press, a main change (off, or off and on again) or a
-// heartbeat/lag fault while the key is down cancels it: the release then only pauses, the driver has to start a new press
+// lag fault (safety_rx_checks_invalid) while the key is down cancels it: the release then only pauses, the driver has to start a new press. A lost
+// heartbeat re-initializes the safety (init resets the request). The heartbeat engaged-mismatch counts are not part of this: openpilot cannot see them
 static void hyundai_common_cancel_resume_disarm(void) {
   cancel_resume_armed = false;
 }
 
 static void hyundai_common_cancel_resume_fault_check(void) {
-  if (safety_rx_checks_invalid || (heartbeat_engaged_mismatches > 0U) || (heartbeat_engaged_mads_mismatches > 0U)) {
+  if (safety_rx_checks_invalid) {
     hyundai_common_cancel_resume_disarm();
   }
 }
