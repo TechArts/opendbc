@@ -345,12 +345,16 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(True)
     self.t = 0
 
-  def _frame(self, lat_active, angle, model=None, v=None):
+  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None):
     """One controller cycle into the real panda. Returns (0xCB frames, accepted, active, icon, request angle)."""
     v = self.V if v is None else v
     self.t += 10000
     self.safety.set_timer(self.t)
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": v * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+    wheels = {f"WHL_Spd{p}Val": v * 3.6 for p in ("FL", "FR", "RL", "RR")}
+    if wheel_counts is not None:  # raw 0.03125 kph counts per wheel as on the bus; vEgoRaw is their mean, as the car state computes it
+      wheels = {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), wheel_counts)}
+      v = sum(wheel_counts) / 4 * 0.03125 / 3.6
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, wheels))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": angle}))
     self.cs.out = structs.CarState(vEgo=v, vEgoRaw=v, steeringTorque=0.0, steeringAngleDeg=angle)
     self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
@@ -446,6 +450,18 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.assertEqual((ok, active), ([True], [True]))
     self.assertAlmostEqual(req, 150.0, delta=0.6)
 
+  def test_quantised_wheel_speed_repro(self):
+    counts = (567, 567, 567, 566)
+    for _ in range(100):
+      self._frame(False, 160.0, 160.0, wheel_counts=counts)
+    for i in range(150):
+      self._frame(True, 160.0, 160.0, wheel_counts=counts)
+    self.cc.apply_angle_last = 146.0
+    self.safety.set_desired_angle_last(1460)
+    cb, ok, active, icon, req = self._frame(True, 161.2, 161.2, wheel_counts=counts)
+    self.assertEqual((len(cb), ok), (1, [True]))  # accepted: R1Guard's repro sent ACTIVE 151.2 and got rejected with a green icon
+    self.assertFalse(icon == 2 and not active[0])
+
   def test_sendable_turn_is_not_paused(self):
     """Negative counterpart: wheel 300 at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
     out = self._replay(lambda i: 300.0, wheel0=300.0, model=300.0, v=4.9, frames=150)
@@ -479,21 +495,52 @@ class TestPandaAngleCheck(unittest.TestCase):
     msg = self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2, "ADAS_StrAnglReqVal": request})
     return bool(self.safety.safety_tx_hook(msg))
 
-  def test_mirror_matches_the_panda_at_the_step_and_angle_limits(self):
-    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
-    for v in (0.5, 2.0, 4.76, 4.9, 6.0, 10.0):
-      step, max_angle = limits_can(round(v * 3.6 / 0.03125) * 0.03125 / 3.6)
+  def test_mirror_never_accepts_what_the_panda_rejects(self):
+    """Fine speed grid (our vEgoRaw is not the panda's quantised sample), half-count requests, both signs: no false accept; a panda-legal frame is
+    refused only within 3 counts of its step / angle limit."""
+    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, SPEED_MARGIN, limits_can
+    for v in [0.5, 2.0, 4.76, 4.9197049, 6.0, 10.0] + [4.5 + 0.0137 * k for k in range(40)]:
+      step, max_angle = limits_can(v)
       for last in (0.0, 146.0, -216.0, 300.0):
         check = PandaAngleCheck()
         for _ in range(6):
-          check.add_speed(round(v * 3.6 / 0.03125) * 0.03125 / 3.6)
-        for d in range(-step - 3, step + 4):
+          check.add_speed(v)
+        for d in range(-step - 4, step + 5):
           for frac in (0.0, 0.05, 0.03, 0.07):  # half counts too: the packer rounds half up, Python's round() to even
             request = last + d / 10 + frac
-            if abs(request * 10) > max_angle + 3:
+            if abs(request * 10) > max_angle + 4:
               continue
+            mirror, panda = check.accepts(request, last), self._panda(v, last, request)
             with self.subTest(v=v, last=last, d=d, frac=frac):
-              self.assertEqual(check.accepts(request, last), self._panda(v, last, request))
+              self.assertFalse(mirror and not panda)
+              if panda and not mirror:
+                step_m, max_angle_m = limits_can(v + SPEED_MARGIN)  # the mirror's own conservative limits
+                self.assertTrue(abs(d) >= step_m - 3 or abs(request * 10) >= max_angle_m - 3)
+
+  def test_random_parity_mirror_accept_implies_panda_accept(self):
+    """Thousands of random speeds (raw counts per wheel), last angles and requests around the limits, real libsafety."""
+    import random
+    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
+    rng = random.Random(1111)
+    for _ in range(4000):
+      counts = [rng.randint(0, 900) for _ in range(1)] * 4
+      counts[rng.randrange(4)] += rng.choice((0, 0, -1, 1))  # one wheel off by a count, as on the car
+      v = sum(counts) / 4 * 0.03125 / 3.6
+      last = rng.uniform(-340.0, 340.0)
+      step, max_angle = limits_can(v)
+      request = last + rng.choice((-1, 1)) * (rng.uniform(0.0, 1.0) * 1.3 * step / 10)
+      request = max(-359.0, min(359.0, request))
+      check = PandaAngleCheck()
+      for _ in range(6):
+        check.add_speed(v)
+      if check.accepts(request, last):
+        for _ in range(6):
+          self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), counts)}))
+        self.t = (self.t + 300_000) % 2**32
+        self.safety.set_timer(self.t)
+        self.safety.set_desired_angle_last(round(last * 10))
+        self.assertTrue(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2, "ADAS_StrAnglReqVal": request})),
+                        f"counts={counts} last={last} request={request}")
 
   def test_panda_legal_step_is_accepted_where_the_python_limiter_is_stricter(self):
     """last 146, wheel 160, request 150 at 4.76 m/s: a 4 deg step, legal for the panda (about 5.6 deg per frame)."""
