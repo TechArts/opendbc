@@ -53,6 +53,7 @@ class AxisOwner:
 LKA_ICON_SETTLE_FRAMES = int(1.7 / DT_CTRL)  # panda 1.5 s (LFA's on/off blink lasts <= 1.3 s)
 LKA_HOLD_FRAMES = int(0.3 / DT_CTRL)         # panda 0.5 s (longest LKA_SysIndReq gap inside a nudge: 0.33 s, seen once)
 LKA_ICON_LFA = (1, 2)                        # camera LFA_ICON: grey (on, not steering) / green (on, steering)
+LFA_PRESS_BLINK_FRAMES = int(1.5 / DT_CTRL)  # after an LFA button press the camera's icon blinks within 0.3 s (route 34: 0.25 s); no blink in this time = it ignored it
 
 
 class LkaWindow:
@@ -62,6 +63,16 @@ class LkaWindow:
     self.icon_zero_since: int | None = None
     self.lka_frame: int | None = None
     self.lfa_on = False  # the camera's own LFA, settled (a blink does not flip it)
+    self.press_frame: int | None = None  # an LFA button press with the camera's LFA on: it goes off, the icon must not wait for the blink to settle
+    self.blink_seen = False
+
+  def lfa_pressed(self, frame: int) -> None:
+    """The LFA button (MADS) was pressed while the camera's LFA is on: that press turns it off (the icon blinks 3,0,3,0 for 1-2 s, then 0, which
+    only counts as off after the settle time). The truth for the dash is off from the press itself."""
+    if self.lfa_on:
+      self.lfa_on = False
+      self.press_frame = frame
+      self.blink_seen = False
 
   def update(self, icon: int | None, ind: int | None, frame: int) -> bool:
     """icon: camera LFA_ICON (0x161), ind: camera LKA_SysIndReq (0x12A), None before the first frame. True while the camera's nudge may steer."""
@@ -70,8 +81,14 @@ class LkaWindow:
     elif self.icon_zero_since is None:
       self.icon_zero_since = frame
     settled = self.icon_zero_since is not None and frame - self.icon_zero_since >= LKA_ICON_SETTLE_FRAMES
+    if self.press_frame is not None:
+      self.blink_seen = self.blink_seen or (icon is not None and icon not in LKA_ICON_LFA)
+      if icon in LKA_ICON_LFA and (self.blink_seen or frame - self.press_frame > LFA_PRESS_BLINK_FRAMES):
+        self.press_frame = None  # blinked and is on again (an LFA on press), or never blinked (the press changed nothing)
+      elif settled:
+        self.press_frame = None
     if icon in LKA_ICON_LFA:
-      self.lfa_on = True
+      self.lfa_on = self.press_frame is None
     elif settled:
       self.lfa_on = False
     if ind == 3:
@@ -139,6 +156,8 @@ class CameraHandback:
     # lateral: always ours from the start (inactive frames too: the camera's own request, LFA lane centering included, must not reach the EPS,
     # also after a main press that turns the car's LFA on), except while the car's own lane-keeping nudge (LKA) steers with openpilot
     # steering off: then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we send nothing (the panda decides the same, see LkaWindow)
+    if any(be.type == structs.CarState.ButtonEvent.Type.lkas and be.pressed for be in CS.out.buttonEvents):
+      self.lka_window.lfa_pressed(frame)
     lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, frame)
     send_lat = not (lka_nudge and not CC.latActive)
     send_long = self.long_owner.update(bool(CC.enabled and openpilot_long), driver_cruise, frame)
