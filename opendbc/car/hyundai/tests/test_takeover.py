@@ -345,12 +345,14 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(True)
     self.t = 0
 
-  def _frame(self, lat_active, angle):
+  def _frame(self, lat_active, angle, model=None, v=None):
+    """One controller cycle into the real panda. Returns (0xCB frames, accepted, active, icon, request angle)."""
+    v = self.V if v is None else v
     self.t += 10000
     self.safety.set_timer(self.t)
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": self.V * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": v * 3.6 for p in ("FL", "FR", "RL", "RR")}))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": angle}))
-    self.cs.out = structs.CarState(vEgo=self.V, vEgoRaw=self.V, steeringTorque=0.0, steeringAngleDeg=angle)
+    self.cs.out = structs.CarState(vEgo=v, vEgoRaw=v, steeringTorque=0.0, steeringAngleDeg=angle)
     self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
     self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
     self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
@@ -358,34 +360,152 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
     self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
     CC = structs.CarControl(latActive=lat_active, enabled=lat_active)
-    CC.actuators.steeringAngleDeg = self.MODEL
-    _, sends = self.cc.update(CC.as_reader(), structs.CarControlSP(), self.cs, 0)
+    CC.actuators.steeringAngleDeg = self.MODEL if model is None else model
+    act, sends = self.cc.update(CC.as_reader(), structs.CarControlSP(), self.cs, 0)
     cb = [s for s in sends if s[0] == self.ADDR]
     accepted = [bool(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(s[0], s[2], s[1]))) for s in cb]
     active = [(bytes(s[1])[3] >> 4) == 2 for s in cb]
-    return cb, accepted, active, self.cc.dash_states(self.cs, CC.as_reader())[0]
+    return cb, accepted, active, self.cc.dash_states(self.cs, CC.as_reader())[0], act.steeringAngleDeg
 
-  def _replay(self, wheel_at):
-    """Blinker pause (100 frames inactive), then lateral comes back; wheel_at(i) is the measured angle at resume frame i."""
+  def _replay(self, wheel_at, wheel0=None, model=None, v=None, frames=200):
+    """Blinker pause (100 frames inactive), then lateral comes back; wheel_at(i) is the measured angle at resume frame i.
+    Every frame: one 0xCB, accepted, green icon only with an ACTIVE frame. Returns [(active, request angle, icon)] of the resume frames."""
     from opendbc.car.hyundai import hyundaicanfd
+    wheel0 = self.WHEEL if wheel0 is None else wheel0
     for _ in range(100):
-      cb, ok, active, _ = self._frame(False, self.WHEEL)
+      cb, ok, active, _, _ = self._frame(False, wheel0, model, v)
       self.assertEqual((len(cb), ok, active), (1, [True], [False]))
-    for i in range(200):
-      cb, ok, active, icon = self._frame(True, wheel_at(i))
+    out = []
+    for i in range(frames):
+      cb, ok, active, icon, req = self._frame(True, wheel_at(i), model, v)
       self.assertEqual(len(cb), 1, f"frame {i}: TX gap")
       self.assertEqual(ok, [True], f"frame {i}: the panda rejected the frame")
       if icon == hyundaicanfd.ICON_ACTIVE:
         self.assertEqual(active, [True], f"frame {i}: icon green without an ACTIVE frame")
+      out.append((active[0], req, icon))
+    return out
+
+  def _assert_resume_steps(self, out):
+    """Between consecutive ACTIVE frames of the resume (RESUME_FRAMES) the request never moves more than the resume rate (1 deg/frame)."""
+    for i in range(1, RESUME_FRAMES):
+      if out[i - 1][0] and out[i][0]:
+        self.assertLessEqual(abs(out[i][1] - out[i - 1][1]), 1.0 + 1e-6, f"frame {i}: resume step")
 
   def test_resume_at_minus_216_never_rejected_no_gap_icon_follows_the_frames(self):
-    self._replay(lambda i: self.WHEEL)
+    out = self._replay(lambda i: self.WHEEL)
+    self.assertGreater(sum(a for a, _, _ in out), 20)  # ACTIVE is actually delivered, not an all-INACTIVE pass
+    self._assert_resume_steps(out)
 
   def test_resume_with_a_slowly_unwinding_wheel(self):
-    self._replay(lambda i: self.WHEEL + 0.5 * i)
+    out = self._replay(lambda i: self.WHEEL + 0.5 * i)
+    self.assertGreater(sum(a for a, _, _ in out), 20)
+    self._assert_resume_steps(out)
 
   def test_resume_with_a_fast_wheel(self):
-    self._replay(lambda i: self.WHEEL + 1.3 * i)
+    out = self._replay(lambda i: self.WHEEL + 1.3 * i)
+    self._assert_resume_steps(out)  # 1.3 deg/frame trajectory: steps stay <= 1 deg between ACTIVE frames (inactive where none exists)
+
+  def test_guard_boundaries_both_signs(self):
+    """150 / 170 deg wheel and 5 m/s, positive and negative: resume slowly unwinding, model 1.1x the wheel; all frames accepted, steps <= 1 deg."""
+    for sign in (1, -1):
+      for wheel in (149.0, 151.0, 169.0, 171.0, 216.0):
+        for v in (4.9, 5.1):
+          with self.subTest(wheel=sign * wheel, v=v):
+            self.setUp()
+            out = self._replay(lambda i: sign * (wheel - 0.3 * i), wheel0=sign * wheel, model=sign * wheel * 1.1, v=v)
+            self.assertGreater(sum(a for a, _, _ in out), 20)
+            self._assert_resume_steps(out)
+
+  def test_unsendable_wheel_pauses_with_a_grey_icon(self):
+    """Wheel +-350, model 345 at 4.9 m/s: the model limits leave no legal ACTIVE command. Inactive frames only (one per cycle, accepted), then an
+    explicit pause after the guard time, grey the whole time."""
+    from opendbc.car.hyundai import hyundaicanfd
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        paused_at = None
+        for _ in range(100):
+          self._frame(False, sign * 350.0, sign * 345.0, 4.9)
+        for i in range(120):
+          cb, ok, active, icon, _ = self._frame(True, sign * 350.0, sign * 345.0, 4.9)
+          self.assertEqual((len(cb), ok, active), (1, [True], [False]))
+          self.assertEqual(icon, hyundaicanfd.ICON_PAUSED)
+          if self.cc.takeover.paused and paused_at is None:
+            paused_at = i
+        self.assertIsNotNone(paused_at)
+        self.assertGreater(paused_at, GUARD_FRAMES)
+        self.assertLess(paused_at, GUARD_FRAMES + 5)
+
+  def test_panda_legal_frame_is_still_sent_active(self):
+    """last 146, wheel 160, model 160 at 4.76 m/s: the guard lifts the request to 150 (a 4 deg step, legal for the panda). Not turned inactive."""
+    self._replay(lambda i: 160.0, wheel0=160.0, model=160.0, frames=150)
+    self.assertFalse(self.cc.takeover.resuming)
+    self.cc.apply_angle_last = 146.0
+    self.safety.set_desired_angle_last(1460)
+    cb, ok, active, icon, req = self._frame(True, 160.0, 160.0)
+    self.assertEqual((ok, active), ([True], [True]))
+    self.assertAlmostEqual(req, 150.0, delta=0.6)
+
+  def test_sendable_turn_is_not_paused(self):
+    """Negative counterpart: wheel 300 at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
+    out = self._replay(lambda i: 300.0, wheel0=300.0, model=300.0, v=4.9, frames=150)
+    self.assertFalse(self.cc.takeover.paused)
+    self.assertGreater(sum(a for a, _, _ in out), 20)
+
+
+class TestPandaAngleCheck(unittest.TestCase):
+  """The controller's mirror of the panda acceptance (panda_angle.py) against the real libsafety."""
+
+  def setUp(self):
+    from opendbc.car.hyundai.values import HyundaiSafetyFlags
+    from opendbc.safety.tests.common import CANPackerSafety
+    from opendbc.safety.tests.libsafety import libsafety_py
+    self.libsafety_py = libsafety_py
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+    self.safety.set_safety_hooks(structs.CarParams.SafetyModel.hyundaiCanfd, int(HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.CAMERA_SCC |
+                                                                                  HyundaiSafetyFlags.CANFD_LFA_ALT_STEERING | HyundaiSafetyFlags.CCNC))
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.safety.set_controls_allowed_lateral(True)
+    self.t = 0
+
+  def _panda(self, v, last, request):
+    for _ in range(6):
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": v * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+    self.t = (self.t + 300_000) % 2**32  # more than the 250 ms real-time window apart: that check starts clean
+    self.safety.set_timer(self.t)
+    self.safety.set_desired_angle_last(round(last * 10))
+    msg = self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2, "ADAS_StrAnglReqVal": request})
+    return bool(self.safety.safety_tx_hook(msg))
+
+  def test_mirror_matches_the_panda_at_the_step_and_angle_limits(self):
+    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
+    for v in (0.5, 2.0, 4.76, 4.9, 6.0, 10.0):
+      step, max_angle = limits_can(round(v * 3.6 / 0.03125) * 0.03125 / 3.6)
+      for last in (0.0, 146.0, -216.0, 300.0):
+        check = PandaAngleCheck()
+        for _ in range(6):
+          check.add_speed(round(v * 3.6 / 0.03125) * 0.03125 / 3.6)
+        for d in range(-step - 3, step + 4):
+          request = last + d / 10
+          if abs(request * 10) > max_angle + 3:
+            continue
+          with self.subTest(v=v, last=last, d=d):
+            self.assertEqual(check.accepts(request, last), self._panda(v, last, request))
+
+  def test_panda_legal_step_is_accepted_where_the_python_limiter_is_stricter(self):
+    """last 146, wheel 160, request 150 at 4.76 m/s: a 4 deg step, legal for the panda (about 5.6 deg per frame)."""
+    from opendbc.car.hyundai.panda_angle import PandaAngleCheck
+    check = PandaAngleCheck()
+    for _ in range(6):
+      check.add_speed(4.76)
+    self.assertTrue(check.accepts(150.0, 146.0))
+    self.assertTrue(self._panda(4.76, 146.0, 150.0))
+    self.assertFalse(check.accepts(170.0, 146.0))
+    self.assertFalse(self._panda(4.76, 146.0, 170.0))
+
+
 
 
 if __name__ == "__main__":

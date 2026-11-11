@@ -14,6 +14,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons
 from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
 from opendbc.car.hyundai.takeover import TakeoverFilter
+from opendbc.car.hyundai.panda_angle import PandaAngleCheck
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.cluster_alert import ClusterAlertCarController
@@ -120,6 +121,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.BASELINE_VM = VehicleModel(get_baseline_safety_cp())
     self.apply_angle_last = 0
     self.lat_unsent = False
+    self.panda_check = PandaAngleCheck()
 
     self.accel_last = 0
     self.apply_torque_last = 0
@@ -159,6 +161,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # angle control
     else:
       v_ego_raw = CS.out.vEgoRaw
+      self.panda_check.add_speed(v_ego_raw)
       desired_angle = float(np.clip(actuators.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
 
       self.angle_filter.update_alpha(float(np.interp(CS.out.vEgo, [5, 10, 20], [0.2, 0.1, 0.0])))
@@ -177,11 +180,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
       if lat_active and apply_angle is not None:
         apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo)
-        # the guard clips run last and can undo the rate limit above: never send a frame the panda rejects (its per-frame step is checked against
-        # the last frame it saw, which is the measured angle after an inactive frame), send inactive at the measured angle instead
-        checked = apply_steer_angle_limits_vm(apply_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, True, self.params, self.BASELINE_VM)
-        if checked is None or abs(checked - apply_angle) > 1e-3:
+        # the guard clips run last and can undo the rate limit above: never send an ACTIVE frame the panda rejects (its per-frame step is checked
+        # against the last frame it saw, the measured angle after an inactive frame), send inactive at the measured angle instead
+        if apply_angle is not None and not self.panda_check.accepts(apply_angle, self.apply_angle_last):
           apply_angle = None
+      self.takeover.note_unsendable(lat_active and apply_angle is None)
 
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
@@ -190,7 +193,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       # Failsafe if we detected we'd violate safety
       if apply_angle is None:
         apply_torque = 0
-        apply_angle = CS.out.steeringAngleDeg
+        apply_angle = float(np.clip(CS.out.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
         apply_steer_req = False
 
       # After we've used the last angle wherever we needed it, we now update it.
