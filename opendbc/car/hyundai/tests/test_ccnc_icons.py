@@ -207,8 +207,8 @@ class TestDashStates(unittest.TestCase):
     self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["SETSPEED"]), (2, 1, 1))
 
     self.cs.msg_161.update({"LFA_ICON": 2, "SETSPEED_HUD": 2})
-    out = self._frame(False, False, False, False)  # we still own both (no driver action): off frames, not the camera's icons
-    self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["DISTANCE"]), (0, 1, 0))
+    out = self._frame(False, False, False, False)  # we still own both (no driver action): off frames, not the camera's icons; the cruise icon is off
+    self.assertEqual((out["LFA_ICON"], out["SETSPEED_HUD"], out["DISTANCE"]), (0, 0, 0))
 
 
 class TestCameraMain(unittest.TestCase):
