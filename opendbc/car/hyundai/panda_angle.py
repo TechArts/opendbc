@@ -15,6 +15,11 @@ RAD_TO_DEG = 57.29577951308232
 DEG_TO_CAN = 10
 FREQUENCY = 100
 SPEED_SAMPLES = 6  # MAX_SAMPLE_VALS
+# the panda's speed samples are integer mm/s of the mean of four 0.03125 kph wheel counts (hyundai_canfd.h:329, UPDATE_VEHICLE_SPEED), quantised below
+# the same way; its limits are float32. Err on the side of inactive: a slightly higher speed (smaller limits) and one count less than the panda's
+# own +1 tolerance.
+SPEED_MARGIN = 0.005  # m/s on top of the exact quantisation below (float32 in the panda)
+COUNT_MARGIN = 1
 
 
 def _angle_from_curvature(curvature: float, speed: float) -> float:
@@ -40,10 +45,13 @@ class PandaAngleCheck:
     self.speeds: deque[float] = deque(maxlen=SPEED_SAMPLES)
 
   def add_speed(self, v_ego_raw: float):
-    self.speeds.append(v_ego_raw)
+    """v_ego_raw is the mean of the four wheel counts * 0.03125 kph in m/s (a multiple of a quarter count); stored like the panda's sample."""
+    mean_counts = round(v_ego_raw * 3.6 / 0.03125 * 4) / 4
+    self.speeds.append(math.floor(mean_counts * 0.03125 / 3.6 * 1000.0 + 0.5) / 1000.0)
 
   def accepts(self, request: float, last: float) -> bool:
-    """Would the panda accept an ACTIVE frame with this request, after a frame with angle `last` (both deg)?"""
-    step, max_angle = limits_can(min(self.speeds) if self.speeds else 0.0)
+    """Would the panda accept an ACTIVE frame with this request, after a frame with angle `last` (both deg)? Never True for a frame it rejects;
+    False for at most the few counts at the very edge of its limits that it would accept."""
+    step, max_angle = limits_can((min(self.speeds) if self.speeds else 0.0) + SPEED_MARGIN)
     request_can, last_can = _to_can(request), _to_can(last)
-    return abs(request_can - last_can) <= step and abs(request_can) <= max_angle
+    return abs(request_can - last_can) <= step - COUNT_MARGIN and abs(request_can) <= max_angle - COUNT_MARGIN
