@@ -286,6 +286,40 @@ class TestCurveTakeover(unittest.TestCase):
     f = make_curve()  # the same hand above the region's speed: not a grab (F22)
     self.assertFalse(any(run(f, 100, torque=300, pressed=True, v=8.0, angle=250.0, desired=250.0)))
 
+  def test_random_sequences_after_a_fault_no_active_frame_until_a_release_hold(self):
+    """State machine: random latActive toggles, fault flags, torque 0-600, pressed, wheel in/out of the region. After a fault in the region the filter
+    returns paused (no ACTIVE frame) every active frame until lateral has been active with |torque| < release and not pressed for hold frames
+    with the fault gone."""
+    import random
+    for seed in range(300):
+      rng = random.Random(seed)
+      f = make_curve()
+      latched, calm = False, 0
+      angle, v = 250.0, 2.68
+      for i in range(3000):
+        if rng.random() < 0.02:
+          angle = rng.choice((250.0, 120.0, 100.0, -250.0, -120.0))
+          v = rng.choice((2.68, 2.68, 5.0, 8.0))
+        tq = rng.choice((0.0, 0.0, 50.0, 99.0, 120.0, 200.0, 300.0, 600.0)) * rng.choice((1, -1))
+        pr = rng.random() < 0.2
+        act = rng.random() < (0.9 if i % 400 < 300 else 0.5)
+        fault = rng.random() < (0.01 if latched else 0.003)
+        if rng.random() < 0.01:
+          fault, tq, pr = False, 0.0, False  # a long hand-off now and then
+        region = v < 6.0 and abs(angle) > 140.0
+        if fault and region:
+          latched = True
+        paused = f.update(tq, pr, fault, v, angle, angle, act)
+        if not act:
+          calm = 0
+          continue
+        calm = calm + 1 if abs(tq) < 100 and not pr else 0
+        if latched and calm >= f.hold_frames and f.fault_frames == 0:
+          latched = False
+          continue
+        if latched:
+          self.assertTrue(paused, f"seed {seed} frame {i}: ACTIVE under the latch")
+
   def test_fault_in_the_region_latches_the_straight_release_until_the_hand_is_off(self):
     f = make_curve()
     kw = dict(angle=250.0, desired=250.0, v=2.68)
@@ -302,7 +336,23 @@ class TestCurveTakeover(unittest.TestCase):
     run(h, 1, torque=300, pressed=True, active=False, **out)
     self.assertTrue(h.strict)
     run(h, h.hold_frames + FAULT_FRAMES + 2, active=False, **out)
+    self.assertTrue(h.strict)  # a hand-off time spent inactive does not count
+    self.assertTrue(all(run(h, h.hold_frames - 1, **out)))
+    self.assertTrue(h.strict)
+    self.assertFalse(run(h, 3, **out)[-1])  # strict clears at the hold frame, the pause itself one frame later
     self.assertFalse(h.strict)
+    # R1Guard round 8: latch set while inactive, then a torque between release (100) and enter (150), unpressed, fault gone: still no ACTIVE
+    for tq in (120.0, 200.0):
+      k = make_curve()
+      run(k, FAULT_FRAMES, torque=300, pressed=True, fault=True, active=False, **kw)
+      run(k, FAULT_FRAMES + 5, torque=tq, active=False, **out)
+      self.assertTrue(k.strict)
+      self.assertEqual(k.paused, False)  # `paused` did not survive the inactive frames: strict alone gates
+      self.assertTrue(all(run(k, 200, torque=tq, **out)), f"torque {tq}: an ACTIVE frame under a hand")
+      self.assertTrue(k.strict)
+      self.assertTrue(all(run(k, k.hold_frames - 1, **out)))
+      self.assertFalse(run(k, 1, **out)[-1])
+      self.assertFalse(k.strict)
     g = make_curve()  # a fault outside the region does not latch anything
     run(g, 5, torque=300, fault=True, v=15.0, angle=17.0, desired=17.0)
     self.assertFalse(g.strict)

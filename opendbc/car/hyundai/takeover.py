@@ -105,16 +105,18 @@ class TakeoverFilter:
 
     self.fault_frames = FAULT_FRAMES if fault else max(0, self.fault_frames - 1)
     # the strict latch lives across inactive frames (controlsd drops latActive on the fault itself, test_fault_guard): set by a fault in the guard
-    # region, cleared only by a hand off (below the release torque, not pressed) for the hold time with the fault gone
+    # region; while set, steering is paused (below) whatever `paused` did across inactive frames, and it clears only with lateral active and the hand
+    # off (|torque| < release, not pressed) for the full hold time with the fault gone
     if fault and self.step_capped(angle, v_ego):
       self.strict = True
-    self.strict_calm_frames = self.strict_calm_frames + 1 if abs(torque) < self.release_torque and not pressed else 0
-    if self.strict and self.strict_calm_frames >= self.hold_frames and self.fault_frames == 0:
-      self.strict = False
     if not lat_active:
       self._reset()
       self.lat_active_last = False
+      self.strict_calm_frames = 0
       return False
+    self.strict_calm_frames = self.strict_calm_frames + 1 if abs(torque) < self.release_torque and not pressed else 0
+    if self.strict and self.strict_calm_frames >= self.hold_frames and self.fault_frames == 0:
+      self.strict = False
     if not self.lat_active_last:
       # lateral just came back (engage, blinker pause, MADS pause, fault): blend in like after a takeover, never snap to the model
       self.resuming = True
@@ -150,7 +152,7 @@ class TakeoverFilter:
     self.grab_frames = self.grab_frames + 1 if grab else 0
 
     if not self.paused:
-      if press or self.grab_frames >= ENTER_FRAMES or self.fault_frames > 0 or self.bind_frames > GUARD_FRAMES or self.unsendable_frames > GUARD_FRAMES:
+      if press or self.strict or self.grab_frames >= ENTER_FRAMES or self.fault_frames > 0 or self.bind_frames > GUARD_FRAMES or self.unsendable_frames > GUARD_FRAMES:
         self.paused = True
         self.resuming = False
         self.release_frames = 0
