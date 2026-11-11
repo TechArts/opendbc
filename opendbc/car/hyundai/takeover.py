@@ -38,6 +38,12 @@ ALONG_BASE = 300  # beyond-push clause: along-turn torque >= ALONG_BASE + ALONG_
 ALONG_PER_A = 150
 BEYOND_DEG = 3.0  # ... and the wheel at least this far past the model's angle in the push direction
 
+# Route 3a 1:31.3, 1:32.6, 1:35.1, 1:47.1 (6-7 mph, wheel 200-310 deg, hand torque 250-520 along the turn): the curve rule above let ACTIVE frames
+# (gain 0.03, request = wheel) through under a holding hand and the EPS faulted (AciFltSig_Lv2 = 2, then the camera's FAULT_*), 4 of 4 times.
+# In the low-speed, large-angle region (step_capped) the straight-road rule applies whatever the curve: any hand on the wheel is a pause,
+# released only by torque below the release value and no steeringPressed for the hold time. An EPS fault in the region latches the same rule
+# until the next release, so there is no fixed-time retry under a holding hand, even if the wheel unwinds out of the region meanwhile.
+
 
 class TakeoverFilter:
   def __init__(self, enter_torque: int, release_torque: int, hold_ms: int, resume_rate_x10: int,
@@ -54,6 +60,7 @@ class TakeoverFilter:
     self.release_frames = 0
     self.resume_frames = 0
     self.fault_frames = 0
+    self.strict = False  # an EPS fault in the guard region latched the straight-road rule until the next release
     self.bind_frames = 0
     self.lat_active_last = False
     self.unsendable_frames = 0  # consecutive frames lateral was on without a sendable ACTIVE request, from the controller
@@ -77,6 +84,7 @@ class TakeoverFilter:
   def _reset(self):
     self.paused = False
     self.resuming = False
+    self.strict = False
     self.grab_frames = self.release_frames = self.resume_frames = self.bind_frames = self.unsendable_frames = 0
 
   @staticmethod
@@ -121,6 +129,10 @@ class TakeoverFilter:
         turn = int(math.copysign(1, desired))
     along = torque * turn  # > 0: along the requested turn (assisting), < 0: opposing
     self.opposing = turn != 0 and along <= -OPPOSE_RELEASE
+    if fault and self.step_capped(angle, v_ego):
+      self.strict = True
+    if self.strict or self.step_capped(angle, v_ego):
+      turn = 0  # route 3a: a hand on the wheel in the guard region is never "holding the curve"
 
     if turn == 0:
       grab = abs(torque) >= self.enter_torque
@@ -145,6 +157,7 @@ class TakeoverFilter:
       self.release_frames = self.release_frames + 1 if calm else 0
       if self.release_frames >= self.hold_frames and self.fault_frames == 0 and not binds:
         self.paused = False
+        self.strict = False
         self.resuming = True
         self.resume_frames = RESUME_FRAMES
 
