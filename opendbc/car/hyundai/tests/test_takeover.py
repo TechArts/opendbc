@@ -156,9 +156,11 @@ class TestTakeoverFilter(unittest.TestCase):
 class TestLowSpeedGuard(unittest.TestCase):
   def test_cap(self):
     f = make()
-    self.assertEqual(f.limit(215.0, 176.0, 175.0, 4.0), 170.0)
+    self.assertEqual(f.limit(215.0, 176.0, 175.0, 4.0), 175.0)  # wheel already past the cap: the request stays at the wheel, never pulled inward
     self.assertEqual(f.limit(160.0, 176.0, 175.0, 4.0), 165.0)  # error cap
-    self.assertEqual(f.limit(-215.0, -176.0, -175.0, 4.0), -170.0)
+    self.assertEqual(f.limit(-215.0, -176.0, -175.0, 4.0), -175.0)
+    self.assertEqual(f.limit(168.0, 160.0, 160.0, 4.0), 168.0)
+    self.assertEqual(f.limit(175.0, 160.0, 160.0, 4.0), 170.0)  # wheel within the cap: the cap applies
     self.assertEqual(f.limit(215.0, 176.0, 175.0, 6.0), 215.0)  # fast enough
     self.assertEqual(f.limit(120.0, 100.0, 100.0, 4.0), 120.0)  # small angle
 
@@ -320,6 +322,70 @@ class TestCurveTakeover(unittest.TestCase):
     g = make_curve()
     self.curve(g, 1, -150, angle=1.0, desired=1.0)
     self.assertFalse(g.opposing)  # straight: no curve sign
+
+
+class TestBlockedResumeRoute39(unittest.TestCase):
+  """Route 39 29:19.6: the blinker pause ends at 4.76 m/s with the wheel at -216 deg (past the guard's 170 deg). The guard pulled the request to
+  -170, 46 deg from the wheel; the panda rejected all 50 frames (no 0xCB reached the car for 0.52 s), the EPS faulted, the icon was green.
+  Closed loop against the real panda safety (libsafety)."""
+
+  V, WHEEL, MODEL = 4.76, -216.0, -253.0
+  ADDR = 0xCB
+
+  def setUp(self):
+    from opendbc.safety.tests.common import CANPackerSafety
+    from opendbc.safety.tests.libsafety import libsafety_py
+    self.libsafety_py = libsafety_py
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+    self.cc, self.cs = _carcontroller(150, curve_hold=True)
+    self.safety.set_safety_hooks(structs.CarParams.SafetyModel.hyundaiCanfd, int(self.cc.CP.safetyConfigs[-1].safetyParam))
+    self.safety.init_tests()
+    self.safety.set_controls_allowed(True)
+    self.safety.set_controls_allowed_lateral(True)
+    self.t = 0
+
+  def _frame(self, lat_active, angle):
+    self.t += 10000
+    self.safety.set_timer(self.t)
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": self.V * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": angle}))
+    self.cs.out = structs.CarState(vEgo=self.V, vEgoRaw=self.V, steeringTorque=0.0, steeringAngleDeg=angle)
+    self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
+    self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
+    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
+    self.cs.main_cruise_enabled = True
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
+    self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
+    CC = structs.CarControl(latActive=lat_active, enabled=lat_active)
+    CC.actuators.steeringAngleDeg = self.MODEL
+    _, sends = self.cc.update(CC.as_reader(), structs.CarControlSP(), self.cs, 0)
+    cb = [s for s in sends if s[0] == self.ADDR]
+    accepted = [bool(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(s[0], s[2], s[1]))) for s in cb]
+    active = [(bytes(s[1])[3] >> 4) == 2 for s in cb]
+    return cb, accepted, active, self.cc.dash_states(self.cs, CC.as_reader())[0]
+
+  def _replay(self, wheel_at):
+    """Blinker pause (100 frames inactive), then lateral comes back; wheel_at(i) is the measured angle at resume frame i."""
+    from opendbc.car.hyundai import hyundaicanfd
+    for _ in range(100):
+      cb, ok, active, _ = self._frame(False, self.WHEEL)
+      self.assertEqual((len(cb), ok, active), (1, [True], [False]))
+    for i in range(200):
+      cb, ok, active, icon = self._frame(True, wheel_at(i))
+      self.assertEqual(len(cb), 1, f"frame {i}: TX gap")
+      self.assertEqual(ok, [True], f"frame {i}: the panda rejected the frame")
+      if icon == hyundaicanfd.ICON_ACTIVE:
+        self.assertEqual(active, [True], f"frame {i}: icon green without an ACTIVE frame")
+
+  def test_resume_at_minus_216_never_rejected_no_gap_icon_follows_the_frames(self):
+    self._replay(lambda i: self.WHEEL)
+
+  def test_resume_with_a_slowly_unwinding_wheel(self):
+    self._replay(lambda i: self.WHEEL + 0.5 * i)
+
+  def test_resume_with_a_fast_wheel(self):
+    self._replay(lambda i: self.WHEEL + 1.3 * i)
 
 
 if __name__ == "__main__":
