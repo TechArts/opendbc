@@ -1735,6 +1735,94 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x1CF))
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x1CF))
 
+  # --- F23 first-frame leak: the panda forwards before it receives (fwd sees bus and address only), so a lock armed from the camera's rising frame
+  # lets that frame through. Real order per camera frame: fwd decision, then rx. Route 34 18:05.2: CANCEL press, release 0.16 s later, camera ACCMode 4 -> 1
+  # 0.02 s after the release, that one frame reached the car. The lock now arms on the CANCEL press itself.
+  def _cam_frame(self, mode, main=1, dt=20_000):
+    """one camera 0x1A0 frame in the panda's order (fwd decision, then rx); returns True if the car side got it"""
+    self.safety.set_timer(self.safety_t)
+    self.safety_t += dt
+    fwd = self._scc_fwd()
+    self._camera_acc(mode, main)
+    return fwd
+
+  def _standby_clock(self):
+    self._standby_after_brake()
+    self.safety_t = 1 * self.S
+    self.safety.set_timer(self.safety_t)
+
+  def _tap_cancel(self, hold_frames=8, brake_at_release=False, rise_after_release=1, camera_mode=1):
+    """CANCEL held hold_frames x 20 ms with the camera in standby, released, the camera moves rise_after_release frames later; returns the
+    list of 'frame reached the car' for every camera frame from the press on"""
+    leaked = []
+    for _ in range(hold_frames):
+      self.safety.set_timer(self.safety_t)
+      self._button(self.CANCEL)
+      leaked.append(self._cam_frame(4))
+    if brake_at_release:
+      self._brake(1)
+    self.safety.set_timer(self.safety_t)
+    self._button(0)
+    for _ in range(rise_after_release):
+      leaked.append(self._cam_frame(4))
+    for _ in range(10):
+      leaked.append(self._cam_frame(camera_mode))
+    return leaked
+
+  def test_cancel_press_in_standby_no_camera_frame_reaches_car(self):
+    # the exact route-34 sequence: standby, CANCEL, camera 4 -> 1 after the release (the pause key resumes openpilot, which sends nothing yet)
+    for mode in (1, 2):
+      with self.subTest(mode=mode):
+        self._standby_clock()
+        self.assertTrue(self._cam_frame(4))  # standby frames reach the car before the press
+        self.assertFalse(any(self._tap_cancel(8, rise_after_release=0, camera_mode=mode)))  # blocked from the press itself, the rising frame included
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_cancel_press_without_grant_no_camera_frame_reaches_car(self):
+    # brake held at the release: no pause-key resume, the camera still toggles on the release (nothing grants controls)
+    for mode in (1, 2):
+      for rise_after in (0, 1, 5):
+        with self.subTest(mode=mode, rise_after=rise_after):
+          self._standby_clock()
+          self.assertFalse(any(self._tap_cancel(brake_at_release=True, rise_after_release=rise_after, camera_mode=mode)))
+          self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_cancel_press_camera_rises_while_key_held(self):
+    self._standby_clock()
+    for i in range(30):  # 0.6 s hold: the camera rises on its own timing
+      self.safety.set_timer(self.safety_t)
+      self._button(self.CANCEL)
+      self.assertFalse(self._cam_frame(1 if i >= 20 else 4))
+    self._button(0)
+    for _ in range(10):
+      self.assertFalse(self._cam_frame(1))
+
+  def test_cancel_press_arm_lasts_through_a_long_hold(self):
+    self._standby_clock()
+    for _ in range(300):  # 6 s hold
+      self.safety.set_timer(self.safety_t)
+      self._button(self.CANCEL)
+      self.assertFalse(self._cam_frame(4))
+    self._button(0)
+    self.assertFalse(self._cam_frame(1))
+
+  def test_cancel_press_that_the_camera_ignores_hands_the_camera_back(self):
+    # no rise: after the settle time and 3 standby frames the camera's standby frames flow again (the lock is not sticky)
+    self._standby_clock()
+    self.assertFalse(any(self._tap_cancel(brake_at_release=True, rise_after_release=0, camera_mode=4)))
+    self.safety_t += self.S
+    self.assertFalse(self._cam_frame(4))  # settle time over, standby frame 1 of 3
+    self.assertFalse(self._cam_frame(4))
+    self.assertFalse(self._cam_frame(4))
+    self.assertTrue(self._cam_frame(4))
+
+  def test_cancel_press_arm_needs_camera_main(self):
+    self._standby_clock()
+    self._camera_acc(0, main=0)  # camera main off: nothing to resume
+    self.safety.set_timer(self.safety_t)
+    self._button(self.CANCEL)
+    self.assertTrue(self._scc_fwd())
+
   # --- pause-key release grants controls_allowed without openpilot owning 0x1A0: the camera must stay out in every ordering (R1 F1)
   def _release_pause(self):
     self._standby_after_brake()
@@ -1802,6 +1890,7 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
 
   def test_release_with_camera_in_standby_blocks_camera_until_permission_ends(self):
     self._release_pause()
+    self.safety.set_timer(self.S)  # the CANCEL settle time (HYUNDAI_CANFD_HB_CANCEL_SETTLE_US) is over
     for _ in range(10):
       self._camera_acc(4)
     self.assertFalse(self._scc_fwd())  # permission without ownership: no stock frames even in standby

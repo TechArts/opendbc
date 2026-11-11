@@ -16,6 +16,7 @@ from opendbc.car import DT_CTRL, structs
 
 TAIL_FRAMES = int(6.0 / DT_CTRL)         # > the panda's ~3 s heartbeat mismatch + margin
 RECENT_ACTION_FRAMES = int(1.0 / DT_CTRL)  # a driver action this close before the axis went inactive is its reason
+CANCEL_SETTLE_FRAMES = int(0.8 / DT_CTRL)  # panda HYUNDAI_CANFD_HB_CANCEL_SETTLE_US 0.6 s after the last CANCEL frame, plus our CAN latency
 
 
 class AxisOwner:
@@ -105,6 +106,28 @@ class CameraHandback:
     self.lfa_alt_counter = CounterFollower(1 << 16)
     self.scc_counter = CounterFollower(1 << 16)
     self.prev_brake_pressed = False
+    self.cancel_armed = False                  # a CANCEL press started with the camera main on and no openpilot ownership: the panda locks 0x1A0
+    self.cancel_down = False
+    self.cancel_release_frame: int | None = None
+
+  def cancel_lock(self, CS, owner: bool, frame: int) -> bool:
+    """Mirror of the panda's CANCEL pre-arm (hyundai_canfd.h): from the CANCEL press until CANCEL_SETTLE_FRAMES after its release the camera's 0x1A0 is
+    blocked (the camera resumes its own ACC on the release), so our 'off' frames must already be there, or the car sees no 0x1A0."""
+    for be in CS.out.buttonEvents:
+      if be.type == structs.CarState.ButtonEvent.Type.cancel:
+        self.cancel_down = be.pressed
+        if be.pressed:
+          self.cancel_armed = bool(CS.out.cruiseState.available) and not owner
+        else:
+          self.cancel_release_frame = frame
+    if not self.cancel_armed:
+      return False
+    if self.cancel_down:
+      return True
+    if self.cancel_release_frame is not None and frame - self.cancel_release_frame <= CANCEL_SETTLE_FRAMES:
+      return True
+    self.cancel_armed = False
+    return False
 
   def update(self, CC, CS, openpilot_long: bool, frame: int) -> tuple[bool, bool]:
     """Returns (send lateral, send longitudinal) for this frame."""
@@ -121,4 +144,5 @@ class CameraHandback:
     send_long = self.long_owner.update(bool(CC.enabled and openpilot_long), driver_cruise, frame)
     # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
     stock_acc_lock = bool(openpilot_long and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
-    return send_lat, send_long or stock_acc_lock
+    cancel_lock = self.cancel_lock(CS, self.long_owner.owner, frame) and bool(openpilot_long and not CC.enabled)  # (always consumes the events)
+    return send_lat, send_long or stock_acc_lock or cancel_lock

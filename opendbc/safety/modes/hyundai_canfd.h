@@ -110,7 +110,11 @@ static uint32_t hyundai_canfd_get_checksum(const CANPacket_t *msg) {
 // button in the forward hook (fwd runs before rx and only gets bus and address), so it acts on the camera's own state instead: a rising
 // camera ACCMode 1/2 while controls are not allowed and openpilot does not own 0x1A0 is an engage the driver did not make for openpilot.
 // From the next frame the camera's 0x1A0 is blocked and openpilot's 'off' frames (ACCMode not 1/2) replace it, until the camera is back
-// in standby for HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES frames or openpilot takes the axis. At most one camera frame (aReq about 0) leaks.
+// in standby for HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES frames or openpilot takes the axis. That rising frame itself would still reach the car (the
+// forward hook runs before the rx hook, so it cannot see the frame's own ACCMode), so the lock is armed earlier, from the cause: the camera's cruise
+// key is the CANCEL press (route 34 18:05.2: the camera moved 4 -> 1 on the release, 0.02 s after it). A CANCEL press while the camera's main is on and
+// openpilot does not own 0x1A0 arms the lock at once and keeps it for HYUNDAI_CANFD_HB_CANCEL_SETTLE_US after the last CANCEL frame (the key is
+// repeated at 50 Hz while it is down); a camera that did not move in that time is released as before. Zero camera ACC-active frames reach the car.
 // While stock owns an axis, openpilot's frames for it are rejected (except the lock's 'off' frames), so the two never interleave.
 static bool hyundai_canfd_handback = false;
 static bool hyundai_canfd_hb_long_op = false;
@@ -124,6 +128,9 @@ static bool hyundai_canfd_hb_cam_seen = false;      // a camera 0x1A0 was receiv
 static bool hyundai_canfd_hb_cam_engaged = false;   // camera ACCMode 1 or 2
 static bool hyundai_canfd_hb_stock_lock = false;
 static uint8_t hyundai_canfd_hb_cam_standby_frames = 0U;
+static bool hyundai_canfd_hb_cancel_arm = false;      // a CANCEL press armed the lock: the camera may resume on the release
+static uint32_t hyundai_canfd_hb_cancel_arm_ts = 0U;  // the last CANCEL frame
+static const uint32_t HYUNDAI_CANFD_HB_CANCEL_SETTLE_US = 600000U;  // camera reaction to a CANCEL release: 0.02 s (route 34), 0.18 s after the press
 static const uint32_t HYUNDAI_CANFD_HB_ACTION_WINDOW_US = 10000000U;  // heartbeat mismatch exits MADS/controls ~3 s after openpilot disengages
 static const uint8_t HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES = 3U;
 static const uint32_t HYUNDAI_CANFD_HB_LKA_ICON_SETTLE_US = 1500000U;  // camera LFA_ICON 0 for this long = LFA really off (blink <= 1.3 s)
@@ -134,6 +141,12 @@ static uint32_t hyundai_canfd_hb_cam_icon_zero_ts = 0U;  // since when
 static uint32_t hyundai_canfd_hb_cam_icon_ts = 0U;     // when the last camera 0x161 arrived (stale or missing: no window)
 static bool hyundai_canfd_hb_cam_lka_seen = false;     // a camera 0x12A with LKA_SysIndReq 3 was seen since init
 static uint32_t hyundai_canfd_hb_cam_lka_ts = 0U;      // the last one
+
+// the lock was armed by a CANCEL press that is down or was released less than the settle time ago
+static bool hyundai_canfd_hb_cancel_settling(void) {
+  return hyundai_canfd_hb_cancel_arm &&
+         (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_canfd_hb_cancel_arm_ts) <= HYUNDAI_CANFD_HB_CANCEL_SETTLE_US);
+}
 
 static void hyundai_canfd_handback_note_action(uint32_t now) {
   hyundai_canfd_hb_long_action = true;
@@ -184,7 +197,7 @@ static void hyundai_canfd_handback_camera_acc(int acc_mode) {
     hyundai_canfd_hb_cam_standby_frames = 0U;
   }
   if (hyundai_canfd_hb_stock_lock) {
-    if (engaged) {
+    if (engaged || hyundai_canfd_hb_cancel_settling()) {
       hyundai_canfd_hb_cam_standby_frames = 0U;
     } else {
       hyundai_canfd_hb_cam_standby_frames = (hyundai_canfd_hb_cam_standby_frames < 255U) ? (hyundai_canfd_hb_cam_standby_frames + 1U) : 255U;
@@ -236,6 +249,17 @@ static void hyundai_canfd_handback_buttons(int cruise_button, bool main_button) 
       hyundai_canfd_handback_note_action(microsecond_timer_get());
     }
     hyundai_canfd_handback_step();
+    if (hyundai_longitudinal && hyundai_long_main_button_engage && (cruise_button == HYUNDAI_BTN_CANCEL)) {
+      if (cancel_edge && acc_main_on && !hyundai_canfd_hb_long_op) {
+        hyundai_canfd_hb_cancel_arm = true;
+        hyundai_canfd_hb_stock_lock = true;
+        hyundai_canfd_hb_cam_standby_frames = 0U;
+        hyundai_canfd_hb_cancel_arm_ts = microsecond_timer_get();
+      } else if (hyundai_canfd_hb_cancel_settling()) {
+        hyundai_canfd_hb_cancel_arm_ts = microsecond_timer_get();  // key still down
+      } else {
+      }
+    }
   }
 }
 
@@ -693,6 +717,8 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_canfd_hb_cam_engaged = false;
   hyundai_canfd_hb_stock_lock = false;
   hyundai_canfd_hb_cam_standby_frames = 0U;
+  hyundai_canfd_hb_cancel_arm = false;
+  hyundai_canfd_hb_cancel_arm_ts = 0U;
 
   safety_config ret;
   if (hyundai_longitudinal) {

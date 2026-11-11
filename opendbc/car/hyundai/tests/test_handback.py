@@ -293,6 +293,48 @@ class TestCarControllerHandback(unittest.TestCase):
     self.cs.cruise_info["ACCMode"] = 4  # camera back in standby: silent again
     self.assertNotIn(0x1A0, self._msgs(enabled=False, frame=2 + 5000))
 
+  def _step(self, event=None, available=True):
+    """one controller frame (off the icon cadence), with an optional CANCEL press (True) / release (False) event; returns (sent addresses, 0x1A0 data)"""
+    if self.cc.frame % 5 == 0:
+      self.cc.frame += 2
+    self.cs.out.cruiseState.available = available
+    self.cs.out.buttonEvents = [] if event is None else [structs.CarState.ButtonEvent(type=ButtonType.cancel, pressed=event)]
+    cc = structs.CarControl()
+    cc.enabled = False
+    msgs = self.cc.create_canfd_msgs(False, 0, 0.0, 0.0, False, self.hud, self.cs, cc)
+    self.cc.frame += 2
+    return {m[0] for m in msgs}, next((m[1] for m in msgs if m[0] == 0x1A0), None)
+
+  def test_cancel_press_in_standby_sends_off_frames_until_settled(self):
+    # the panda blocks the camera's 0x1A0 from the CANCEL press (the camera resumes its ACC on the release): our off frames must replace it from the
+    # press on, while the key is down and until 0.8 s after the release; then silent again (the camera is back to standby)
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
+    self.assertNotIn(0x1A0, self._step()[0])
+    sent, dat = self._step(True)
+    self.assertIn(0x1A0, sent)
+    parser = CANParser(DBC_NAME, [("SCC_CONTROL", 0)], 0)
+    parser.update([(0, [(0x1A0, dat, 0)])])
+    self.assertEqual(parser.vl["SCC_CONTROL"]["ACCMode"], 0)  # an 'off' frame, nothing engages
+    self.assertEqual(parser.vl["SCC_CONTROL"]["aReqValue"], 0)
+    for _ in range(40):  # the key is held 1.6 s
+      self.assertIn(0x1A0, self._step()[0])
+    self.assertIn(0x1A0, self._step(False)[0])
+    for _ in range(25):  # about 0.6 s (the cadence skips add frames): the camera resumes in this window
+      self.assertIn(0x1A0, self._step()[0])
+    for _ in range(30):  # the 0.8 s settle (80 frames) is over
+      sent = self._step()[0]
+    self.assertNotIn(0x1A0, sent)  # settled
+
+  def test_cancel_press_without_camera_main_or_while_owner_sends_nothing(self):
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
+    self.assertNotIn(0x1A0, self._step(True, available=False)[0])  # camera main off: the panda does not arm either
+    self._step(False)
+    self._msgs(enabled=True)  # openpilot owns the axis: the press is its own cancel, no lock bookkeeping
+    self.assertTrue(self.cc.handback.long_owner.owner)
+    self.cs.out.cruiseState.available = True
+    self._msgs(enabled=False, buttons=(ButtonType.cancel,))
+    self.assertFalse(self.cc.handback.cancel_armed)
+
   def test_stock_acc_not_locked_while_openpilot_engaged(self):
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}
     self._msgs(enabled=True)
