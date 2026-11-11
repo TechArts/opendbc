@@ -520,6 +520,74 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.assertEqual((len(cb), ok), (1, [True]))
     self.assertFalse(icon == 2 and not active[0])
 
+  def test_outside_the_guard_region_the_commanded_angle_is_the_vehicle_model_chain(self):
+    """Randomized: wheel <= 140 deg or v >= 6 m/s, no takeover torque. After the resume blend the controller's request is exactly what c8b769bd
+    computed: the two vehicle-model limiter passes from the last request, nothing of the guard-region step cap or backstop on top."""
+    import random
+    from opendbc.car.lateral import apply_steer_angle_limits_vm
+    from opendbc.car.hyundai.carcontroller import ANGLE_SAFETY_BASELINE_MODEL
+    for seed in range(6):
+      rng = random.Random(seed)
+      self.setUp()
+      v = rng.choice((3.0, 8.0, 18.0, 19.3, 25.0))
+      wheel_max = 140.0 if v < 6.0 else 250.0
+      counts = (round(v * 3.6 / 0.03125),) * 4
+      v = sum(counts) / 4 * 0.03125 / 3.6
+      wheel, last = rng.uniform(-wheel_max, wheel_max), None
+      for _ in range(100):
+        self._frame(False, wheel, wheel, wheel_counts=counts)
+      for i in range(300):
+        wheel = max(-wheel_max, min(wheel_max, wheel + rng.uniform(-0.6, 0.6)))
+        model = max(-300.0, min(300.0, wheel + rng.uniform(-12, 12)))
+        last = self.cc.apply_angle_last
+        filtered_before = self.cc.angle_filter.x
+        cb, ok, active, icon, req = self._frame(True, wheel, model, wheel_counts=counts)
+        self.assertEqual((len(cb), ok), (1, [True]), f"seed {seed} frame {i}")
+        if not self.cc.takeover.resuming and not self.cc.takeover.paused:
+          desired = self.cc.angle_filter.x
+          ref = apply_steer_angle_limits_vm(desired, last, v, wheel, True, self.cc.params, self.cc.VM)
+          if self.cc.CP.carFingerprint != ANGLE_SAFETY_BASELINE_MODEL:
+            ref = apply_steer_angle_limits_vm(ref or desired, last, v, wheel, True, self.cc.params, self.cc.BASELINE_VM)
+          if ref is not None:
+            self.assertAlmostEqual(req, ref, places=4, msg=f"seed {seed} frame {i}")
+          self.assertFalse(self.cc.takeover.unsendable_frames and ref is not None)
+
+  def test_highway_speed_delivers_active_and_converges(self):
+    """R1Guard round 4: wheel 0, model 10 at 18 and 19.3 m/s, takeover off and on: ACTIVE every frame, never rejected, the request converges. Outside the
+    low-speed guard region no backstop runs."""
+    for torque in (0, 150):
+      for v in (18.0, 19.3):
+        with self.subTest(takeover=torque, v=v):
+          self.setUp()
+          self.cc, self.cs = _carcontroller(torque, curve_hold=True)
+          self.safety.set_safety_hooks(structs.CarParams.SafetyModel.hyundaiCanfd, int(self.cc.CP.safetyConfigs[-1].safetyParam))
+          self.safety.init_tests()
+          self.safety.set_controls_allowed(True)
+          self.safety.set_controls_allowed_lateral(True)
+          counts = (round(v * 3.6 / 0.03125),) * 4
+          for _ in range(100):
+            self._frame(False, 0.0, 10.0, wheel_counts=counts)
+          n_active, req = 0, 0.0
+          for i in range(400):
+            cb, ok, active, icon, req = self._frame(True, 0.0, 10.0, wheel_counts=counts)
+            self.assertEqual((len(cb), ok), (1, [True]), f"frame {i}")
+            n_active += active[0]
+          self.assertGreaterEqual(n_active, 390)
+          self.assertGreater(req, 4.9 if torque else 9.9)
+
+  def test_guard_region_backstop_clamps_instead_of_dropping(self):
+    """A candidate beyond what the backstop accepts is moved to the largest accepted step, not dropped (no reset of the last angle)."""
+    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
+    check = PandaAngleCheck()
+    for _ in range(6):
+      check.add_speed(18.0)
+    step, _ = limits_can(19.0)
+    out = check.clamp(10.0, 0.0)
+    self.assertIsNotNone(out)
+    self.assertAlmostEqual(out, (step - 1) / 10)
+    self.assertEqual(check.clamp(0.1, 0.0), 0.1)  # already accepted: unchanged
+    self.assertIsNone(check.clamp(0.0, 400.0))  # last beyond the angle limit by more than a step: nothing fits
+
   def test_sendable_turn_is_not_paused(self):
     """Negative counterpart: wheel 300 at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
     out = self._replay(lambda i: 300.0, wheel0=300.0, model=300.0, v=4.9, frames=150)
