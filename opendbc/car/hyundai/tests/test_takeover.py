@@ -157,10 +157,13 @@ class TestLowSpeedGuard(unittest.TestCase):
   def test_cap(self):
     f = make()
     self.assertEqual(f.limit(215.0, 176.0, 175.0, 4.0), 175.0)  # wheel already past the cap: the request stays at the wheel, never pulled inward
-    self.assertEqual(f.limit(160.0, 176.0, 175.0, 4.0), 165.0)  # error cap
+    self.assertEqual(f.limit(160.0, 165.5, 175.0, 4.0), 165.0)  # error cap
     self.assertEqual(f.limit(-215.0, -176.0, -175.0, 4.0), -175.0)
-    self.assertEqual(f.limit(168.0, 160.0, 160.0, 4.0), 168.0)
-    self.assertEqual(f.limit(175.0, 160.0, 160.0, 4.0), 170.0)  # wheel within the cap: the cap applies
+    self.assertEqual(f.limit(168.0, 167.5, 160.0, 4.0), 168.0)
+    self.assertEqual(f.limit(175.0, 169.5, 160.0, 4.0), 170.0)  # wheel within the cap: the cap applies
+    self.assertEqual(f.limit(175.0, 160.0, 160.0, 4.0), 161.0)  # and no step above 1 deg per frame in the guard region
+    self.assertIsNone(f.limit(175.0, 140.0, 160.0, 4.0))  # the capped step cannot reach the guard's band: inactive
+    self.assertEqual(f.limit(175.0, 160.0, 160.0, 6.0), 175.0)  # above the cap speed
     self.assertEqual(f.limit(215.0, 176.0, 175.0, 6.0), 215.0)  # fast enough
     self.assertEqual(f.limit(120.0, 100.0, 100.0, 4.0), 120.0)  # small angle
 
@@ -345,8 +348,9 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(True)
     self.t = 0
 
-  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None):
-    """One controller cycle into the real panda. Returns (0xCB frames, accepted, active, icon, request angle)."""
+  def _frame(self, lat_active, angle, model=None, v=None, wheel_counts=None, extra_counts=()):
+    """One controller cycle into the real panda. Returns (0xCB frames, accepted, active, icon, request angle). extra_counts: wheel-speed RX frames
+    the panda gets before this cycle's one, which the controller never reads."""
     v = self.V if v is None else v
     self.t += 10000
     self.safety.set_timer(self.t)
@@ -354,6 +358,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     if wheel_counts is not None:  # raw 0.03125 kph counts per wheel as on the bus; vEgoRaw is their mean, as the car state computes it
       wheels = {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), wheel_counts)}
       v = sum(wheel_counts) / 4 * 0.03125 / 3.6
+    for extra in extra_counts:
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), extra)}))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, wheels))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": angle}))
     self.cs.out = structs.CarState(vEgo=v, vEgoRaw=v, steeringTorque=0.0, steeringAngleDeg=angle)
@@ -440,15 +446,51 @@ class TestBlockedResumeRoute39(unittest.TestCase):
         self.assertGreater(paused_at, GUARD_FRAMES)
         self.assertLess(paused_at, GUARD_FRAMES + 5)
 
-  def test_panda_legal_frame_is_still_sent_active(self):
-    """last 146, wheel 160, model 160 at 4.76 m/s: the guard lifts the request to 150 (a 4 deg step, legal for the panda). Not turned inactive."""
+  def test_guard_step_cap_never_exceeds_one_degree_and_tracking_delivers_active(self):
+    """last 146, wheel 160 (a contrived gap): the capped step cannot reach the guard's band, so inactive (accepted) and the next frame starts at the wheel;
+    then tracking a model that moves 0.5 deg per frame delivers ACTIVE every frame, steps <= 1 deg."""
     self._replay(lambda i: 160.0, wheel0=160.0, model=160.0, frames=150)
     self.assertFalse(self.cc.takeover.resuming)
     self.cc.apply_angle_last = 146.0
     self.safety.set_desired_angle_last(1460)
     cb, ok, active, icon, req = self._frame(True, 160.0, 160.0)
-    self.assertEqual((ok, active), ([True], [True]))
-    self.assertAlmostEqual(req, 150.0, delta=0.6)
+    self.assertEqual((ok, active), ([True], [False]))
+    prev = None
+    for i in range(100):
+      cb, ok, active, icon, req = self._frame(True, 160.0 + 0.5 * i, 160.0 + 0.5 * i + 3.0)
+      self.assertEqual((len(cb), ok, active), (1, [True], [True]), f"frame {i}")
+      if prev is not None:
+        self.assertLessEqual(abs(req - prev), 1.0 + 1e-6)
+      prev = req
+
+  def test_random_rx_out_of_step_with_controller_updates(self):
+    """Random wheel / model / speed walks (rising and falling speed below 6 m/s) with 0-5 extra RX wheel-speed frames the controller never reads
+    between updates: no rejected frame, no gap, ACTIVE steps <= 1 deg, green only with ACTIVE, ACTIVE is delivered."""
+    import random
+    for seed in range(8):
+      rng = random.Random(seed)
+      self.setUp()
+      sign = rng.choice((1, -1))
+      wheel = sign * rng.uniform(145.0, 250.0)
+      counts = rng.randint(300, 640)
+      for _ in range(100):
+        self._frame(False, wheel, wheel, wheel_counts=(counts,) * 4)
+      prev, n_active = None, 0
+      drift = rng.choice((-3, 0, 3))
+      for i in range(300):
+        counts = max(250, min(660, counts + drift + rng.randint(-4, 4)))
+        extra = [(max(250, min(660, counts + rng.randint(-8, 8))),) * 4 for _ in range(rng.randint(0, 5))]
+        wheel += rng.uniform(-0.8, 0.8)
+        wheel = sign * max(145.0, abs(wheel))
+        cb, ok, active, icon, req = self._frame(True, wheel, wheel + rng.uniform(-15, 15), wheel_counts=(counts,) * 4, extra_counts=extra)
+        self.assertEqual((len(cb), ok), (1, [True]), f"seed {seed} frame {i}")
+        self.assertFalse(icon == 2 and not active[0], f"seed {seed} frame {i}: green without ACTIVE")
+        if active[0] and prev is not None:
+          self.assertLessEqual(abs(req - prev), 1.0 + 1e-6, f"seed {seed} frame {i}")
+        prev = req if active[0] else None
+        n_active += active[0]
+      self.assertGreater(n_active, 30, f"seed {seed}")
+
 
   def test_quantised_wheel_speed_repro(self):
     counts = (567, 567, 567, 566)
@@ -460,6 +502,22 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.safety.set_desired_angle_last(1460)
     cb, ok, active, icon, req = self._frame(True, 161.2, 161.2, wheel_counts=counts)
     self.assertEqual((len(cb), ok), (1, [True]))  # accepted: R1Guard's repro sent ACTIVE 151.2 and got rejected with a green icon
+    self.assertFalse(icon == 2 and not active[0])
+
+  def test_speed_history_out_of_step_with_the_panda_samples(self):
+    """R1Guard: warm at 530 counts per wheel, then the panda gets six samples at 565 while the controller reads only the latest once: our history
+    still holds the old low speeds, the panda's minimum is the new one. last 146, wheel 161.9: ACTIVE must not be sent unless accepted."""
+    for _ in range(100):
+      self._frame(False, 160.0, 160.0, wheel_counts=(530,) * 4)
+    for _ in range(150):
+      self._frame(True, 160.0, 160.0, wheel_counts=(530,) * 4)
+    for _ in range(6):
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": 565 * 0.03125 for p in ("FL", "FR", "RL", "RR")}))
+    self.t += 60000
+    self.cc.apply_angle_last = 146.0
+    self.safety.set_desired_angle_last(1460)
+    cb, ok, active, icon, req = self._frame(True, 161.9, 161.9, wheel_counts=(565,) * 4)
+    self.assertEqual((len(cb), ok), (1, [True]))
     self.assertFalse(icon == 2 and not active[0])
 
   def test_sendable_turn_is_not_paused(self):
@@ -496,9 +554,8 @@ class TestPandaAngleCheck(unittest.TestCase):
     return bool(self.safety.safety_tx_hook(msg))
 
   def test_mirror_never_accepts_what_the_panda_rejects(self):
-    """Fine speed grid (our vEgoRaw is not the panda's quantised sample), half-count requests, both signs: no false accept; a panda-legal frame is
-    refused only within 3 counts of its step / angle limit."""
-    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, SPEED_MARGIN, limits_can
+    """Fine speed grid, half-count requests, both signs: the backstop never accepts a frame the panda rejects."""
+    from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
     for v in [0.5, 2.0, 4.76, 4.9197049, 6.0, 10.0] + [4.5 + 0.0137 * k for k in range(40)]:
       step, max_angle = limits_can(v)
       for last in (0.0, 146.0, -216.0, 300.0):
@@ -510,48 +567,63 @@ class TestPandaAngleCheck(unittest.TestCase):
             request = last + d / 10 + frac
             if abs(request * 10) > max_angle + 4:
               continue
-            mirror, panda = check.accepts(request, last), self._panda(v, last, request)
             with self.subTest(v=v, last=last, d=d, frac=frac):
-              self.assertFalse(mirror and not panda)
-              if panda and not mirror:
-                step_m, max_angle_m = limits_can(v + SPEED_MARGIN)  # the mirror's own conservative limits
-                self.assertTrue(abs(d) >= step_m - 3 or abs(request * 10) >= max_angle_m - 3)
+              self.assertFalse(check.accepts(request, last) and not self._panda(v, last, request))
 
   def test_random_parity_mirror_accept_implies_panda_accept(self):
-    """Thousands of random speeds (raw counts per wheel), last angles and requests around the limits, real libsafety."""
+    """Thousands of random cases with the panda's speed samples out of step with the controller's reads (rising and falling speed): the mirror sees a
+    random subset of 12 recent samples that always holds the newest, the panda's minimum is over the last six. Mirror accepts => libsafety accepts."""
     import random
     from opendbc.car.hyundai.panda_angle import PandaAngleCheck, limits_can
     rng = random.Random(1111)
+    accepted = 0
     for _ in range(4000):
-      counts = [rng.randint(0, 900) for _ in range(1)] * 4
-      counts[rng.randrange(4)] += rng.choice((0, 0, -1, 1))  # one wheel off by a count, as on the car
-      v = sum(counts) / 4 * 0.03125 / 3.6
-      last = rng.uniform(-340.0, 340.0)
-      step, max_angle = limits_can(v)
-      request = last + rng.choice((-1, 1)) * (rng.uniform(0.0, 1.0) * 1.3 * step / 10)
-      request = max(-359.0, min(359.0, request))
+      c = rng.randint(100, 900)
+      samples = []
+      drift = rng.choice((-12, -4, 0, 4, 12))  # counts per sample: falling, flat or rising
+      for _ in range(12):
+        c = max(0, min(1000, c + drift + rng.randint(-2, 2)))
+        samples.append([c] * 4)
+      for s in samples:
+        s[rng.randrange(4)] += rng.choice((0, 0, -1, 1))
+      speeds = [sum(s) / 4 * 0.03125 / 3.6 for s in samples]
       check = PandaAngleCheck()
-      for _ in range(6):
-        check.add_speed(v)
+      for k in sorted(rng.sample(range(11), rng.randint(0, 6)) + [11]):
+        check.add_speed(speeds[k])
+      last = rng.uniform(-340.0, 340.0)
+      step, _ = limits_can(min(speeds[6:]))
+      request = max(-359.0, min(359.0, last + rng.choice((-1, 1)) * rng.uniform(0.0, 1.3) * step / 10))
       if check.accepts(request, last):
-        for _ in range(6):
-          self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": c * 0.03125 for p, c in zip(("FL", "FR", "RL", "RR"), counts)}))
+        accepted += 1
+        for s in samples[6:]:
+          self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": x * 0.03125 for p, x in zip(("FL", "FR", "RL", "RR"), s)}))
         self.t = (self.t + 300_000) % 2**32
         self.safety.set_timer(self.t)
         self.safety.set_desired_angle_last(round(last * 10))
         self.assertTrue(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 2, "ADAS_StrAnglReqVal": request})),
-                        f"counts={counts} last={last} request={request}")
+                        f"samples={samples[6:]} last={last} request={request}")
+    self.assertGreater(accepted, 200)  # the test does exercise accepted frames
 
-  def test_panda_legal_step_is_accepted_where_the_python_limiter_is_stricter(self):
-    """last 146, wheel 160, request 150 at 4.76 m/s: a 4 deg step, legal for the panda (about 5.6 deg per frame)."""
+  def test_backstop_accepts_small_steps_and_rejects_big_ones(self):
+    """last 146 at 4.76 m/s: a 1 deg step (the controller's cap in the guard region) passes; a 24 deg step does not, for the backstop and the panda."""
     from opendbc.car.hyundai.panda_angle import PandaAngleCheck
     check = PandaAngleCheck()
     for _ in range(6):
       check.add_speed(4.76)
-    self.assertTrue(check.accepts(150.0, 146.0))
-    self.assertTrue(self._panda(4.76, 146.0, 150.0))
+    self.assertTrue(check.accepts(147.0, 146.0))
+    self.assertTrue(self._panda(4.76, 146.0, 147.0))
     self.assertFalse(check.accepts(170.0, 146.0))
     self.assertFalse(self._panda(4.76, 146.0, 170.0))
+
+  def test_one_degree_step_is_always_legal_below_six_m_s(self):
+    """The proof in takeover.limit(): the panda's step limit at its worst plausible speed (ours + 1 m/s, below 7 m/s sample, 6 m/s after its -1 m/s
+    fudge) is above the 1 deg cap. Checked against libsafety over the whole range, both signs."""
+    from opendbc.car.hyundai.takeover import STEP_CAP_DEG, STEP_CAP_SPEED
+    for v in [0.0, 1.0, 3.0, 4.9, 5.9, STEP_CAP_SPEED - 0.01, STEP_CAP_SPEED + 0.99]:
+      for last in (-200.0, -146.0, 0.0, 146.0, 150.0, 199.0):  # within the panda's lateral accel limit (220 deg at its 6 m/s)
+        for sign in (1, -1):
+          with self.subTest(v=v, last=last, sign=sign):
+            self.assertTrue(self._panda(v, last, last + sign * STEP_CAP_DEG))
 
 
 
