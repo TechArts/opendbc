@@ -68,10 +68,51 @@ class TestTakeoverFilter(unittest.TestCase):
   def test_any_lateral_resume_blends_in(self):
     # e.g. the end of a blinker pause at low speed: the request starts at the wheel and moves at most 1 deg per frame
     f = make()
-    run(f, 20, active=False)
+    run(f, 20, active=False, angle=20.0)
     f.update(0.0, False, False, 3.0, 20.0, 60.0, True)
     self.assertTrue(f.resuming)
     self.assertEqual(f.limit(60.0, 20.0, 20.0, 3.0), 21.0)
+
+  def _unwinding(self, f, frames, start, rate, active=True):
+    """the wheel moves rate deg per frame from start (the driver finishing a turn); returns the paused flags and the last angle"""
+    out, angle = [], start
+    for _ in range(frames):
+      out.append(f.update(0.0, False, False, 6.7, angle, angle + 20.0, active))
+      angle += rate
+    return out, angle
+
+  def test_resume_with_a_fast_wheel_stays_paused_until_it_calms(self):
+    # route 34 3:25.3: the blinker pause ended while the wheel unwound at 1.5-2.3 deg per frame at 15 mph
+    f = make()
+    self._unwinding(f, 20, -150.0, 2.3, active=False)
+    paused, angle = self._unwinding(f, 40, -104.0, 2.0)
+    self.assertTrue(all(paused))  # never an active request against a wheel that moves faster than the blend
+    self.assertFalse(f.resuming)
+    paused, angle = self._unwinding(f, 60, angle, 0.2)  # the wheel calms: released after the 0.5 s hold, then blended in
+    self.assertTrue(paused[0] and not paused[-1])
+    self.assertTrue(f.resuming)
+
+  def test_resume_with_a_slow_wheel_is_unchanged(self):
+    f = make()
+    self._unwinding(f, 20, -50.0, 0.5, active=False)
+    paused, _ = self._unwinding(f, 5, -40.0, 0.5)
+    self.assertFalse(any(paused))
+    self.assertTrue(f.resuming)
+
+  def test_request_step_never_exceeds_the_resume_rate_even_when_the_wheel_moves_fast(self):
+    # the wheel starts slow (resume accepted), then speeds up: the convergence limit must not drag the request along at the wheel's speed
+    f = make()
+    self._unwinding(f, 20, -86.0, 0.2, active=False)
+    last, angle = -82.0, -82.0
+    steps = []
+    for _ in range(40):
+      f.update(0.0, False, False, 6.7, angle, angle + 30.0, True)
+      if f.paused:
+        break
+      req = f.limit(angle + 30.0, last, angle, 6.7)
+      steps.append(abs(req - last))
+      last, angle = req, angle + 1.9
+    self.assertTrue(steps and max(steps) <= 1.0 + 1e-9, steps)
 
   def test_resume_ramp_and_convergence(self):
     f = make()
