@@ -391,21 +391,29 @@ class TestCarControllerHandback(unittest.TestCase):
     self.cs.cruise_info["ACCMode"] = 4  # camera back in standby: silent again
     self.assertNotIn(0x1A0, self._msgs(enabled=False, frame=2 + 5000))
 
-  def _step(self, event=None, available=True):
-    """one controller frame (off the icon cadence), with an optional CANCEL press (True) / release (False) event; returns (sent addresses, 0x1A0 data)"""
+  def _step(self, key=None, available=True, enabled=False, brake=False):
+    """one controller frame (off the icon cadence). key True / False presses / releases the physical CANCEL key. The key is read from the raw
+    state (cruise_buttons); the event it makes is rewritten to resumeCruise like card's PauseResumeKey does in standby. Returns (addresses, 0x1A0)"""
     if self.cc.frame % 5 == 0:
       self.cc.frame += 2
+    if key is not None:
+      self.cs.cruise_buttons.append(4 if key else 0)
+      self.cs.out.buttonEvents = [structs.CarState.ButtonEvent(type=ButtonType.resumeCruise, pressed=key)]
+    else:
+      self.cs.cruise_buttons.append(self.cs.cruise_buttons[-1])
+      self.cs.out.buttonEvents = []
     self.cs.out.cruiseState.available = available
-    self.cs.out.buttonEvents = [] if event is None else [structs.CarState.ButtonEvent(type=ButtonType.cancel, pressed=event)]
+    self.cs.out.brakePressed = brake
     cc = structs.CarControl()
-    cc.enabled = False
+    cc.enabled = enabled
+    cc.latActive = enabled
     msgs = self.cc.create_canfd_msgs(False, 0, 0.0, 0.0, False, self.hud, self.cs, cc)
     self.cc.frame += 2
     return {m[0] for m in msgs}, next((m[1] for m in msgs if m[0] == 0x1A0), None)
 
   def test_cancel_press_in_standby_sends_off_frames_until_settled(self):
     # the panda blocks the camera's 0x1A0 from the CANCEL press (the camera resumes its ACC on the release): our off frames must replace it from the
-    # press on, while the key is down and until 0.8 s after the release; then silent again (the camera is back to standby)
+    # press on, on every frame while the key is down and until 0.8 s after the release; then silent again (the camera is back to standby)
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
     self.assertNotIn(0x1A0, self._step()[0])
     sent, dat = self._step(True)
@@ -423,15 +431,37 @@ class TestCarControllerHandback(unittest.TestCase):
       sent = self._step()[0]
     self.assertNotIn(0x1A0, sent)  # settled
 
-  def test_cancel_press_without_camera_main_or_while_owner_sends_nothing(self):
+  def test_cancel_press_without_camera_main_sends_nothing(self):
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
-    self.assertNotIn(0x1A0, self._step(True, available=False)[0])  # camera main off: the panda does not arm either
+    for _ in range(5):
+      self.assertNotIn(0x1A0, self._step(True, available=False)[0])  # camera main off: the panda does not arm either
     self._step(False)
-    self._msgs(enabled=True)  # openpilot owns the axis: the press is its own cancel, no lock bookkeeping
+
+  def test_cancel_hold_that_outlives_the_ownership_tail_keeps_the_off_frames(self):
+    # openpilot engaged, brake: the panda hands back at once, our tail runs 6 s; a CANCEL hold that starts in the tail and outlasts it never has a gap
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
+    self._step(enabled=True)
+    self.assertIn(0x1A0, self._step(enabled=True)[0])
+    self.assertIn(0x1A0, self._step(enabled=False, brake=True)[0])
     self.assertTrue(self.cc.handback.long_owner.owner)
+    for _ in range(100):  # 2 s into the tail
+      self._step()
+    self.assertIn(0x1A0, self._step(True)[0])
+    self.assertTrue(self.cc.handback.long_owner.owner)
+    for _ in range(300):  # held 6 s: the tail ends meanwhile
+      self.assertIn(0x1A0, self._step()[0])
+    self.assertFalse(self.cc.handback.long_owner.owner)
+    self.assertIn(0x1A0, self._step(False)[0])
+
+  def test_cancel_press_with_the_buttons_events_untouched_still_arms(self):
+    # no PauseResumeKey (e.g. a press that starts engaged stays a cancel): the same raw key state
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
+    self.cs.cruise_buttons.append(4)
+    self.cs.out.buttonEvents = [structs.CarState.ButtonEvent(type=ButtonType.cancel, pressed=True)]
     self.cs.out.cruiseState.available = True
-    self._msgs(enabled=False, buttons=(ButtonType.cancel,))
-    self.assertFalse(self.cc.handback.cancel_armed)
+    self.cc.frame = 6
+    msgs = self.cc.create_canfd_msgs(False, 0, 0.0, 0.0, False, self.hud, self.cs, structs.CarControl())
+    self.assertIn(0x1A0, {m[0] for m in msgs})
 
   def test_stock_acc_not_locked_while_openpilot_engaged(self):
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}

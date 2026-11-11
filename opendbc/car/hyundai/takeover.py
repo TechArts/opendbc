@@ -2,7 +2,7 @@
 
 While paused the controller sends 0xCB INACTIVE at the measured angle with gain 0 (no counter-force, no angle error for the EPS to fault on).
 When the driver lets go the request is blended back to the model: angle step limited (never more than the resume rate per frame, whatever the
-wheel does), gain ramped by the controller, and kept within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
+wheel does; only the low-speed guard's own clips run after it), gain ramped by the controller, and kept within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
 Lateral never starts (engage, blinker pause end, takeover release) while the wheel still moves faster than that: it stays paused until it calms.
 Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding.
 """

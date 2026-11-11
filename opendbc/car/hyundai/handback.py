@@ -13,6 +13,7 @@ openpilot frame until the axis is no longer allowed AND the driver acted. openpi
 Without a driver action it keeps sending 'off' frames: the car sees a benign off state, the stock camera does not take over unannounced.
 """
 from opendbc.car import DT_CTRL, structs
+from opendbc.car.hyundai.values import Buttons
 
 TAIL_FRAMES = int(6.0 / DT_CTRL)         # > the panda's ~3 s heartbeat mismatch + margin
 RECENT_ACTION_FRAMES = int(1.0 / DT_CTRL)  # a driver action this close before the axis went inactive is its reason
@@ -127,21 +128,21 @@ class CameraHandback:
     self.cancel_down = False
     self.cancel_release_frame: int | None = None
 
-  def cancel_lock(self, CS, owner: bool, frame: int) -> bool:
+  def cancel_lock(self, CS, frame: int) -> bool:
     """Mirror of the panda's CANCEL pre-arm (hyundai_canfd.h): from the CANCEL press until CANCEL_SETTLE_FRAMES after its release the camera's 0x1A0 is
-    blocked (the camera resumes its own ACC on the release), so our 'off' frames must already be there, or the car sees no 0x1A0."""
-    for be in CS.out.buttonEvents:
-      if be.type == structs.CarState.ButtonEvent.Type.cancel:
-        self.cancel_down = be.pressed
-        if be.pressed:
-          self.cancel_armed = bool(CS.out.cruiseState.available) and not owner
-        else:
-          self.cancel_release_frame = frame
+    blocked (the camera resumes its own ACC on the release), so our 'off' frames must already be there, or the car sees no 0x1A0. Read from the raw
+    key state (CS.cruise_buttons), not from the button events: card's PauseResumeKey rewrites the standby CANCEL events to resumeCruise before the
+    controller sees them. Armed whatever the ownership tail says: the panda arms on its own state (a brake or CANCEL ended its ownership), frames we
+    send while it did not arm are rejected, harmless like the tail; a missing frame during a long hold is a 0x1A0 gap."""
+    down = CS.cruise_buttons[-1] == Buttons.CANCEL
+    if down and not self.cancel_down:
+      self.cancel_armed = bool(CS.out.cruiseState.available)
+    elif not down and self.cancel_down:
+      self.cancel_release_frame = frame
+    self.cancel_down = down
     if not self.cancel_armed:
       return False
-    if self.cancel_down:
-      return True
-    if self.cancel_release_frame is not None and frame - self.cancel_release_frame <= CANCEL_SETTLE_FRAMES:
+    if down or (self.cancel_release_frame is not None and frame - self.cancel_release_frame <= CANCEL_SETTLE_FRAMES):
       return True
     self.cancel_armed = False
     return False
@@ -163,5 +164,5 @@ class CameraHandback:
     send_long = self.long_owner.update(bool(CC.enabled and openpilot_long), driver_cruise, frame)
     # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
     stock_acc_lock = bool(openpilot_long and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
-    cancel_lock = self.cancel_lock(CS, self.long_owner.owner, frame) and bool(openpilot_long and not CC.enabled)  # (always consumes the events)
+    cancel_lock = self.cancel_lock(CS, frame) and bool(openpilot_long and not CC.enabled)  # (evaluated every frame: edge tracking)
     return send_lat, send_long or stock_acc_lock or cancel_lock
