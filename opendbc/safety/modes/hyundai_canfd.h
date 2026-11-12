@@ -133,7 +133,7 @@ static bool hyundai_canfd_hb_cam_engaged = false;   // camera ACCMode 1 or 2
 static bool hyundai_canfd_hb_stock_lock = false;
 static uint8_t hyundai_canfd_hb_cam_standby_frames = 0U;
 static bool hyundai_canfd_hb_btn_arm = false;      // a CANCEL press or a main press (engage) armed the lock: the camera may react on the key
-static bool hyundai_canfd_hb_lock_main = false;    // the lock was armed by the engage press (main, camera main off), not by a CANCEL / hand-back / camera edge
+static bool hyundai_canfd_hb_lock_btn = false;    // the lock was armed by a key (engage press, CANCEL, the pause-key grant that follows it), not by a hand-back / camera edge
 static uint32_t hyundai_canfd_hb_btn_arm_ts = 0U;  // the last frame of that key
 static const uint32_t HYUNDAI_CANFD_HB_BTN_SETTLE_US = 600000U;  // camera reaction to a CANCEL release: 0.02 s (route 34), 0.18 s after the press
 static const uint32_t HYUNDAI_CANFD_HB_ACTION_WINDOW_US = 10000000U;  // heartbeat mismatch exits MADS/controls ~3 s after openpilot disengages
@@ -171,7 +171,7 @@ static void hyundai_canfd_handback_step(void) {
     hyundai_pause_resume_granted = false;
     if (!hyundai_canfd_hb_long_op && controls_allowed) {
       hyundai_canfd_hb_stock_lock = true;
-      hyundai_canfd_hb_lock_main = false;
+      hyundai_canfd_hb_lock_btn = hyundai_canfd_hb_btn_arm;  // the grant ends a CANCEL press that armed the lock
       hyundai_canfd_hb_cam_standby_frames = 0U;
     }
   }
@@ -191,7 +191,7 @@ static void hyundai_canfd_handback_step(void) {
     // openpilot -> camera: the camera's ACC is typically still engaged along (3b 5:23.7, 10:03.9, 3d 6:16.3: ACCMode 1 for ~0.1 s after the driver acted), so
     // its 0x1A0 stays out of the car, our 'off' frames replace it, until it has reported standby (the stock ACC lock)
     hyundai_canfd_hb_stock_lock = true;
-    hyundai_canfd_hb_lock_main = false;
+    hyundai_canfd_hb_lock_btn = false;
     hyundai_canfd_hb_cam_standby_frames = 0U;
   }
 }
@@ -224,9 +224,9 @@ static void hyundai_canfd_handback_camera_acc(int acc_mode) {
 // that lock ends after the settle time and the standby frames whatever controls_allowed says (empty 0x1A0 slots otherwise, R1 on bb30b3e8).
 static void hyundai_canfd_handback_lock_release(void) {
   if (hyundai_canfd_hb_stock_lock && (hyundai_canfd_hb_cam_standby_frames >= HYUNDAI_CANFD_HB_STOCK_STANDBY_FRAMES) &&
-      (!controls_allowed || hyundai_canfd_hb_lock_main) && !hyundai_canfd_hb_btn_settling()) {
+      (!controls_allowed || hyundai_canfd_hb_lock_btn) && !hyundai_canfd_hb_btn_settling()) {
     hyundai_canfd_hb_stock_lock = false;
-    hyundai_canfd_hb_lock_main = false;
+    hyundai_canfd_hb_lock_btn = false;
   }
 }
 
@@ -279,7 +279,7 @@ static void hyundai_canfd_handback_buttons(int cruise_button, bool main_button) 
       if (arm) {
         hyundai_canfd_hb_btn_arm = true;
         hyundai_canfd_hb_stock_lock = true;
-        hyundai_canfd_hb_lock_main = main_arm;
+        hyundai_canfd_hb_lock_btn = true;
         hyundai_canfd_hb_cam_standby_frames = 0U;
         hyundai_canfd_hb_btn_arm_ts = microsecond_timer_get();
       } else if ((cancel_down || main_button) && hyundai_canfd_hb_btn_settling()) {
@@ -565,7 +565,7 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
           hyundai_canfd_hb_long_action = false;
           hyundai_canfd_hb_stock_lock = false;
           hyundai_canfd_hb_btn_arm = false;
-          hyundai_canfd_hb_lock_main = false;
+          hyundai_canfd_hb_lock_btn = false;
         } else if (hyundai_canfd_hb_stock_lock && !violation && (hb_acc_mode != 1) && (hb_acc_mode != 2)) {
           // stock ACC lock: 'off' frames replace the camera's, they cannot engage anything
         } else {
@@ -746,7 +746,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_canfd_hb_cam_seen = false;
   hyundai_canfd_hb_cam_engaged = false;
   hyundai_canfd_hb_stock_lock = false;
-  hyundai_canfd_hb_lock_main = false;
+  hyundai_canfd_hb_lock_btn = false;
   hyundai_canfd_hb_cam_standby_frames = 0U;
   hyundai_canfd_hb_btn_arm = false;
   hyundai_canfd_hb_btn_arm_ts = 0U;

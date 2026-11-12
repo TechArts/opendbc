@@ -1908,16 +1908,15 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self.assertTrue(self._scc(0))
     self.assertFalse(self._scc(1))
 
-  def test_release_with_camera_in_standby_blocks_camera_until_permission_ends(self):
+  def test_release_with_camera_in_standby_blocks_camera_until_settled(self):
     self._release_pause()
-    self.safety.set_timer(self.S)  # the CANCEL settle time (HYUNDAI_CANFD_HB_CANCEL_SETTLE_US) is over
-    for _ in range(10):
-      self._camera_acc(4)
-    self.assertFalse(self._scc_fwd())  # permission without ownership: no stock frames even in standby
-    self._brake(1)
-    self._brake(0)
+    self._camera_acc(4)
+    self.assertFalse(self._scc_fwd())  # permission without ownership, the key was just released: no stock frames yet
+    self.safety.set_timer(self.S)  # the key's settle time (HYUNDAI_CANFD_HB_BTN_SETTLE_US) is over
     for _ in range(3):
       self._camera_acc(4)
+    # a declined resume (openpilot never sends) must not leave the car without a 0x1A0 once our off frames stop (python's button_lock, 0.8 s):
+    # the key's lock ends after the settle time and the standby frames, whatever controls_allowed says (R1 on be7fd3cd)
     self.assertTrue(self._scc_fwd())
 
   # --- policy: during a pause-key hold any brake press, main change or heartbeat/lag fault disarms the pending resume; the release only pauses
@@ -2028,7 +2027,7 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     slots = self._main_engage(python_late=1)
     self.assertEqual([(False, False)] + [(False, True)] * 7, slots)
 
-  def _joint_slots(self, cam_modes, press_slots, enabled_from=None):
+  def _joint_slots(self, cam_modes, press_slots, enabled_from=None, cancel=False):
     """python's real CameraHandback decides per slot whether we send (ACCMode 0 while not enabled, 1 once enabled), libsafety decides what reaches the car.
     The camera's main is off until the press ends, then on; cam_modes[i] is the camera's ACCMode in slot i (standby 4 / engaged along 1). Returns the
     (camera reached, ours reached) per slot, python's send flag and controls_allowed."""
@@ -2043,17 +2042,18 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     out, cam_main, frame = [], 0, 2
     for i, cam in enumerate(cam_modes):
       pressed = i in press_slots
-      cs.main_buttons.append(1 if pressed else 0)
-      cs.out.cruiseState.available = bool(cam_main)
+      cs.cruise_buttons.append(4 if (pressed and cancel) else 0)
+      cs.main_buttons.append(1 if (pressed and not cancel) else 0)
+      cs.out.cruiseState.available = bool(cam_main) or cancel
       cs.cruise_info = {"ACCMode": cam}
       enabled = enabled_from is not None and i >= enabled_from
       cc = SimpleNamespace(enabled=enabled, latActive=False)
       _, send = hb.update(cc, cs, True, frame)
       frame += 2
       # the camera's main rises with the end of the press (20 ms after its first frame in the logs, here after the last)
-      cam_main = 1 if (i >= max(press_slots) + 1) else 0
-      reached = self._slot(cam=cam, ours=(1 if enabled and not hb.cutoff else 0) if send else None,
-                           events=[lambda: self._button(main=1 if pressed else 0)], cam_main=cam_main)
+      cam_main = 1 if (cancel or i >= max(press_slots) + 1) else 0
+      key = (lambda: self._button(self.CANCEL if pressed else 0)) if cancel else (lambda: self._button(main=1 if pressed else 0))
+      reached = self._slot(cam=cam, ours=(1 if enabled and not hb.cutoff else 0) if send else None, events=[key], cam_main=cam_main)
       out.append((reached, send, self.safety.get_controls_allowed()))
     return out
 
@@ -2071,6 +2071,14 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     slots = self._joint_slots([4] * 6 + [1] * 30 + [4] * 60, press_slots={5, 6, 7})
     for i, (reached, _, _) in enumerate(slots[8:], start=8):
       self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+
+  def test_declined_pause_resume_no_empty_slot_no_camera_acc_frame(self):
+    # R1 on be7fd3cd: CANCEL press/release in standby grants controls_allowed (pause key = resume), openpilot declines: same hole, same bounded release
+    slots = self._joint_slots([4] * 80, press_slots={5, 6, 7}, cancel=True)
+    self.assertTrue(any(ctl for _, _, ctl in slots[8:]))
+    for i, (reached, _, _) in enumerate(slots[6:], start=6):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+    self.assertTrue(slots[-1][0][0] and not slots[-1][0][1])
 
   def test_main_press_with_camera_main_on_does_not_lock(self):
     # the press that turns main off: nothing engages, the camera's frames flow
