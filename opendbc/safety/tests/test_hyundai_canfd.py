@@ -2028,6 +2028,50 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     slots = self._main_engage(python_late=1)
     self.assertEqual([(False, False)] + [(False, True)] * 7, slots)
 
+  def _joint_slots(self, cam_modes, press_slots, enabled_from=None):
+    """python's real CameraHandback decides per slot whether we send (ACCMode 0 while not enabled, 1 once enabled), libsafety decides what reaches the car.
+    The camera's main is off until the press ends, then on; cam_modes[i] is the camera's ACCMode in slot i (standby 4 / engaged along 1). Returns the
+    (camera reached, ours reached) per slot, python's send flag and controls_allowed."""
+    from types import SimpleNamespace
+    from collections import deque
+    from opendbc.car.hyundai.handback import CameraHandback
+    hb = CameraHandback()
+    cs = SimpleNamespace(cruise_buttons=deque([0] * 4, maxlen=4), main_buttons=deque([0] * 4, maxlen=4), cruise_info={}, cam_lfa_icon=None, cam_lka_ind=None,
+                         out=SimpleNamespace(cruiseState=SimpleNamespace(available=False), brakePressed=False, buttonEvents=[]))
+    self._init()
+    self.safety_t = self.S
+    out, cam_main, frame = [], 0, 2
+    for i, cam in enumerate(cam_modes):
+      pressed = i in press_slots
+      cs.main_buttons.append(1 if pressed else 0)
+      cs.out.cruiseState.available = bool(cam_main)
+      cs.cruise_info = {"ACCMode": cam}
+      enabled = enabled_from is not None and i >= enabled_from
+      cc = SimpleNamespace(enabled=enabled, latActive=False)
+      _, send = hb.update(cc, cs, True, frame)
+      frame += 2
+      # the camera's main rises with the end of the press (20 ms after its first frame in the logs, here after the last)
+      cam_main = 1 if (i >= max(press_slots) + 1) else 0
+      reached = self._slot(cam=cam, ours=(1 if enabled and not hb.cutoff else 0) if send else None,
+                           events=[lambda: self._button(main=1 if pressed else 0)], cam_main=cam_main)
+      out.append((reached, send, self.safety.get_controls_allowed()))
+    return out
+
+  def test_declined_main_engage_no_empty_slot_no_camera_acc_frame(self):
+    # R1 on bb30b3e8: the press is declined (python never enables), the camera's main rises with ACCMode 4 and the panda grants controls_allowed.
+    # Every slot after the press has exactly one sender (the camera's standby frames or our off frames), the camera's ACC-active frame never passes.
+    slots = self._joint_slots([4] * 80, press_slots={5, 6, 7})
+    self.assertTrue(any(ctl for _, _, ctl in slots))
+    for i, (reached, _, _) in enumerate(slots[6:], start=6):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+    self.assertTrue(slots[-1][0][0] and not slots[-1][0][1])  # the camera's standby frames flow again at the end
+
+  def test_declined_main_engage_camera_engages_no_empty_slot(self):
+    # the camera's ACC engages with the press and openpilot declines: its frames stay out, our off frames replace them for as long as it is engaged
+    slots = self._joint_slots([4] * 6 + [1] * 30 + [4] * 60, press_slots={5, 6, 7})
+    for i, (reached, _, _) in enumerate(slots[8:], start=8):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+
   def test_main_press_with_camera_main_on_does_not_lock(self):
     # the press that turns main off: nothing engages, the camera's frames flow
     self._init()
