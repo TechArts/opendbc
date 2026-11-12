@@ -146,10 +146,10 @@ class CameraHandback:
     main_down = bool(CS.main_buttons[-1])
     available = bool(CS.out.cruiseState.available)
     self.cancel_edge = cancel_down and not self.cancel_down
-    if self.cancel_edge:
-      self.button_armed = available
-    elif main_down and not self.main_down:
-      self.button_armed = not available
+    # arm on the eligible edges only, an ineligible key (CANCEL with camera main off, main press that turns it off) keeps what is armed: the panda
+    # keeps its lock and refreshes its settle time on any key frame
+    if (self.cancel_edge and available) or (main_down and not self.main_down and not available):
+      self.button_armed = True
     if (self.cancel_down or self.main_down) and not (cancel_down or main_down):
       self.button_release_frame = frame
     self.cancel_down, self.main_down = cancel_down, main_down

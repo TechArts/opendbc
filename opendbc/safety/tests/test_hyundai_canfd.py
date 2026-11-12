@@ -2027,7 +2027,7 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     slots = self._main_engage(python_late=1)
     self.assertEqual([(False, False)] + [(False, True)] * 7, slots)
 
-  def _joint_slots(self, cam_modes, press_slots, enabled_from=None, cancel=False):
+  def _joint_slots(self, cam_modes, press_slots, enabled_from=None, cancel=False, main_slots=()):
     """python's real CameraHandback decides per slot whether we send (ACCMode 0 while not enabled, 1 once enabled), libsafety decides what reaches the car.
     The camera's main is off until the press ends, then on; cam_modes[i] is the camera's ACCMode in slot i (standby 4 / engaged along 1). Returns the
     (camera reached, ours reached) per slot, python's send flag and controls_allowed."""
@@ -2043,7 +2043,7 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     for i, cam in enumerate(cam_modes):
       pressed = i in press_slots
       cs.cruise_buttons.append(4 if (pressed and cancel) else 0)
-      cs.main_buttons.append(1 if (pressed and not cancel) else 0)
+      cs.main_buttons.append(1 if ((pressed and not cancel) or i in main_slots) else 0)
       cs.out.cruiseState.available = bool(cam_main) or cancel
       cs.cruise_info = {"ACCMode": cam}
       enabled = enabled_from is not None and i >= enabled_from
@@ -2052,7 +2052,7 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
       frame += 2
       # the camera's main rises with the end of the press (20 ms after its first frame in the logs, here after the last)
       cam_main = 1 if (cancel or i >= max(press_slots) + 1) else 0
-      key = (lambda: self._button(self.CANCEL if pressed else 0)) if cancel else (lambda: self._button(main=1 if pressed else 0))
+      key = (lambda: self._button(self.CANCEL if pressed else 0, main=1 if i in main_slots else 0)) if cancel else (lambda: self._button(main=1 if pressed else 0))
       reached = self._slot(cam=cam, ours=(1 if enabled and not hb.cutoff else 0) if send else None, events=[key], cam_main=cam_main)
       out.append((reached, send, self.safety.get_controls_allowed()))
     return out
@@ -2079,6 +2079,12 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     for i, (reached, _, _) in enumerate(slots[6:], start=6):
       self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
     self.assertTrue(slots[-1][0][0] and not slots[-1][0][1])
+
+  def test_declined_pause_resume_then_main_off_press_no_empty_slot(self):
+    # R1 on dec8d609: a main press that turns main off (camera main on) while the CANCEL lock settles must not drop python's off frames
+    slots = self._joint_slots([4] * 100, press_slots={5, 6, 7}, cancel=True, main_slots={10, 11})
+    for i, (reached, _, _) in enumerate(slots[6:], start=6):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
 
   def test_main_press_with_camera_main_on_does_not_lock(self):
     # the press that turns main off: nothing engages, the camera's frames flow
