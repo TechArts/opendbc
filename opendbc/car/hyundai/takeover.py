@@ -29,6 +29,14 @@ STEP_CAP_DEG = 1.0  # deg per frame, the most any ACTIVE request moves in the lo
 STEP_CAP_SPEED = 6.0  # m/s
 STEP_CAP_ANGLE = 140.0  # deg
 
+# route 42 13:12.5-13:13.6 (3.2 m/s, hand off): the model's turn tightened faster than the EPS turned the wheel (about 1 deg per frame), the request
+# ran 11-47 deg ahead (wheel 68 -> 144 deg) and the EPS faulted (AciFltSig_Lv2 = 2, then the camera's FAULT_*) as the wheel passed 140, before the
+# guard's band (> GUARD_ANGLE) applied. Below LEAD_SPEED, once the wheel or the request is past LEAD_ANGLE, the request stays within LEAD_MAX_ERROR
+# of the wheel (lead_band). Hands-off turns on routes 40-42 led by at most 7 deg, so the band binds only when the wheel falls behind.
+LEAD_SPEED = STEP_CAP_SPEED  # m/s
+LEAD_ANGLE = 90.0  # deg, |wheel| or |request|
+LEAD_MAX_ERROR = GUARD_MAX_ERROR  # deg, |request - measured|
+
 # curve-aware mode (HyundaiCurveHold, research/curve-hold.md Q2/Q5): in a curve only a pull against the turn, or a push deeper than the model
 # asks, is a grab. A hand that holds the wheel along the turn (129 + 103 * a_lat torque once paused) is not.
 CURVE_A_MIN = 0.3  # m/s^2, lateral load from which the wheel counts as in a curve
@@ -202,23 +210,35 @@ class TakeoverFilter:
       lo, hi = max(lo, angle - CONVERGE_DEG, last - self.resume_rate), min(hi, angle + CONVERGE_DEG, last + self.resume_rate)
     return lo, hi
 
-  def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
-    """Applies the low-speed cap and the resume blend to a request that already passed the vehicle-model limits.
+  @staticmethod
+  def lead_band(request: float, last: float, angle: float, v_ego: float) -> tuple[float, float]:
+    """(lo, hi) of the request: the wheel +- LEAD_MAX_ERROR below LEAD_SPEED once the wheel or the request is past LEAD_ANGLE, else unbounded.
+    A last request already outside the band is brought back by at most STEP_CAP_DEG per frame (accepted by the panda below 6 m/s, see window()),
+    so the band alone never leaves the request empty: gradual convergence, not an instant cap."""
+    if v_ego >= LEAD_SPEED or max(abs(angle), abs(request)) <= LEAD_ANGLE:
+      return -math.inf, math.inf
+    return min(angle - LEAD_MAX_ERROR, last + STEP_CAP_DEG), max(angle + LEAD_MAX_ERROR, last - STEP_CAP_DEG)
 
-    Outside the guard region (step_capped false): the resume blend only, as it always was. Inside: the request moved to the nearest point of window()
-    intersected with `backstop` (the panda backstop's window from the controller, None when it has none). None: the intersection is empty (a wheel that
-    moves against the band, a step the panda would not accept): send inactive at the measured angle, the next frame starts from there."""
+  def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
+    """Applies the low-speed cap, the lead band and the resume blend to a request that already passed the vehicle-model limits.
+
+    Outside the guard region (step_capped false): the resume blend, then the lead band (no change at LEAD_SPEED and above or within LEAD_ANGLE).
+    Inside: the request moved to the nearest point of window() intersected with the lead band and `backstop` (the panda backstop's window from the
+    controller, None when it has none). None: the intersection is empty (a wheel that moves against the band, a step the panda would not accept):
+    send inactive at the measured angle, the next frame starts from there."""
     if not self.enabled:
       return request
     if not self.step_capped(angle, v_ego):
       if self.resuming:
         request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
         request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
-      return request
+      lo, hi = self.lead_band(request, last, angle, v_ego)
+      return float(np.clip(request, lo, hi))
     if backstop is None:
       return None
     lo, hi = self.window(last, angle, v_ego)
-    lo, hi = max(lo, backstop[0]), min(hi, backstop[1])
+    lead_lo, lead_hi = self.lead_band(request, last, angle, v_ego)
+    lo, hi = max(lo, backstop[0], lead_lo), min(hi, backstop[1], lead_hi)
     if lo > hi:
       return None
     return float(np.clip(request, lo, hi))
