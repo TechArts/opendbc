@@ -199,19 +199,56 @@ class TestLowSpeedGuard(unittest.TestCase):
     self.assertEqual(f.limit(100.0, 80.0, 100.0, 3.0), 80.5)
     self.assertEqual(f.limit(60.0, 80.0, 100.0, 3.0), 80.5)  # a request the other way still only steps 0.5 toward the wheel
 
+  def test_a_pause_inside_the_guard_region_holds_until_the_wheel_or_speed_leaves_it(self):
+    """Route 45 7:46.7 (0.94 m/s, wheel -341 deg, hand 70-187, not pressed): after a takeover pause openpilot resumed ACTIVE (gain 0.03, request 3 deg
+    from the wheel) and the EPS faulted. Inside the region (v < 6 m/s, |wheel| > 140 deg) a pause never releases, however long the hand is off; it
+    releases after the hold time once the wheel is back under 140 deg or the speed is 6 m/s or more."""
+    hold = 50
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        a = -341.0 * sign
+        f = make()
+        self.assertTrue(run(f, ENTER_FRAMES, torque=300.0, v=0.94, angle=a, desired=a)[-1])
+        self.assertTrue(all(run(f, 600, torque=70.0, v=0.94, angle=a, desired=a)))  # calm, but still in the region
+        self.assertTrue(all(run(f, 600, torque=0.0, v=5.9, angle=a, desired=a)))  # hand off, still below 6 m/s
+        self.assertFalse(run(f, hold + 5, torque=0.0, v=0.94, angle=-130.0 * sign, desired=-130.0 * sign)[-1])  # unwound below 140: releases
+        f = make()
+        run(f, ENTER_FRAMES, torque=300.0, v=0.94, angle=a, desired=a)
+        self.assertFalse(run(f, hold + 5, torque=0.0, v=6.0, angle=a, desired=a)[-1])  # 6 m/s: outside the region, releases
+
+  def test_lateral_coming_back_inside_the_guard_region_starts_paused(self):
+    """Engage, blinker-pause end or MADS resume inside the region: no ACTIVE start there (paused, so the controller sends inactive at the wheel);
+    outside the region it starts with the usual resume blend."""
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        a = 216.0 * sign
+        f = make()
+        run(f, 1, v=4.76, angle=a, desired=a, active=False)
+        self.assertTrue(all(run(f, 300, v=4.76, angle=a, desired=a)))
+        self.assertFalse(run(f, 60, v=4.76, angle=120.0 * sign, desired=120.0 * sign)[-1])
+        f = make()
+        run(f, 1, v=4.76, angle=120.0 * sign, desired=120.0 * sign, active=False)
+        self.assertFalse(run(f, 1, v=4.76, angle=120.0 * sign, desired=120.0 * sign)[0])
+        self.assertTrue(f.resuming)
+
   def test_cap_binding_pauses_after_half_second_and_stays_until_released(self):
     f = make()
+    run(f, 1, v=4.0, angle=130.0, desired=130.0)  # lateral on outside the region, then the wheel turns in while ACTIVE
     paused = run(f, GUARD_FRAMES + 5, v=4.0, angle=175.0, desired=205.0)
     self.assertFalse(paused[GUARD_FRAMES - 1])
     self.assertTrue(paused[-1])
     self.assertTrue(all(run(f, 200, v=4.0, angle=175.0, desired=205.0)))  # still binding: stay paused, no flapping
-    self.assertFalse(run(f, 60, v=4.0, angle=175.0, desired=168.0)[-1])
+    self.assertTrue(all(run(f, 60, v=4.0, angle=175.0, desired=168.0)))  # no longer binding, but no ACTIVE re-entry inside the region
+    self.assertFalse(run(f, 60, v=4.0, angle=130.0, desired=130.0)[-1])  # unwound below 140 deg: released
 
   def test_no_pause_when_cap_does_not_bind(self):
-    self.assertFalse(any(run(make(), 300, v=4.0, angle=175.0, desired=168.0)))
+    f = make()
+    run(f, 1, v=4.0, angle=130.0, desired=130.0)
+    self.assertFalse(any(run(f, 300, v=4.0, angle=175.0, desired=168.0)))
 
   def test_short_binding_does_not_pause(self):
     f = make()
+    run(f, 1, v=4.0, angle=130.0, desired=130.0)
     run(f, GUARD_FRAMES - 5, v=4.0, angle=175.0, desired=205.0)
     self.assertFalse(any(run(f, 100, v=4.0, angle=175.0, desired=170.0)))
 
@@ -302,19 +339,26 @@ class TestCurveTakeover(unittest.TestCase):
   def test_opposing_pressed_pauses_at_once(self):
     self.assertTrue(self.curve(make_curve(), 1, -200, pressed=True)[0])
 
-  def test_guard_region_hand_along_the_turn_pauses_and_releases_like_straight(self):
-    """Route 3a: v 2.68 m/s, wheel and model 250: a = 0.7 m/s^2, a turn. In the region any torque or steeringPressed pauses, along the turn too."""
+  def test_guard_region_hand_along_the_turn_pauses_like_straight_and_holds_in_the_region(self):
+    """Route 3a: v 2.68 m/s, wheel and model 250: a = 0.7 m/s^2, a turn. In the region any torque or steeringPressed pauses, along the turn too;
+    the pause then holds while the wheel is in the region (route 45) and releases like straight once it is back under 140 deg."""
     for sign in (1, -1):
       a = 250.0 * sign
       kw = dict(v=2.68, angle=a, desired=a)
+      out = dict(v=2.68, angle=120.0 * sign, desired=120.0 * sign)
       f = make_curve()
+      run(f, 1, **out)  # lateral on outside the region, then the wheel turns in while ACTIVE
       self.assertTrue(run(f, 1, torque=0.0, pressed=True, **kw)[0])
       f = make_curve()
-      self.assertTrue(run(f, ENTER_FRAMES, torque=250 * sign, **kw)[-1])  # along-turn torque from the 3rd frame, unpressed
+      run(f, 1, **out)
+      self.assertFalse(run(f, ENTER_FRAMES - 1, torque=250 * sign, **kw)[-1])
+      self.assertTrue(run(f, 1, torque=250 * sign, **kw)[-1])  # along-turn torque for ENTER_FRAMES, unpressed: a grab in the region
       hold = f.hold_frames
       self.assertTrue(all(run(f, hold + 50, torque=300 * sign, pressed=True, **kw)))
-      self.assertTrue(all(run(f, hold - 1, torque=0.0, **kw)))
-      self.assertFalse(run(f, 1, torque=0.0, **kw)[-1])
+      self.assertTrue(all(run(f, hold + 50, torque=0.0, **kw)))  # hand off, still in the region: held
+      self.assertTrue(all(run(f, 5, torque=0.0, **out)))  # back under 140; the 130 deg jump reads as a fast wheel for the 5-frame rate window
+      self.assertTrue(all(run(f, hold - 1, torque=0.0, **out)))  # then the straight-road hold time
+      self.assertFalse(run(f, 1, torque=0.0, **out)[-1])
     f = make_curve()  # the same hand above the region's speed: not a grab (F22)
     self.assertFalse(any(run(f, 100, torque=300, pressed=True, v=8.0, angle=250.0, desired=250.0)))
 
@@ -521,10 +565,23 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       if out[i - 1][0] and out[i][0]:
         self.assertLessEqual(abs(out[i][1] - out[i - 1][1]), 1.0 + 1e-6, f"frame {i}: resume step")
 
-  def test_resume_at_minus_216_never_rejected_no_gap_icon_follows_the_frames(self):
-    out = self._replay(lambda i: self.WHEEL)
-    self.assertGreater(sum(a for a, _, _ in out), 20)  # ACTIVE is actually delivered, not an all-INACTIVE pass
-    self._assert_resume_steps(out)
+  def _assert_active_steps(self, out):
+    """Between any two consecutive ACTIVE frames the request never moves more than 1 deg."""
+    for i in range(1, len(out)):
+      if out[i - 1][0] and out[i][0]:
+        self.assertLessEqual(abs(out[i][1] - out[i - 1][1]), 1.0 + 1e-6, f"frame {i}: ACTIVE step")
+
+  def test_resume_at_minus_216_stays_inactive_until_the_wheel_leaves_the_region(self):
+    """Route 39 29:19.6: the blinker pause ends at 4.76 m/s with the wheel at -216 deg. Lateral does not start inside the region (route 45): every
+    frame inactive, accepted, grey; once the driver unwinds below 140 deg steering comes back, ACTIVE steps <= 1 deg."""
+    def wheel_at(i):
+      return self.WHEEL if i < 100 else min(-130.0, self.WHEEL + 1.0 * (i - 100))
+    out = self._replay(wheel_at, frames=300)
+    for i, (active, _, _) in enumerate(out):
+      if abs(wheel_at(i)) > 140.0:
+        self.assertFalse(active, f"frame {i}: ACTIVE inside the region")
+    self.assertGreater(sum(a for a, _, _ in out), 20)  # ACTIVE is actually delivered once out of the region
+    self._assert_active_steps(out)
 
   def test_resume_with_a_slowly_unwinding_wheel(self):
     out = self._replay(lambda i: self.WHEEL + 0.5 * i)
@@ -536,26 +593,30 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self._assert_resume_steps(out)  # 1.3 deg/frame trajectory: steps stay <= 1 deg between ACTIVE frames (inactive where none exists)
 
   def test_guard_boundaries_both_signs(self):
-    """150 / 170 deg wheel and 5 m/s, positive and negative: resume slowly unwinding, model 1.1x the wheel; all frames accepted, steps <= 1 deg."""
+    """150 / 170 deg wheel and 5 m/s, positive and negative: resume slowly unwinding, model 1.1x the wheel; all frames accepted, no ACTIVE while the
+    wheel is in the region (below 6 m/s), steps <= 1 deg."""
     for sign in (1, -1):
       for wheel in (149.0, 151.0, 169.0, 171.0, 216.0):
         for v in (4.9, 5.1):
           with self.subTest(wheel=sign * wheel, v=v):
             self.setUp()
-            out = self._replay(lambda i: sign * (wheel - 0.3 * i), wheel0=sign * wheel, model=sign * wheel * 1.1, v=v)
+            out = self._replay(lambda i: sign * (wheel - 0.3 * i), wheel0=sign * wheel, model=sign * wheel * 1.1, v=v, frames=400)
+            for i, (active, _, _) in enumerate(out):
+              if wheel - 0.3 * i > 140.0:
+                self.assertFalse(active, f"frame {i}: ACTIVE inside the region")
             self.assertGreater(sum(a for a, _, _ in out), 20)
-            self._assert_resume_steps(out)
+            self._assert_active_steps(out)
 
   def test_unsendable_wheel_pauses_with_a_grey_icon(self):
-    """Wheel +-350, model 345 at 4.9 m/s: the model limits leave no legal ACTIVE command. Inactive frames only (one per cycle, accepted), then an
-    explicit pause after the guard time, grey the whole time."""
+    """Steering ACTIVE at 300 deg (4.9 m/s), then the wheel is at +-350 with the model at 345: the model limits leave no legal ACTIVE command. Inactive
+    frames only (one per cycle, accepted), then an explicit pause after the guard time, grey the whole time."""
     from opendbc.car.hyundai import hyundaicanfd
     for sign in (1, -1):
       with self.subTest(sign=sign):
         self.setUp()
+        self._warm(sign * 300.0, 4.9)
+        self.assertFalse(self.cc.takeover.paused)
         paused_at = None
-        for _ in range(100):
-          self._frame(False, sign * 350.0, sign * 345.0, 4.9)
         for i in range(120):
           cb, ok, active, icon, _ = self._frame(True, sign * 350.0, sign * 345.0, 4.9)
           self.assertEqual((len(cb), ok, active), (1, [True], [False]))
@@ -569,7 +630,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
   def test_guard_step_cap_never_exceeds_one_degree_and_tracking_delivers_active(self):
     """last 146, wheel 160 (a contrived gap): the capped step cannot reach the guard's band, so inactive (accepted) and the next frame starts at the wheel;
     then tracking a model that moves 0.5 deg per frame delivers ACTIVE every frame, steps <= 1 deg."""
-    self._replay(lambda i: 160.0, wheel0=160.0, model=160.0, frames=150)
+    self._warm(160.0, self.V)
     self.assertFalse(self.cc.takeover.resuming)
     self.cc.apply_angle_last = 146.0
     self.safety.set_desired_angle_last(1460)
@@ -585,7 +646,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
 
   def test_random_rx_out_of_step_with_controller_updates(self):
     """Random wheel / model / speed walks (rising and falling speed below 6 m/s) with 0-5 extra RX wheel-speed frames the controller never reads
-    between updates: no rejected frame, no gap, ACTIVE steps <= 1 deg, green only with ACTIVE, ACTIVE is delivered."""
+    between updates: no rejected frame, no gap, ACTIVE steps <= 1 deg, green only with ACTIVE, ACTIVE is delivered. Lateral comes on at 130 deg and
+    the wheel turns into the region while ACTIVE (lateral never starts inside it)."""
     import random
     for seed in range(8):
       rng = random.Random(seed)
@@ -593,8 +655,14 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       sign = rng.choice((1, -1))
       wheel = sign * rng.uniform(145.0, 250.0)
       counts = rng.randint(300, 640)
+      w = sign * 130.0
       for _ in range(100):
-        self._frame(False, wheel, wheel, wheel_counts=(counts,) * 4)
+        self._frame(False, w, w, wheel_counts=(counts,) * 4)
+      for _ in range(150):
+        self._frame(True, w, w, wheel_counts=(counts,) * 4)
+      while w != wheel:
+        w += max(-0.5, min(0.5, wheel - w))
+        self._frame(True, w, w, wheel_counts=(counts,) * 4)
       prev, n_active = None, 0
       drift = rng.choice((-3, 0, 3))
       for i in range(300):
@@ -612,12 +680,28 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       self.assertGreater(n_active, 30, f"seed {seed}")
 
 
+  def _enter(self, wheel, counts, v_ego=None, model=None, frames=150):
+    """Lateral on and settled at (wheel, model) at the given raw wheel counts. Lateral never starts inside the guard region, so a target there is
+    entered while ACTIVE: lateral comes on at 130 deg, then the wheel (and the model, same offset) turns in at 0.5 deg per frame, then 50 frames."""
+    model = wheel if model is None else model
+    v = sum(counts) / len(counts) * 0.03125 / 3.6
+    inside = self.cc.takeover.step_capped(wheel, v)
+    w = (130.0 if wheel > 0 else -130.0) if inside else wheel
+    for _ in range(100):
+      self._frame(False, w, w + model - wheel, wheel_counts=counts, v_ego=v_ego)
+    for _ in range(frames):
+      self._frame(True, w, w + model - wheel, wheel_counts=counts, v_ego=v_ego)
+    if inside:
+      while w != wheel:
+        w += max(-0.5, min(0.5, wheel - w))
+        self._frame(True, w, w + model - wheel, wheel_counts=counts, v_ego=v_ego)
+      for _ in range(50):
+        self._frame(True, wheel, model, wheel_counts=counts, v_ego=v_ego)
+    self.assertFalse(self.cc.takeover.paused)  # the ACTIVE path decides the next frames, not a pause
+
   def test_quantised_wheel_speed_repro(self):
     counts = (567, 567, 567, 566)
-    for _ in range(100):
-      self._frame(False, 160.0, 160.0, wheel_counts=counts)
-    for i in range(150):
-      self._frame(True, 160.0, 160.0, wheel_counts=counts)
+    self._enter(160.0, counts)
     self.cc.apply_angle_last = 146.0
     self.safety.set_desired_angle_last(1460)
     cb, ok, active, icon, req = self._frame(True, 161.2, 161.2, wheel_counts=counts)
@@ -627,10 +711,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
   def test_speed_history_out_of_step_with_the_panda_samples(self):
     """R1Guard: warm at 530 counts per wheel, then the panda gets six samples at 565 while the controller reads only the latest once: our history
     still holds the old low speeds, the panda's minimum is the new one. last 146, wheel 161.9: ACTIVE must not be sent unless accepted."""
-    for _ in range(100):
-      self._frame(False, 160.0, 160.0, wheel_counts=(530,) * 4)
-    for _ in range(150):
-      self._frame(True, 160.0, 160.0, wheel_counts=(530,) * 4)
+    self._enter(160.0, (530,) * 4)
     for _ in range(6):
       self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": 565 * 0.03125 for p in ("FL", "FR", "RL", "RR")}))
     self.t += 60000
@@ -732,9 +813,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       sign = rng.choice((1, -1))
       wheel = sign * rng.uniform(150.0, 240.0)
       counts = rng.randint(300, 750)
-      for _ in range(100):
-        self._frame(False, wheel, wheel, wheel_counts=(counts,) * 4)
-      last = None
+      self._enter(wheel, (counts,) * 4)
+      last, n_active = None, 0
       for i in range(250):
         counts = max(250, min(760, counts + rng.randint(-5, 5)))
         extra = [(max(250, min(760, counts + rng.randint(-10, 10))),) * 4 for _ in range(rng.randint(0, 4))]
@@ -752,22 +832,22 @@ class TestBlockedResumeRoute39(unittest.TestCase):
           if self.cc.takeover.resuming:  # R1Guard round 6 nit: the resume window too (limit() saw resuming whenever it is still set after update())
             self.assertLessEqual(abs(req - last), self.cc.takeover.resume_rate + 1e-3, f"seed {seed} frame {i}: resume rate")
             self.assertLessEqual(abs(req - wheel), CONVERGE_DEG + 1e-3, f"seed {seed} frame {i}: resume convergence")
+          n_active += 1
+      self.assertGreater(n_active, 20, f"seed {seed}: the ACTIVE constraints were actually checked")
 
   def test_sendable_turn_is_not_paused(self):
-    """Negative counterpart: wheel 300 at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
-    out = self._replay(lambda i: 300.0, wheel0=300.0, model=300.0, v=4.9, frames=150)
+    """Negative counterpart: steering ACTIVE into a wheel of 300 deg at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
+    counts = self._warm(300.0, 4.9)
+    n_active = sum(self._frame(True, 300.0, 300.0, wheel_counts=counts)[2][0] for _ in range(150))
     self.assertFalse(self.cc.takeover.paused)
-    self.assertGreater(sum(a for a, _, _ in out), 20)
+    self.assertGreater(n_active, 20)
 
   # --- route 3a: a hand on the wheel in the guard region (v < 6 m/s, |wheel| > 140 deg) is a pause, never "holding the curve" ---
 
   def _warm(self, wheel, v, frames=150, model=None):
-    model = wheel if model is None else model
+    """_enter at the wheel counts for speed v; returns the counts."""
     counts = (round(v * 3.6 / 0.03125),) * 4
-    for _ in range(100):
-      self._frame(False, wheel, model, wheel_counts=counts)
-    for _ in range(frames):
-      self._frame(True, wheel, model, wheel_counts=counts)
+    self._enter(wheel, counts, model=model, frames=frames)
     return counts
 
   def test_route_3a_1_31_3_hand_along_the_turn_pauses_without_active_frames(self):
@@ -787,6 +867,35 @@ class TestBlockedResumeRoute39(unittest.TestCase):
           self.assertAlmostEqual(req, wheel, places=4, msg=f"frame {i}: INACTIVE at the measured angle")
           self.assertTrue(self.cc.takeover.paused)
           self.assertEqual(self.cc.apply_torque_last, 0)
+
+  def test_route_45_7_46_7_no_active_re_entry_at_minus_341(self):
+    """Route 45 7:46.7: 0.94 m/s (2.1 mph), wheel -341 deg, the driver's hand 70-187 below the takeover torque, not pressed. Before: after the pause the
+    controller resumed ACTIVE for 14 frames (gain 0.03, request 3 deg from the wheel) and the EPS faulted. Now, closed loop with the real panda: after
+    the takeover no ACTIVE frame while the wheel is in the region (every frame accepted, grey), and steering comes back once it is unwound below
+    140 deg, ACTIVE steps <= 1 deg."""
+    from opendbc.car.hyundai import hyundaicanfd
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        wheel, v = sign * -341.0, 0.94
+        counts = self._warm(wheel, v)
+        self.assertFalse(self.cc.takeover.paused)
+        for _ in range(10):  # the driver takes the wheel
+          self._frame(True, wheel, wheel, wheel_counts=counts, torque=sign * -300.0, pressed=True)
+        self.assertTrue(self.cc.takeover.paused)
+        for i in range(300):  # light hand, then hand off, still at -341
+          cb, ok, active, icon, _ = self._frame(True, wheel, wheel, wheel_counts=counts, torque=sign * -70.0 if i < 150 else 0.0)
+          self.assertEqual((len(cb), ok, active, icon), (1, [True], [False], hyundaicanfd.ICON_PAUSED), f"frame {i}")
+        out, w = [], wheel
+        for _ in range(400):  # the driver unwinds at 1 deg per frame to 120 deg
+          w = (1.0 if w > 0 else -1.0) * max(120.0, abs(w) - 1.0)
+          cb, ok, active, icon, req = self._frame(True, w, w, wheel_counts=counts)
+          self.assertEqual((len(cb), ok), (1, [True]))
+          if abs(w) > 140.0:
+            self.assertFalse(active[0], f"ACTIVE at {w:.0f} deg")
+          out.append((active[0], req, icon))
+        self.assertGreater(sum(a for a, _, _ in out), 100)
+        self._assert_active_steps(out)
 
   def test_route_3a_after_the_eps_flag_no_retry_while_the_hand_holds(self):
     """The flag (steerFaultTemporary 61 frames) in the region, the hand still holds along the turn, also after the wheel unwinds out of the region:
