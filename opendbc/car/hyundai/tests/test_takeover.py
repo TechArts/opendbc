@@ -183,6 +183,22 @@ class TestLowSpeedGuard(unittest.TestCase):
     self.assertEqual(f.limit(140.0, 137.0, 128.0, 6.0), 140.0)  # at 6 m/s and above: unchanged
     self.assertEqual(f.limit(108.0, 105.0, 100.0, 3.2), 108.0)  # within 10 deg of the wheel: unchanged
 
+  def test_lead_band_never_empties_the_quantised_window(self):
+    """R1 (fb39adef): an off-grid last request (133.04) with the panda backstop on the 0.1 deg grid ([132.0, 134.0]) and the band unreachable must
+    still give an ACTIVE request at the reachable edge, not an inactive frame; both rounding directions."""
+    f = make()
+    self.assertEqual(f.limit(140.0, 133.04, 145.0, 3.0, (132.0, 134.0)), 134.0)
+    self.assertEqual(f.limit(150.0, 157.06, 145.0, 3.0, (156.1, 158.1)), 156.1)
+
+  def test_lead_band_keeps_a_slower_resume_rate(self):
+    """R1 (fb39adef): resuming at 0.5 deg per frame, wheel 100, last 80: the band moves the request toward the wheel by the resume rate, not 1 deg."""
+    f = make(rate=5)
+    run(f, 1, v=3.0, angle=100.0, desired=100.0, active=False)
+    run(f, 1, v=3.0, angle=100.0, desired=100.0)
+    self.assertTrue(f.resuming)
+    self.assertEqual(f.limit(100.0, 80.0, 100.0, 3.0), 80.5)
+    self.assertEqual(f.limit(60.0, 80.0, 100.0, 3.0), 80.5)  # a request the other way still only steps 0.5 toward the wheel
+
   def test_cap_binding_pauses_after_half_second_and_stays_until_released(self):
     f = make()
     paused = run(f, GUARD_FRAMES + 5, v=4.0, angle=175.0, desired=205.0)

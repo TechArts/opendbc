@@ -211,37 +211,42 @@ class TakeoverFilter:
     return lo, hi
 
   @staticmethod
-  def lead_band(request: float, last: float, angle: float, v_ego: float) -> tuple[float, float]:
-    """(lo, hi) of the request: the wheel +- LEAD_MAX_ERROR below LEAD_SPEED once the wheel or the request is past LEAD_ANGLE, else unbounded.
-    A last request already outside the band is brought back by at most STEP_CAP_DEG per frame (accepted by the panda below 6 m/s, see window()),
-    so the band alone never leaves the request empty: gradual convergence, not an instant cap."""
+  def lead_band(request: float, lo: float, hi: float, angle: float, v_ego: float) -> float:
+    """The request within [lo, hi] (what may be sent this frame) and, below LEAD_SPEED once the wheel or the request is past LEAD_ANGLE, as close to
+    the wheel +- LEAD_MAX_ERROR as [lo, hi] allows: inside the band where they overlap, else at the edge of [lo, hi] nearest to it. A request already
+    outside the band converges by what [lo, hi] permits (gradual, not an instant cap), and the band never empties [lo, hi]."""
+    limited = float(np.clip(request, lo, hi))
     if v_ego >= LEAD_SPEED or max(abs(angle), abs(request)) <= LEAD_ANGLE:
-      return -math.inf, math.inf
-    return min(angle - LEAD_MAX_ERROR, last + STEP_CAP_DEG), max(angle + LEAD_MAX_ERROR, last - STEP_CAP_DEG)
+      return limited
+    band_lo = min(hi, max(lo, angle - LEAD_MAX_ERROR))
+    band_hi = max(lo, min(hi, angle + LEAD_MAX_ERROR))
+    return float(np.clip(limited, band_lo, band_hi))
 
   def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
     """Applies the low-speed cap, the lead band and the resume blend to a request that already passed the vehicle-model limits.
 
-    Outside the guard region (step_capped false): the resume blend, then the lead band (no change at LEAD_SPEED and above or within LEAD_ANGLE).
-    Inside: the request moved to the nearest point of window() intersected with the lead band and `backstop` (the panda backstop's window from the
-    controller, None when it has none). None: the intersection is empty (a wheel that moves against the band, a step the panda would not accept):
-    send inactive at the measured angle, the next frame starts from there."""
+    Outside the guard region (step_capped false): the resume blend, then the lead band within what may be sent: anything between last and that
+    request (the vehicle-model and resume limits approved it), or a step from last of the resume rate while resuming, else STEP_CAP_DEG (accepted by
+    the panda below 6 m/s, see window()). Nothing changes at LEAD_SPEED and above or within LEAD_ANGLE. Inside: the request moved to the nearest
+    point of window() intersected with `backstop` (the panda backstop's window from the controller, None when it has none), then the lead band within
+    that. None: the intersection is empty (a wheel that moves against the band, a step the panda would not accept): send inactive at the measured
+    angle, the next frame starts from there. The lead band never makes it empty."""
     if not self.enabled:
       return request
     if not self.step_capped(angle, v_ego):
+      step = STEP_CAP_DEG
       if self.resuming:
         request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
         request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
-      lo, hi = self.lead_band(request, last, angle, v_ego)
-      return float(np.clip(request, lo, hi))
+        step = self.resume_rate
+      return self.lead_band(request, min(request, last - step), max(request, last + step), angle, v_ego)
     if backstop is None:
       return None
     lo, hi = self.window(last, angle, v_ego)
-    lead_lo, lead_hi = self.lead_band(request, last, angle, v_ego)
-    lo, hi = max(lo, backstop[0], lead_lo), min(hi, backstop[1], lead_hi)
+    lo, hi = max(lo, backstop[0]), min(hi, backstop[1])
     if lo > hi:
       return None
-    return float(np.clip(request, lo, hi))
+    return self.lead_band(request, lo, hi, angle, v_ego)
 
   def note_unsendable(self, unsendable: bool):
     """Once per frame by the controller: True when lateral is on but no ACTIVE request exists (inactive frame sent instead)."""
