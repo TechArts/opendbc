@@ -180,7 +180,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
       # the low-speed, large-angle guard region (takeover.step_capped): the request is moved to the nearest point of the intersection of the guard band,
       # the resume window, the 1 deg step cap and what the panda accepts at the largest recent speed + 1 m/s (takeover.limit); inactive at the measured
-      # angle if that is empty. Outside the region nothing of this runs: the road-proven path.
+      # angle if that is empty. Outside the region, after the resume blend, only the lead band runs (below 6 m/s with wheel or request past 90 deg: the
+      # request is moved toward the wheel +- 10 deg, keeping the incoming request or one step from last, takeover.lead_band); otherwise the road-proven path.
       in_region = self.takeover.enabled and self.takeover.step_capped(CS.out.steeringAngleDeg, CS.out.vEgo)
       if lat_active and apply_angle is not None:
         backstop = self.panda_check.window(self.apply_angle_last, STEP_CAP_DEG) if in_region else (-math.inf, math.inf)

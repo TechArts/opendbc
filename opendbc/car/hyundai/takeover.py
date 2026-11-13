@@ -2,9 +2,11 @@
 
 While paused the controller sends 0xCB INACTIVE at the measured angle with gain 0 (no counter-force, no angle error for the EPS to fault on).
 When the driver lets go the request is blended back to the model: angle step limited (never more than the resume rate per frame, whatever the
-wheel does; only the low-speed guard's own clips run after it), gain ramped by the controller, and kept within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
+wheel does; the low-speed guard's clips and the lead band that run after it stay within that step), gain ramped by the controller, and kept
+within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
 Lateral never starts (engage, blinker pause end, takeover release) while the wheel still moves faster than that: it stays paused until it calms.
-Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding.
+Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding. Below 6 m/s at large angles the request is also kept from
+running ahead of a lagging wheel (lead_band).
 """
 import math
 from collections import deque
@@ -28,6 +30,15 @@ GUARD_FRAMES = int(0.5 / DT_CTRL)  # the cap must bind this long before it pause
 STEP_CAP_DEG = 1.0  # deg per frame, the most any ACTIVE request moves in the low-speed guard region, see limit()
 STEP_CAP_SPEED = 6.0  # m/s
 STEP_CAP_ANGLE = 140.0  # deg
+
+# route 42 13:12.5-13:13.6 (3.2 m/s, hand off): the model's turn tightened faster than the EPS turned the wheel (about 1 deg per frame), the request
+# ran 11-47 deg ahead (wheel 68 -> 144 deg) and the EPS faulted (AciFltSig_Lv2 = 2, then the camera's FAULT_*) as the wheel passed 140, before the
+# guard's band (> GUARD_ANGLE) applied. Below LEAD_SPEED, once the wheel or the request is past LEAD_ANGLE, the request is moved toward the wheel +-
+# LEAD_MAX_ERROR within what may be sent each frame (lead_band), from either side: while the wheel moves no faster than that allowance, a lead cannot
+# build up and one that exists shrinks. Hands-off turns on routes 40-42 led by at most 7 deg, so the band binds only when request - wheel exceeds it.
+LEAD_SPEED = STEP_CAP_SPEED  # m/s
+LEAD_ANGLE = 90.0  # deg, |wheel| or |request|
+LEAD_MAX_ERROR = GUARD_MAX_ERROR  # deg, |request - measured|
 
 # curve-aware mode (HyundaiCurveHold, research/curve-hold.md Q2/Q5): in a curve only a pull against the turn, or a push deeper than the model
 # asks, is a grab. A hand that holds the wheel along the turn (129 + 103 * a_lat torque once paused) is not.
@@ -202,26 +213,42 @@ class TakeoverFilter:
       lo, hi = max(lo, angle - CONVERGE_DEG, last - self.resume_rate), min(hi, angle + CONVERGE_DEG, last + self.resume_rate)
     return lo, hi
 
-  def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
-    """Applies the low-speed cap and the resume blend to a request that already passed the vehicle-model limits.
+  @staticmethod
+  def lead_band(request: float, lo: float, hi: float, angle: float, v_ego: float) -> float:
+    """The request within [lo, hi] (what may be sent this frame) and, below LEAD_SPEED once the wheel or the request is past LEAD_ANGLE, as close to
+    the wheel +- LEAD_MAX_ERROR as [lo, hi] allows: inside the band where they overlap, else at the edge of [lo, hi] nearest to it. A request already
+    outside the band converges by what [lo, hi] permits (gradual, not an instant cap), and the band never empties [lo, hi]."""
+    limited = float(np.clip(request, lo, hi))
+    if v_ego >= LEAD_SPEED or max(abs(angle), abs(request)) <= LEAD_ANGLE:
+      return limited
+    band_lo, band_hi = np.clip((angle - LEAD_MAX_ERROR, angle + LEAD_MAX_ERROR), lo, hi)  # no overlap: both at the edge of [lo, hi] nearest the band
+    return float(np.clip(limited, band_lo, band_hi))
 
-    Outside the guard region (step_capped false): the resume blend only, as it always was. Inside: the request moved to the nearest point of window()
-    intersected with `backstop` (the panda backstop's window from the controller, None when it has none). None: the intersection is empty (a wheel that
-    moves against the band, a step the panda would not accept): send inactive at the measured angle, the next frame starts from there."""
+  def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
+    """Applies the low-speed cap, the lead band and the resume blend to a request that already passed the vehicle-model limits.
+
+    Outside the guard region (step_capped false): the resume blend, then the lead band within what may be sent: anything between last and that
+    request (the vehicle-model and resume limits approved it), or a step from last of the resume rate while resuming, else STEP_CAP_DEG (accepted by
+    the panda below 6 m/s, see window()). Nothing changes at LEAD_SPEED and above or within LEAD_ANGLE. Inside: the request moved to the nearest
+    point of window() intersected with `backstop` (the panda backstop's window from the controller, None when it has none), then the lead band within
+    that. None: the intersection is empty (a wheel that moves against the band, a step the panda would not accept): send inactive at the measured
+    angle, the next frame starts from there. The lead band never makes it empty."""
     if not self.enabled:
       return request
     if not self.step_capped(angle, v_ego):
+      step = STEP_CAP_DEG
       if self.resuming:
         request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
         request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
-      return request
+        step = self.resume_rate
+      return self.lead_band(request, min(request, last - step), max(request, last + step), angle, v_ego)
     if backstop is None:
       return None
     lo, hi = self.window(last, angle, v_ego)
     lo, hi = max(lo, backstop[0]), min(hi, backstop[1])
     if lo > hi:
       return None
-    return float(np.clip(request, lo, hi))
+    return self.lead_band(request, lo, hi, angle, v_ego)
 
   def note_unsendable(self, unsendable: bool):
     """Once per frame by the controller: True when lateral is on but no ACTIVE request exists (inactive frame sent instead)."""
