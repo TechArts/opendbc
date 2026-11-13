@@ -165,7 +165,39 @@ class TestLowSpeedGuard(unittest.TestCase):
     self.assertIsNone(f.limit(175.0, 140.0, 160.0, 4.0))  # the capped step cannot reach the guard's band: inactive
     self.assertEqual(f.limit(175.0, 160.0, 160.0, 6.0), 175.0)  # above the cap speed
     self.assertEqual(f.limit(215.0, 176.0, 175.0, 6.0), 215.0)  # fast enough
-    self.assertEqual(f.limit(120.0, 100.0, 100.0, 4.0), 120.0)  # small angle
+    self.assertEqual(f.limit(85.0, 80.0, 80.0, 4.0), 85.0)  # small angle (wheel and request within the lead band's LEAD_ANGLE)
+
+  def test_lead_band_keeps_a_low_speed_request_within_10_deg_of_the_wheel(self):
+    """Route 42 13:13.6 (3.2 m/s, hand off): the request ran 11-47 deg ahead of a lagging wheel (68 -> 144 deg) and the EPS faulted as the wheel passed
+    140, before the guard's band (> 150 deg) applied. Below 6 m/s, once the wheel or the request is past 90 deg, the request stays within 10 deg of the
+    wheel; one already further out comes back by at most 1 deg per frame (a step the panda accepts), never an inactive frame."""
+    f = make()
+    self.assertEqual(f.limit(140.0, 137.0, 128.0, 3.2), 138.0)  # 13:13.4 shape: wheel 128, request 140: wheel + 10
+    self.assertEqual(f.limit(-140.0, -137.0, -128.0, 3.2), -138.0)
+    self.assertEqual(f.limit(95.0, 85.0, 80.0, 3.2), 90.0)  # the request alone past 90 deg is enough
+    self.assertEqual(f.limit(130.0, 125.0, 100.0, 3.2), 124.0)  # last 25 deg ahead: back by 1 deg per frame, not to the band in one step
+    self.assertEqual(f.limit(115.0, 125.0, 100.0, 3.2), 115.0)  # a request the vehicle-model limits already brought further back is kept
+    self.assertEqual(f.limit(191.0, 190.0, 144.0, 3.2), 189.0)  # in the step-capped region, 46 deg ahead: same, not inactive
+    self.assertEqual(f.limit(60.0, 70.0, 100.0, 3.2), 71.0)  # the wheel 30 deg ahead (driver turned further): the request catches up by 1 deg per frame
+    self.assertEqual(f.limit(88.0, 84.0, 80.0, 3.2), 88.0)  # both within 90 deg: unchanged
+    self.assertEqual(f.limit(140.0, 137.0, 128.0, 6.0), 140.0)  # at 6 m/s and above: unchanged
+    self.assertEqual(f.limit(108.0, 105.0, 100.0, 3.2), 108.0)  # within 10 deg of the wheel: unchanged
+
+  def test_lead_band_never_empties_the_quantised_window(self):
+    """R1 (fb39adef): an off-grid last request (133.04) with the panda backstop on the 0.1 deg grid ([132.0, 134.0]) and the band unreachable must
+    still give an ACTIVE request at the reachable edge, not an inactive frame; both rounding directions."""
+    f = make()
+    self.assertEqual(f.limit(140.0, 133.04, 145.0, 3.0, (132.0, 134.0)), 134.0)
+    self.assertEqual(f.limit(150.0, 157.06, 145.0, 3.0, (156.1, 158.1)), 156.1)
+
+  def test_lead_band_keeps_a_slower_resume_rate(self):
+    """R1 (fb39adef): resuming at 0.5 deg per frame, wheel 100, last 80: the band moves the request toward the wheel by the resume rate, not 1 deg."""
+    f = make(rate=5)
+    run(f, 1, v=3.0, angle=100.0, desired=100.0, active=False)
+    run(f, 1, v=3.0, angle=100.0, desired=100.0)
+    self.assertTrue(f.resuming)
+    self.assertEqual(f.limit(100.0, 80.0, 100.0, 3.0), 80.5)
+    self.assertEqual(f.limit(60.0, 80.0, 100.0, 3.0), 80.5)  # a request the other way still only steps 0.5 toward the wheel
 
   def test_cap_binding_pauses_after_half_second_and_stays_until_released(self):
     f = make()
@@ -609,8 +641,9 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.assertFalse(icon == 2 and not active[0])
 
   def test_outside_the_guard_region_the_commanded_angle_is_the_vehicle_model_chain(self):
-    """Randomized: wheel <= 140 deg or v >= 6 m/s, no takeover torque. After the resume blend the controller's request is exactly what c8b769bd
-    computed: the two vehicle-model limiter passes from the last request, nothing of the guard-region step cap or backstop on top."""
+    """Randomized: wheel and model within LEAD_ANGLE (90 deg) below 6 m/s, or v >= 6 m/s, no takeover torque. After the resume blend the controller's
+    request is exactly what c8b769bd computed: the two vehicle-model limiter passes from the last request, nothing of the guard-region step cap,
+    lead band or backstop on top."""
     import random
     from opendbc.car.lateral import apply_steer_angle_limits_vm
     from opendbc.car.hyundai.carcontroller import ANGLE_SAFETY_BASELINE_MODEL
@@ -618,7 +651,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       rng = random.Random(seed)
       self.setUp()
       v = rng.choice((3.0, 8.0, 18.0, 19.3, 25.0))
-      wheel_max = 140.0 if v < 6.0 else 250.0
+      wheel_max = 78.0 if v < 6.0 else 250.0  # below 6 m/s: model = wheel +- 12 stays within 90 deg
       counts = (round(v * 3.6 / 0.03125),) * 4
       v = sum(counts) / 4 * 0.03125 / 3.6
       wheel, last = rng.uniform(-wheel_max, wheel_max), None
@@ -805,6 +838,25 @@ class TestBlockedResumeRoute39(unittest.TestCase):
         for i in range(200):
           self._frame(True, wheel, wheel, wheel_counts=counts, torque=300.0, pressed=True)
         self.assertFalse(self.cc.takeover.paused)
+
+  def test_route_42_13_13_a_lagging_wheel_never_falls_more_than_10_deg_behind_the_request(self):
+    """Route 42 13:12.5-13:13.6 shape, closed loop against the real panda: 3.2 m/s, hand off, the model's turn tightens 1.5 deg per frame from 60 to
+    165 deg while the EPS turns the wheel at most 1 deg per frame toward our request. Before: the request ran ahead (47 deg at the wheel's 144 deg in
+    the log), and the guard's band then left no sendable request. Now every frame: one 0xCB, accepted, ACTIVE, the request at most 11 deg ahead of
+    the wheel (the band plus one frame of wheel travel), and the wheel still reaches the model's angle."""
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        v, wheel = 3.2, sign * 60.0
+        counts = self._warm(wheel, v)
+        model = wheel
+        for i in range(200):
+          model = sign * min(165.0, abs(model) + 1.5)
+          cb, ok, active, _, req = self._frame(True, wheel, model, wheel_counts=counts)
+          self.assertEqual((len(cb), ok, active), (1, [True], [True]), f"frame {i}: wheel {wheel:.1f}")
+          self.assertLessEqual(abs(req - wheel), 11.0, f"frame {i}: request {req:.1f}, wheel {wheel:.1f}")
+          wheel += max(-1.0, min(1.0, req - wheel))
+        self.assertAlmostEqual(wheel, model, delta=1.0)
 
 
 class TestPandaAngleCheck(unittest.TestCase):
