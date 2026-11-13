@@ -1496,16 +1496,25 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
   def _lfa_button(self):
     self.safety.set_mads_button_press(1)
 
+  def _camera_standby(self):
+    """the camera reports standby (main on, ACCMode 4) for the frames that end the stock ACC lock"""
+    for _ in range(3):
+      self._camera_acc(4)
+
   def test_brake_hands_back_longitudinal_only(self):
     self._init()
     self._engage_lat()
     self._engage_long()
     self._brake(1)
     self.assertFalse(self.safety.get_controls_allowed())
-    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc_fwd())  # the camera is still engaged along: out of the car until it reports standby, our 'off' frames replace it
+    self.assertTrue(self._scc(0))
+    self.assertFalse(self._scc(1))
     # steering stays with openpilot: a brake edge is not an explicit steering disable, and its trailing frames keep flowing
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
     self.assertTrue(self._cb(False) and self._mdps())
+    self._camera_standby()
+    self.assertTrue(self._scc_fwd())
     self.assertFalse(self._scc(0))  # the camera owns longitudinal again
 
   def test_cancel_hands_back_longitudinal_only(self):
@@ -1513,8 +1522,11 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._engage_lat()
     self._engage_long()
     self._button(self.CANCEL)
-    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc_fwd())
+    self.assertTrue(self._scc(0))
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+    self._camera_standby()
+    self.assertTrue(self._scc_fwd())
 
   def test_main_button_off_hands_back_longitudinal_only(self):
     self._init()
@@ -1527,8 +1539,12 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._button(main=1)  # second press: the camera turns main off
     self._camera_main(0)
     self.assertFalse(self.safety.get_controls_allowed())
-    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc_fwd())
+    self.assertTrue(self._scc(0))
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
+    for _ in range(3):
+      self._camera_acc(0, main=0)
+    self.assertTrue(self._scc_fwd())
 
   def test_lfa_button_never_hands_lateral_back(self):
     # the camera's lane keeping (also enabled again by the Driving Assist/main press or by lane keeping assist) must not steer after the driver's
@@ -1589,6 +1605,8 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self.safety.set_timer(30 * self.S)
     self.assertFalse(self._cb_fwd() or self._mdps_fwd() or self._scc_fwd())
     self._brake(1)  # the next brake releases longitudinal only
+    self.assertFalse(self._scc_fwd())  # (the camera stays out until it reports standby)
+    self._camera_standby()
     self.assertTrue(self._scc_fwd())
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
     self._lfa_button()  # lateral stays with openpilot
@@ -1609,6 +1627,7 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._engage_long()
     self._brake(1)
     self._brake(0)
+    self._camera_standby()
     self.assertTrue(self._scc_fwd())
     self.assertFalse(self._cb_fwd() or self._mdps_fwd())
     self._engage_long()
@@ -1630,9 +1649,10 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._camera_acc(1)  # camera engaged along with openpilot
     self._brake(1)
     self._brake(0)
-    self.assertTrue(self._scc_fwd())
+    self.assertFalse(self._scc_fwd())  # hand-back: the camera, still engaged along, stays out until it reports standby
     self.assertFalse(self.safety.get_controls_allowed())
-    self._camera_acc(4)  # camera: standby
+    for _ in range(3):
+      self._camera_acc(4)  # camera: standby
     self.assertTrue(self._scc_fwd())
 
   def test_camera_acc_on_its_own_is_locked_out(self):
@@ -1888,16 +1908,15 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self.assertTrue(self._scc(0))
     self.assertFalse(self._scc(1))
 
-  def test_release_with_camera_in_standby_blocks_camera_until_permission_ends(self):
+  def test_release_with_camera_in_standby_blocks_camera_until_settled(self):
     self._release_pause()
-    self.safety.set_timer(self.S)  # the CANCEL settle time (HYUNDAI_CANFD_HB_CANCEL_SETTLE_US) is over
-    for _ in range(10):
-      self._camera_acc(4)
-    self.assertFalse(self._scc_fwd())  # permission without ownership: no stock frames even in standby
-    self._brake(1)
-    self._brake(0)
+    self._camera_acc(4)
+    self.assertFalse(self._scc_fwd())  # permission without ownership, the key was just released: no stock frames yet
+    self.safety.set_timer(self.S)  # the key's settle time (HYUNDAI_CANFD_HB_BTN_SETTLE_US) is over
     for _ in range(3):
       self._camera_acc(4)
+    # a declined resume (openpilot never sends) must not leave the car without a 0x1A0 once our off frames stop (python's button_lock, 0.8 s):
+    # the key's lock ends after the settle time and the standby frames, whatever controls_allowed says (R1 on be7fd3cd)
     self.assertTrue(self._scc_fwd())
 
   # --- policy: during a pause-key hold any brake press, main change or heartbeat/lag fault disarms the pending resume; the release only pauses
@@ -1959,6 +1978,180 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
           self._init(long)
           self._rx(addr, bus, length)
           self.assertEqual(expected, self.safety.get_relay_malfunction())
+
+  # --- ownership switches replayed slot by slot (routes 3a/3b/3d). In each 20 ms slot the real order is: driver events on
+  # bus 0, the camera's 0x1A0 on bus 2 (fwd decision, then rx), our 0x1A0 on bus 0 (tx hook). The camera's ACC-active frame (ACCMode 1/2) must never reach
+  # the car around an ownership switch, and with our frames on time every slot has exactly one frame at the car: no gap, no two senders.
+  def _slot(self, cam=None, ours=None, events=(), cam_main=1):
+    self.safety.set_timer(self.safety_t)
+    self.safety_t += 20_000
+    for event in events:
+      event()
+    cam_reached = False
+    if cam is not None:
+      cam_reached = self._scc_fwd()
+      self.assertFalse(cam_reached and cam in (1, 2), f"camera ACCMode {cam} frame reached the car")
+      self._cam_counter = (getattr(self, "_cam_counter", 0) + 1) % 256  # the rx check wants a moving counter, or controls drop after a few frames
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": cam_main, "ACCMode": cam, "COUNTER": self._cam_counter}))
+    ours_reached = bool(ours is not None and self._scc(ours))
+    return cam_reached, ours_reached
+
+  def _one_sender_per_slot(self, slots):
+    for i, (cam_reached, ours_reached) in enumerate(slots):
+      self.assertEqual(1, int(cam_reached) + int(ours_reached), f"slot {i}: camera {cam_reached}, ours {ours_reached}")
+
+  def _main_engage(self, python_late=0):
+    """route 3a 28.7 / 1:13.9, 3b 4:50.3 / 9:31.2, 3d 5:40.7: standby with main off, the press (repeated while down), the camera's main and ACC rise one
+    frame after the first press frame, our first active frame two slots later; python's 'off' frame (python_late=0) fills the slot in between.
+    Returns the slots from the camera's rising frame on."""
+    self._init()
+    self.safety_t = self.S
+    for _ in range(5):
+      self._slot(cam=0, cam_main=0)
+    press = lambda: self._button(main=1)  # noqa: E731
+    self._slot(cam=0, cam_main=0, events=[press])
+    slots = [self._slot(cam=1, ours=0 if not python_late else None, events=[press])]  # the rising frame: ACCMode 1 with main 1
+    slots.append(self._slot(cam=1, ours=1, events=[press]))
+    slots.append(self._slot(cam=1, ours=1, events=[lambda: self._button(main=0)]))
+    slots.extend(self._slot(cam=1, ours=1) for _ in range(5))
+    return slots
+
+  def test_main_engage_no_camera_acc_frame_reaches_car(self):
+    slots = self._main_engage()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._one_sender_per_slot(slots)
+    self.assertEqual([False] * len(slots), [cam for cam, _ in slots])
+
+  def test_main_engage_python_late_only_costs_its_own_slot(self):
+    # no 'off' frame of ours in the rising slot: the camera is out all the same, the car misses that one slot
+    slots = self._main_engage(python_late=1)
+    self.assertEqual([(False, False)] + [(False, True)] * 7, slots)
+
+  def _joint_slots(self, cam_modes, press_slots, enabled_from=None, cancel=False, main_slots=()):
+    """python's real CameraHandback decides per slot whether we send (ACCMode 0 while not enabled, 1 once enabled), libsafety decides what reaches the car.
+    The camera's main is off until the press ends, then on; cam_modes[i] is the camera's ACCMode in slot i (standby 4 / engaged along 1). Returns the
+    (camera reached, ours reached) per slot, python's send flag and controls_allowed."""
+    from types import SimpleNamespace
+    from collections import deque
+    from opendbc.car.hyundai.handback import CameraHandback
+    hb = CameraHandback()
+    cs = SimpleNamespace(cruise_buttons=deque([0] * 4, maxlen=4), main_buttons=deque([0] * 4, maxlen=4), cruise_info={}, cam_lfa_icon=None, cam_lka_ind=None,
+                         out=SimpleNamespace(cruiseState=SimpleNamespace(available=False), brakePressed=False, buttonEvents=[]))
+    self._init()
+    self.safety_t = self.S
+    out, cam_main, frame = [], 0, 2
+    for i, cam in enumerate(cam_modes):
+      pressed = i in press_slots
+      cs.cruise_buttons.append(4 if (pressed and cancel) else 0)
+      cs.main_buttons.append(1 if ((pressed and not cancel) or i in main_slots) else 0)
+      cs.out.cruiseState.available = bool(cam_main) or cancel
+      cs.cruise_info = {"ACCMode": cam}
+      enabled = enabled_from is not None and i >= enabled_from
+      cc = SimpleNamespace(enabled=enabled, latActive=False)
+      _, send = hb.update(cc, cs, True, frame)
+      frame += 2
+      # the camera's main rises with the end of the press (20 ms after its first frame in the logs, here after the last)
+      cam_main = 1 if (cancel or i >= max(press_slots) + 1) else 0
+      key = (lambda: self._button(self.CANCEL if pressed else 0, main=1 if i in main_slots else 0)) if cancel else (lambda: self._button(main=1 if pressed else 0))
+      reached = self._slot(cam=cam, ours=(1 if enabled and not hb.cutoff else 0) if send else None, events=[key], cam_main=cam_main)
+      out.append((reached, send, self.safety.get_controls_allowed()))
+    return out
+
+  def test_declined_main_engage_no_empty_slot_no_camera_acc_frame(self):
+    # R1 on bb30b3e8: the press is declined (python never enables), the camera's main rises with ACCMode 4 and the panda grants controls_allowed.
+    # Every slot after the press has exactly one sender (the camera's standby frames or our off frames), the camera's ACC-active frame never passes.
+    slots = self._joint_slots([4] * 80, press_slots={5, 6, 7})
+    self.assertTrue(any(ctl for _, _, ctl in slots))
+    for i, (reached, _, _) in enumerate(slots[6:], start=6):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+    self.assertTrue(slots[-1][0][0] and not slots[-1][0][1])  # the camera's standby frames flow again at the end
+
+  def test_declined_main_engage_camera_engages_no_empty_slot(self):
+    # the camera's ACC engages with the press and openpilot declines: its frames stay out, our off frames replace them for as long as it is engaged
+    slots = self._joint_slots([4] * 6 + [1] * 30 + [4] * 60, press_slots={5, 6, 7})
+    for i, (reached, _, _) in enumerate(slots[8:], start=8):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+
+  def test_declined_pause_resume_no_empty_slot_no_camera_acc_frame(self):
+    # R1 on be7fd3cd: CANCEL press/release in standby grants controls_allowed (pause key = resume), openpilot declines: same hole, same bounded release
+    slots = self._joint_slots([4] * 80, press_slots={5, 6, 7}, cancel=True)
+    self.assertTrue(any(ctl for _, _, ctl in slots[8:]))
+    for i, (reached, _, _) in enumerate(slots[6:], start=6):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+    self.assertTrue(slots[-1][0][0] and not slots[-1][0][1])
+
+  def test_declined_pause_resume_then_main_off_press_no_empty_slot(self):
+    # R1 on dec8d609: a main press that turns main off (camera main on) while the CANCEL lock settles must not drop python's off frames
+    slots = self._joint_slots([4] * 100, press_slots={5, 6, 7}, cancel=True, main_slots={10, 11})
+    for i, (reached, _, _) in enumerate(slots[6:], start=6):
+      self.assertEqual(1, int(reached[0]) + int(reached[1]), f"slot {i}: {slots[i]}")
+
+  def test_main_press_with_camera_main_on_does_not_lock(self):
+    # the press that turns main off: nothing engages, the camera's frames flow
+    self._init()
+    self.safety_t = self.S
+    self._slot(cam=4)
+    for _ in range(3):
+      self.assertTrue(self._slot(cam=4, events=[lambda: self._button(main=1)])[0])
+    self.assertTrue(self._slot(cam=0, cam_main=0, events=[lambda: self._button(main=0)])[0])
+
+  def _engaged_after_main(self):
+    """openpilot owns 0x1A0 (engaged by the main press as in test_main_engage_no_camera_acc_frame_reaches_car), the camera engaged along and blocked"""
+    self._init()
+    self.safety_t = self.S
+    self._button(main=1)
+    self._camera_main(1)
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self._scc(1))
+    self._one_sender_per_slot([self._slot(cam=1, ours=1) for _ in range(3)])
+
+  def _disengage_slots(self, driver_event, python_late=0, camera_active=6, hold=1, tail=8):
+    """the driver event (repeated for `hold` slots), then openpilot's frames (active ones for `python_late` slots, then 'off'), the camera, engaged
+    along, stays active for `camera_active` slots and reports standby after that; returns all slots from the event on"""
+    return [self._slot(cam=1 if i < camera_active else 4, ours=1 if i < python_late else 0, events=[driver_event] if i < hold else [])
+            for i in range(camera_active + tail)]
+
+  def test_brake_disengage_camera_acc_frame_never_reaches_car(self):
+    # 3b 5:23.7 (aReq -3.88 in an FCW stop), 10:03.9, 3d 6:16.3
+    self._engaged_after_main()
+    slots = self._disengage_slots(lambda: self._brake(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._one_sender_per_slot(slots)
+    self.assertEqual([False] * 6, [cam for cam, _ in slots[:6]])  # the camera is active: none of its frames reaches the car
+    self.assertEqual([(True, False)] * 4, slots[-4:])  # standby again: its frames flow, ours are rejected
+
+  def test_brake_disengage_python_late_only_costs_its_own_slots(self):
+    # openpilot still sends active frames for 2 slots after the brake (the panda rejects them): the car misses exactly those slots, and never gets the
+    # camera's ACC frame in them
+    self._engaged_after_main()
+    slots = self._disengage_slots(lambda: self._brake(1), python_late=2)
+    self.assertEqual([(False, False)] * 2, slots[:2])
+    self._one_sender_per_slot(slots[2:])
+
+  def test_cancel_disengage_camera_acc_frame_never_reaches_car(self):
+    # 3d 5:57.0: CANCEL held 3 slots, the camera stays engaged 6 slots, the lock holds 0.6 s after the last CANCEL frame
+    self._engaged_after_main()
+    slots = self._disengage_slots(lambda: self._button(self.CANCEL), hold=3, tail=45)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._one_sender_per_slot(slots)
+    self.assertEqual([False] * 6, [cam for cam, _ in slots[:6]])
+    self.assertEqual([(True, False)] * 4, slots[-4:])
+
+  def test_cancel_disengage_python_late_only_costs_its_own_slots(self):
+    self._engaged_after_main()
+    slots = self._disengage_slots(lambda: self._button(self.CANCEL), python_late=3, hold=3, tail=45)
+    self.assertEqual([(False, False)] * 3, slots[:3])
+    self._one_sender_per_slot(slots[3:])
+
+  def test_main_off_disengage_camera_acc_frame_never_reaches_car(self):
+    # second main press while engaged: the camera's main falls (its frames are main 0 from then on)
+    self._engaged_after_main()
+    slots = [self._slot(cam=1 if i == 0 else 0, ours=1 if i == 0 else 0, cam_main=1 if i == 0 else 0,
+                        events=[lambda: self._button(main=1)] if i == 0 else [])
+             for i in range(9)]
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertEqual([(False, True)] * 5 + [(True, False)] * 4, slots)  # standby for 3 frames, then the camera's frames flow again
 
   def test_camera_frames_forwarded_do_not_trip_relay(self):
     self._init()

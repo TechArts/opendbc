@@ -391,9 +391,10 @@ class TestCarControllerHandback(unittest.TestCase):
     self.cs.cruise_info["ACCMode"] = 4  # camera back in standby: silent again
     self.assertNotIn(0x1A0, self._msgs(enabled=False, frame=2 + 5000))
 
-  def _step(self, key=None, available=True, enabled=False, brake=False):
-    """one controller frame (off the icon cadence). key True / False presses / releases the physical CANCEL key. The key is read from the raw
-    state (cruise_buttons); the event it makes is rewritten to resumeCruise like card's PauseResumeKey does in standby. Returns (addresses, 0x1A0)"""
+  def _step(self, key=None, available=True, enabled=False, brake=False, main=None):
+    """one controller frame (off the icon cadence). key True / False presses / releases the physical CANCEL key, main True / False the main (Driving
+    Assist) button. The key is read from the raw state (cruise_buttons); the event it makes is rewritten to resumeCruise like card's PauseResumeKey does in
+    standby. Returns (addresses, 0x1A0)"""
     if self.cc.frame % 5 == 0:
       self.cc.frame += 2
     if key is not None:
@@ -402,6 +403,11 @@ class TestCarControllerHandback(unittest.TestCase):
     else:
       self.cs.cruise_buttons.append(self.cs.cruise_buttons[-1])
       self.cs.out.buttonEvents = []
+    if main is not None:
+      self.cs.main_buttons.append(1 if main else 0)
+      self.cs.out.buttonEvents = [structs.CarState.ButtonEvent(type=ButtonType.mainCruise, pressed=main)]
+    else:
+      self.cs.main_buttons.append(self.cs.main_buttons[-1])
     self.cs.out.cruiseState.available = available
     self.cs.out.brakePressed = brake
     cc = structs.CarControl()
@@ -462,6 +468,65 @@ class TestCarControllerHandback(unittest.TestCase):
     self.cc.frame = 6
     msgs = self.cc.create_canfd_msgs(False, 0, 0.0, 0.0, False, self.hud, self.cs, structs.CarControl())
     self.assertIn(0x1A0, {m[0] for m in msgs})
+
+  def _scc_fields(self, dat):
+    parser = CANParser(DBC_NAME, [("SCC_CONTROL", 0)], 0)
+    parser.update([(0, [(0x1A0, dat, 0)])])
+    return parser.vl["SCC_CONTROL"]["ACCMode"], parser.vl["SCC_CONTROL"]["aReqValue"], parser.vl["SCC_CONTROL"]["aReqRaw"]
+
+  def test_off_frame_carries_no_request(self):
+    # route 3d 5:57.0: an 'off' frame with the controller's residual request (0.01, 3b: -3.5) is rejected by the panda: a frame lost
+    self.cc.tuning.actual_accel = -3.5
+    self._msgs(steer_req=True, enabled=True)
+    self.assertEqual((1, -3.5, -3.5), self._scc_fields(self._last_scc))
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}  # camera ACC engaged: the lock sends 'off'
+    self._msgs(enabled=False)
+    self.assertEqual((0, 0, 0), self._scc_fields(self._last_scc))
+
+  def test_driver_action_turns_frames_off_before_enabled_follows(self):
+    # routes 3b/3d: the controller's enabled flag follows a driver action 1-3 frames late; the panda rejects our active frames from the action on, and
+    # the camera's frame is blocked: the car would see no 0x1A0 at all in those slots
+    self.cc.tuning.actual_accel = -3.5
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}
+    self.assertEqual(1, self._scc_fields(self._step(enabled=True)[1])[0])
+    sent, dat = self._step(enabled=True, brake=True)  # brake edge, enabled still true
+    self.assertEqual((0, 0, 0), self._scc_fields(dat))
+    self.assertEqual((0, 0, 0), self._scc_fields(self._step(enabled=True, brake=True)[1]))  # a frame later, still true
+    self.assertEqual((0, 0, 0), self._scc_fields(self._step(enabled=False, brake=True)[1]))
+    self.assertEqual(1, self._scc_fields(self._step(enabled=True)[1])[0])  # engaged again after that: active frames
+
+  def test_cancel_press_turns_frames_off_while_enabled(self):
+    self.assertEqual(1, self._scc_fields(self._step(enabled=True)[1])[0])
+    self.assertEqual(0, self._scc_fields(self._step(True, enabled=True)[1])[0])  # the press frame
+    self.assertEqual(0, self._scc_fields(self._step(enabled=True)[1])[0])  # key down, enabled not yet false
+    self.assertEqual(0, self._scc_fields(self._step(enabled=False)[1])[0])
+
+  def test_main_press_while_engaged_turns_frames_off(self):
+    self.assertEqual(1, self._scc_fields(self._step(enabled=True)[1])[0])
+    self.assertEqual(0, self._scc_fields(self._step(main=True, enabled=True)[1])[0])
+
+  def test_engage_press_sends_off_frames_until_settled(self):
+    # route 3a 28.7: the panda blocks the camera's 0x1A0 from the main press (camera main off), the camera's ACC rises with its main 20 ms later:
+    # our off frames from the press on, every frame while the key is down and until 0.8 s after the release
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 0}
+    self.assertNotIn(0x1A0, self._step(available=False)[0])
+    sent, dat = self._step(main=True, available=False)
+    self.assertIn(0x1A0, sent)
+    self.assertEqual((0, 0, 0), self._scc_fields(dat))
+    for _ in range(10):
+      self.assertIn(0x1A0, self._step(available=False)[0])
+    self.assertIn(0x1A0, self._step(main=False, available=True)[0])
+    for _ in range(25):
+      self.assertIn(0x1A0, self._step(available=True)[0])
+    for _ in range(30):
+      sent = self._step(available=True)[0]
+    self.assertNotIn(0x1A0, sent)  # settled
+
+  def test_main_press_with_camera_main_on_sends_nothing(self):
+    # the press that turns main off: the panda does not arm
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 4}
+    for _ in range(5):
+      self.assertNotIn(0x1A0, self._step(main=True, available=True)[0])
 
   def test_stock_acc_not_locked_while_openpilot_engaged(self):
     self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0, "ACCMode": 1}
