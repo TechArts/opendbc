@@ -680,12 +680,28 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       self.assertGreater(n_active, 30, f"seed {seed}")
 
 
+  def _enter(self, wheel, counts, v_ego=None, model=None, frames=150):
+    """Lateral on and settled at (wheel, model) at the given raw wheel counts. Lateral never starts inside the guard region, so a target there is
+    entered while ACTIVE: lateral comes on at 130 deg, then the wheel (and the model, same offset) turns in at 0.5 deg per frame, then 50 frames."""
+    model = wheel if model is None else model
+    v = sum(counts) / len(counts) * 0.03125 / 3.6
+    inside = self.cc.takeover.step_capped(wheel, v)
+    w = (130.0 if wheel > 0 else -130.0) if inside else wheel
+    for _ in range(100):
+      self._frame(False, w, w + model - wheel, wheel_counts=counts, v_ego=v_ego)
+    for _ in range(frames):
+      self._frame(True, w, w + model - wheel, wheel_counts=counts, v_ego=v_ego)
+    if inside:
+      while w != wheel:
+        w += max(-0.5, min(0.5, wheel - w))
+        self._frame(True, w, w + model - wheel, wheel_counts=counts, v_ego=v_ego)
+      for _ in range(50):
+        self._frame(True, wheel, model, wheel_counts=counts, v_ego=v_ego)
+    self.assertFalse(self.cc.takeover.paused)  # the ACTIVE path decides the next frames, not a pause
+
   def test_quantised_wheel_speed_repro(self):
     counts = (567, 567, 567, 566)
-    for _ in range(100):
-      self._frame(False, 160.0, 160.0, wheel_counts=counts)
-    for i in range(150):
-      self._frame(True, 160.0, 160.0, wheel_counts=counts)
+    self._enter(160.0, counts)
     self.cc.apply_angle_last = 146.0
     self.safety.set_desired_angle_last(1460)
     cb, ok, active, icon, req = self._frame(True, 161.2, 161.2, wheel_counts=counts)
@@ -695,10 +711,7 @@ class TestBlockedResumeRoute39(unittest.TestCase):
   def test_speed_history_out_of_step_with_the_panda_samples(self):
     """R1Guard: warm at 530 counts per wheel, then the panda gets six samples at 565 while the controller reads only the latest once: our history
     still holds the old low speeds, the panda's minimum is the new one. last 146, wheel 161.9: ACTIVE must not be sent unless accepted."""
-    for _ in range(100):
-      self._frame(False, 160.0, 160.0, wheel_counts=(530,) * 4)
-    for _ in range(150):
-      self._frame(True, 160.0, 160.0, wheel_counts=(530,) * 4)
+    self._enter(160.0, (530,) * 4)
     for _ in range(6):
       self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": 565 * 0.03125 for p in ("FL", "FR", "RL", "RR")}))
     self.t += 60000
@@ -800,9 +813,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
       sign = rng.choice((1, -1))
       wheel = sign * rng.uniform(150.0, 240.0)
       counts = rng.randint(300, 750)
-      for _ in range(100):
-        self._frame(False, wheel, wheel, wheel_counts=(counts,) * 4)
-      last = None
+      self._enter(wheel, (counts,) * 4)
+      last, n_active = None, 0
       for i in range(250):
         counts = max(250, min(760, counts + rng.randint(-5, 5)))
         extra = [(max(250, min(760, counts + rng.randint(-10, 10))),) * 4 for _ in range(rng.randint(0, 4))]
@@ -820,6 +832,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
           if self.cc.takeover.resuming:  # R1Guard round 6 nit: the resume window too (limit() saw resuming whenever it is still set after update())
             self.assertLessEqual(abs(req - last), self.cc.takeover.resume_rate + 1e-3, f"seed {seed} frame {i}: resume rate")
             self.assertLessEqual(abs(req - wheel), CONVERGE_DEG + 1e-3, f"seed {seed} frame {i}: resume convergence")
+          n_active += 1
+      self.assertGreater(n_active, 20, f"seed {seed}: the ACTIVE constraints were actually checked")
 
   def test_sendable_turn_is_not_paused(self):
     """Negative counterpart: steering ACTIVE into a wheel of 300 deg at 4.9 m/s has a legal ACTIVE command, lateral stays on without a pause."""
@@ -831,23 +845,9 @@ class TestBlockedResumeRoute39(unittest.TestCase):
   # --- route 3a: a hand on the wheel in the guard region (v < 6 m/s, |wheel| > 140 deg) is a pause, never "holding the curve" ---
 
   def _warm(self, wheel, v, frames=150, model=None):
-    """Lateral on and settled at (wheel, model). Lateral never starts inside the guard region, so a target there is entered while ACTIVE: lateral
-    comes on at 130 deg, then the wheel (and the model, same offset) turns in at 0.5 deg per frame and settles for 50 frames."""
-    model = wheel if model is None else model
+    """_enter at the wheel counts for speed v; returns the counts."""
     counts = (round(v * 3.6 / 0.03125),) * 4
-    inside = self.cc.takeover.step_capped(wheel, v)
-    w = (130.0 if wheel > 0 else -130.0) if inside else wheel
-    m = w + (model - wheel)
-    for _ in range(100):
-      self._frame(False, w, m, wheel_counts=counts)
-    for _ in range(frames):
-      self._frame(True, w, m, wheel_counts=counts)
-    if inside:
-      while w != wheel:
-        w += max(-0.5, min(0.5, wheel - w))
-        self._frame(True, w, w + (model - wheel), wheel_counts=counts)
-      for _ in range(50):
-        self._frame(True, wheel, model, wheel_counts=counts)
+    self._enter(wheel, counts, model=model, frames=frames)
     return counts
 
   def test_route_3a_1_31_3_hand_along_the_turn_pauses_without_active_frames(self):
