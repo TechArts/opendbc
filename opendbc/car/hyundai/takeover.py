@@ -128,11 +128,13 @@ class TakeoverFilter:
     self.strict_calm_frames = self.strict_calm_frames + 1 if abs(torque) < self.release_torque and not pressed else 0
     if self.strict and self.strict_calm_frames >= self.hold_frames and self.fault_frames == 0:
       self.strict = False
+    in_region = self.step_capped(angle, v_ego)
     if not self.lat_active_last:
-      # lateral just came back (engage, blinker pause, MADS pause, fault): blend in like after a takeover, never snap to the model
+      # lateral just came back (engage, blinker pause, MADS pause, fault): blend in like after a takeover, never snap to the model. Inside the guard
+      # region it does not start at all (see the release below): it starts paused, so the controller sends inactive at the measured angle
       self.resuming = True
       self.resume_frames = RESUME_FRAMES
-      if fast:
+      if fast or in_region:
         self.paused = True
         self.resuming = False
         self.release_frames = 0
@@ -174,7 +176,10 @@ class TakeoverFilter:
         calm = along > -self.release_torque and not beyond  # however hard the hand holds along the turn (data: 270-490 at 0.5-2 m/s^2)
       calm = calm and not fast
       self.release_frames = self.release_frames + 1 if calm else 0
-      if self.release_frames >= self.hold_frames and self.fault_frames == 0 and not binds:
+      # route 45 7:46.7 (0.94 m/s, wheel -341 deg, light hand): a release inside the guard region gave 14 ACTIVE frames at gain 0.03, request 3 deg from
+      # the wheel, and the EPS faulted (as on route 3a). No ACTIVE re-entry inside the region: a pause holds until the wheel is back under
+      # STEP_CAP_ANGLE or the speed is STEP_CAP_SPEED or more (steering that is already ACTIVE when the wheel enters the region continues)
+      if self.release_frames >= self.hold_frames and self.fault_frames == 0 and not binds and not in_region:
         self.paused = False
         self.resuming = True
         self.resume_frames = RESUME_FRAMES
