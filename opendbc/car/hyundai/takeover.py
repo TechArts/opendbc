@@ -4,7 +4,8 @@ While paused the controller sends 0xCB INACTIVE at the measured angle with gain 
 When the driver lets go the request is blended back to the model: angle step limited (never more than the resume rate per frame, whatever the
 wheel does; only the low-speed guard's own clips run after it), gain ramped by the controller, and kept within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
 Lateral never starts (engage, blinker pause end, takeover release) while the wheel still moves faster than that: it stays paused until it calms.
-Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding.
+Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding. Below 6 m/s at large angles the request is also kept from
+running ahead of a lagging wheel (lead_band).
 """
 import math
 from collections import deque
@@ -31,8 +32,9 @@ STEP_CAP_ANGLE = 140.0  # deg
 
 # route 42 13:12.5-13:13.6 (3.2 m/s, hand off): the model's turn tightened faster than the EPS turned the wheel (about 1 deg per frame), the request
 # ran 11-47 deg ahead (wheel 68 -> 144 deg) and the EPS faulted (AciFltSig_Lv2 = 2, then the camera's FAULT_*) as the wheel passed 140, before the
-# guard's band (> GUARD_ANGLE) applied. Below LEAD_SPEED, once the wheel or the request is past LEAD_ANGLE, the request stays within LEAD_MAX_ERROR
-# of the wheel (lead_band). Hands-off turns on routes 40-42 led by at most 7 deg, so the band binds only when the wheel falls behind.
+# guard's band (> GUARD_ANGLE) applied. Below LEAD_SPEED, once the wheel or the request is past LEAD_ANGLE, the request is moved toward the wheel +-
+# LEAD_MAX_ERROR within what may be sent each frame (lead_band): a lead cannot build up, one that exists converges. Hands-off turns on routes 40-42
+# led by at most 7 deg, so the band binds only when the wheel falls behind.
 LEAD_SPEED = STEP_CAP_SPEED  # m/s
 LEAD_ANGLE = 90.0  # deg, |wheel| or |request|
 LEAD_MAX_ERROR = GUARD_MAX_ERROR  # deg, |request - measured|
@@ -218,8 +220,7 @@ class TakeoverFilter:
     limited = float(np.clip(request, lo, hi))
     if v_ego >= LEAD_SPEED or max(abs(angle), abs(request)) <= LEAD_ANGLE:
       return limited
-    band_lo = min(hi, max(lo, angle - LEAD_MAX_ERROR))
-    band_hi = max(lo, min(hi, angle + LEAD_MAX_ERROR))
+    band_lo, band_hi = np.clip((angle - LEAD_MAX_ERROR, angle + LEAD_MAX_ERROR), lo, hi)  # no overlap: both at the edge of [lo, hi] nearest the band
     return float(np.clip(limited, band_lo, band_hi))
 
   def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
