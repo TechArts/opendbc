@@ -326,8 +326,8 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
     "ACCMode": 0 if not enabled else (2 if gas_override else 1),
     "MainMode_ACC": 1 if main_cruise_enabled else 0,
     "StopReq": 1 if tuning.stopping else 0,
-    "aReqValue": tuning.actual_accel,
-    "aReqRaw": tuning.actual_accel,
+    "aReqValue": tuning.actual_accel if enabled else 0,  # an 'off' frame (ACCMode 0) carries no request: the panda rejects it with one (3d 5:57.0: 0.01)
+    "aReqRaw": tuning.actual_accel if enabled else 0,
     "VSetDis": set_speed,
     "JerkLowerLimit": tuning.jerk_lower,
     "JerkUpperLimit": tuning.jerk_upper,

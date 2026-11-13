@@ -386,7 +386,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       if self.frame % 2 == 0:
         if send_long:
           scc_counter = self.handback.scc_counter.next(CS.cruise_info.get("COUNTER")) if self.handback else None
-          can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
+          acc_enabled = CC.enabled and not (self.handback and self.handback.cutoff)  # driver action this frame: 'off' already (panda rejects active)
+          can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, acc_enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
                                                            set_speed_in_units, hud_control, self.lead_data, CS.main_cruise_enabled, self.tuning,
                                                            CS.cruise_info if ccnc_non_hda2 else None, scc_counter))
         self.accel_last = accel

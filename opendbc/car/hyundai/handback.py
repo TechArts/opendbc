@@ -11,13 +11,17 @@ openpilot frame until the axis is no longer allowed AND the driver acted. openpi
     action, and stops TAIL_FRAMES after the driver action: the panda hands the axis back at the first moment the permission is gone after the
     action (the heartbeat mismatch takes ~3 s), and rejects any frame of ours from then on, so a long tail is harmless and a short one is not.
 Without a driver action it keeps sending 'off' frames: the car sees a benign off state, the stock camera does not take over unannounced.
+Ownership switches: the camera's ACC-active 0x1A0 never reaches the car at a switch, the panda blocks it from the
+engage press / the driver action until the camera reports standby. Our frames must be there in the same 20 ms slots, so: the engage press (main, camera main
+off) and CANCEL lock like the panda does (button_lock), and the driver action (brake edge, CANCEL, main) turns our frames to 'off' at once, from the
+car state of this very frame, not from CC.enabled which is a controller cycle or two behind (cutoff).
 """
 from opendbc.car import DT_CTRL, structs
 from opendbc.car.hyundai.values import Buttons
 
 TAIL_FRAMES = int(6.0 / DT_CTRL)         # > the panda's ~3 s heartbeat mismatch + margin
 RECENT_ACTION_FRAMES = int(1.0 / DT_CTRL)  # a driver action this close before the axis went inactive is its reason
-CANCEL_SETTLE_FRAMES = int(0.8 / DT_CTRL)  # panda HYUNDAI_CANFD_HB_CANCEL_SETTLE_US 0.6 s after the last CANCEL frame, plus our CAN latency
+BUTTON_SETTLE_FRAMES = int(0.8 / DT_CTRL)  # panda HYUNDAI_CANFD_HB_BTN_SETTLE_US 0.6 s after the last CANCEL / main frame, plus our CAN latency
 
 
 class AxisOwner:
@@ -124,27 +128,36 @@ class CameraHandback:
     self.lfa_alt_counter = CounterFollower(1 << 16)
     self.scc_counter = CounterFollower(1 << 16)
     self.prev_brake_pressed = False
-    self.cancel_armed = False                  # a CANCEL press started with the camera main on and no openpilot ownership: the panda locks 0x1A0
+    self.button_armed = False                  # CANCEL press (camera main on) / engage press (camera main off) without ownership: the panda locks 0x1A0
     self.cancel_down = False
-    self.cancel_release_frame: int | None = None
+    self.cancel_edge = False
+    self.main_down = False
+    self.button_release_frame: int | None = None
+    self.cutoff = False                        # a driver action ended the engagement and CC.enabled has not followed yet: 'off' frames from now on
 
-  def cancel_lock(self, CS, frame: int) -> bool:
-    """Mirror of the panda's CANCEL pre-arm (hyundai_canfd.h): from the CANCEL press until CANCEL_SETTLE_FRAMES after its release the camera's 0x1A0 is
-    blocked (the camera resumes its own ACC on the release), so our 'off' frames must already be there, or the car sees no 0x1A0. Read from the raw
-    key state (CS.cruise_buttons), not from the button events: card's PauseResumeKey rewrites the standby CANCEL events to resumeCruise before the
-    controller sees them. Armed whatever the ownership tail says: the panda arms on its own state (a brake or CANCEL ended its ownership), frames we
-    send while it did not arm are rejected, harmless like the tail; a missing frame during a long hold is a 0x1A0 gap."""
-    down = CS.cruise_buttons[-1] == Buttons.CANCEL
-    if down and not self.cancel_down:
-      self.cancel_armed = bool(CS.out.cruiseState.available)
-    elif not down and self.cancel_down:
-      self.cancel_release_frame = frame
-    self.cancel_down = down
-    if not self.cancel_armed:
+  def button_lock(self, CS, frame: int) -> bool:
+    """Mirror of the panda's button pre-arm (hyundai_canfd.h): from the CANCEL press (camera main on) or the engage press (main button, camera main off) until
+    BUTTON_SETTLE_FRAMES after its release the camera's 0x1A0 is blocked (the camera resumes its own ACC on a CANCEL release, and engages with the main
+    press), so our 'off' frames must already be there, or the car sees no 0x1A0. Read from the raw key state (CS.cruise_buttons, CS.main_buttons), not from
+    the button events: card's PauseResumeKey rewrites the standby CANCEL events to resumeCruise before the controller sees them. Armed whatever the
+    ownership tail says: the panda arms on its own state (a brake or CANCEL ended its ownership), frames we send while it did not arm are rejected,
+    harmless like the tail; a missing frame during a long hold is a 0x1A0 gap."""
+    cancel_down = CS.cruise_buttons[-1] == Buttons.CANCEL
+    main_down = bool(CS.main_buttons[-1])
+    available = bool(CS.out.cruiseState.available)
+    self.cancel_edge = cancel_down and not self.cancel_down
+    # arm on the eligible edges only, an ineligible key (CANCEL with camera main off, main press that turns it off) keeps what is armed: the panda
+    # keeps its lock and refreshes its settle time on any key frame
+    if (self.cancel_edge and available) or (main_down and not self.main_down and not available):
+      self.button_armed = True
+    if (self.cancel_down or self.main_down) and not (cancel_down or main_down):
+      self.button_release_frame = frame
+    self.cancel_down, self.main_down = cancel_down, main_down
+    if not self.button_armed:
       return False
-    if down or (self.cancel_release_frame is not None and frame - self.cancel_release_frame <= CANCEL_SETTLE_FRAMES):
+    if cancel_down or main_down or (self.button_release_frame is not None and frame - self.button_release_frame <= BUTTON_SETTLE_FRAMES):
       return True
-    self.cancel_armed = False
+    self.button_armed = False
     return False
 
   def update(self, CC, CS, openpilot_long: bool, frame: int) -> tuple[bool, bool]:
@@ -153,6 +166,7 @@ class CameraHandback:
     brake_edge = CS.out.brakePressed and not self.prev_brake_pressed
     self.prev_brake_pressed = CS.out.brakePressed
     pressed = [be.type for be in CS.out.buttonEvents if be.pressed]  # a list: the capnp enum values do not hash consistently
+    button_lock = self.button_lock(CS, frame)  # (evaluated every frame: edge tracking)
     driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
     # lateral: always ours from the start (inactive frames too: the camera's own request, LFA lane centering included, must not reach the EPS,
     # also after a main press that turns the car's LFA on), except while the car's own lane-keeping nudge (LKA) steers with openpilot
@@ -161,8 +175,14 @@ class CameraHandback:
       self.lka_window.lfa_pressed(frame)
     lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, frame)
     send_lat = not (lka_nudge and not CC.latActive)
-    send_long = self.long_owner.update(bool(CC.enabled and openpilot_long), driver_cruise, frame)
+    active = bool(CC.enabled and openpilot_long)
+    # the panda drops the permission at the driver action (brake edge, CANCEL, main press) and rejects our active frames from then on; the controller's
+    # enabled flag follows a cycle or two later. Our frames are 'off' from this frame on, so the car sees no gap while the camera's frames are blocked.
+    if active and (brake_edge or self.cancel_edge or button_type.mainCruise in pressed):
+      self.cutoff = True
+    elif not active:
+      self.cutoff = False
+    send_long = self.long_owner.update(active, driver_cruise, frame)
     # the camera's own ACC engaged while openpilot is not: the panda locks it out of the car and takes our 'off' frames instead
     stock_acc_lock = bool(openpilot_long and not CC.enabled and CS.cruise_info.get("ACCMode", 0) in (1, 2))
-    cancel_lock = self.cancel_lock(CS, frame) and bool(openpilot_long and not CC.enabled)  # (evaluated every frame: edge tracking)
-    return send_lat, send_long or stock_acc_lock or cancel_lock
+    return send_lat, send_long or stock_acc_lock or (button_lock and bool(openpilot_long and not CC.enabled))
