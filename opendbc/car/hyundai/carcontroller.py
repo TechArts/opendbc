@@ -340,7 +340,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # steering control
     send_lat, send_long = True, True
     if self.handback:
-      send_lat, send_long = self.handback.update(CC, CS, self.CP.openpilotLongitudinalControl, self.frame)
+      send_lat, send_long = self.handback.update(CC, CS, self.CP.openpilotLongitudinalControl, self.frame, steer_req=bool(apply_steer_req))
 
     if send_lat:
       lfa_alt_counter = self.handback.lfa_alt_counter.next(CS.cam_lfa_alt.get("COUNTER")) if self.handback else None

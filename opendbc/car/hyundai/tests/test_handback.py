@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, gen_empty_fingerprint, structs
 from opendbc.car.hyundai import hyundaicanfd
-from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow, TAIL_FRAMES, RECENT_ACTION_FRAMES, LKA_ICON_SETTLE_FRAMES, LKA_HOLD_FRAMES
+from opendbc.car.hyundai.handback import AxisOwner, CounterFollower, LkaWindow, TAIL_FRAMES, RECENT_ACTION_FRAMES, LKA_ICON_SETTLE_FRAMES, LKA_HOLD_FRAMES, \
+                                         LAT_IDLE_FRAMES
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.tests.gv70 import DBC_NAME, dbc_defaults, gv70_controller
@@ -244,13 +245,29 @@ class TestCarControllerHandback(unittest.TestCase):
         sent = self._nudge(icon, ind)
         self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
 
-  def test_lka_nudge_not_allowed_while_mads_on_or_paused(self):
-    self._msgs(steer_req=True)
-    self._nudge(0, 3)
-    sent = self._msgs(steer_req=False, lat_active=True)  # MADS on, request paused by a takeover
-    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
-    sent = self._msgs(steer_req=True, lat_active=True)
-    self.assertEqual(sent & {0xCB, 0xEA}, {0xCB, 0xEA})
+  def test_lka_nudge_waits_until_openpilot_has_stopped_steering(self):
+    """The panda opens its window 0.2 s after openpilot's last ACTIVE frame; we go silent only after 0.3 s, so the car always has a 0xCB. A takeover
+    pause (MADS on, no request) is not steering: the nudge may steer; an ACTIVE request sends at once (the panda drops it and closes its window)."""
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = 0, 2
+    for _ in range(100):  # 2 s: icon settled, openpilot steering, no lane departure
+      self._msgs(steer_req=True)
+    self.cs.cam_lka_ind = 3
+    start = self.cc.frame
+    while self.cc.frame - start <= LAT_IDLE_FRAMES - 2:  # openpilot's request ends with the nudge: within 0.3 s we keep sending
+      self.assertEqual(self._msgs(steer_req=False, lat_active=True) & {0xCB, 0xEA}, {0xCB, 0xEA})
+    for _ in range(5):
+      self._msgs(steer_req=False, lat_active=True)
+    self.assertFalse(self._msgs(steer_req=False, lat_active=True) & {0xCB, 0xEA})  # paused, 0.3 s idle: the nudge steers
+    self.assertEqual(self._msgs(steer_req=True, lat_active=True) & {0xCB, 0xEA}, {0xCB, 0xEA})  # openpilot steers again: at once
+
+  def test_lka_nudge_with_openpilot_cruise_on_sends_nothing(self):
+    """Route 48 35:59-37:02 (T23): openpilot cruise on, steering off by the LFA button, the car's nudge: silent (the panda forwards the camera)."""
+    self._msgs(steer_req=True, enabled=True)
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = 0, 3
+    for _ in range(110):
+      sent = self._msgs(steer_req=False, enabled=True, lat_active=False)
+    self.assertFalse(sent & {0xCB, 0xEA})
+    self.assertIn(0x1A0, sent)  # cruise stays openpilot's
 
   def test_openpilot_owns_lateral_from_boot(self):
     self.assertEqual(self._nudge(2, 3) & {0xCB, 0xEA}, {0xCB, 0xEA})  # the car's LFA (icon 2): ours replaces it, also with a lane departure
@@ -558,6 +575,132 @@ class TestCarControllerHandback(unittest.TestCase):
     dat = next(m[1] for m in msgs if m[0] == 0xEA)
     parser.update([(0, [(0xEA, dat, 2)])])
     self.assertEqual(parser.vl["MDPS"]["MDPS_ADASAciActvSta_Lv2"], 1)
+
+
+class TestLateralSenderWithPanda(unittest.TestCase):
+  """The car controller and the real panda (libsafety) on the same camera frames, every 10 ms: never two 0xCB or MDPS senders; a missing 0xCB only
+  at a switch of sender, never two cycles in a row, in both bus orders. Route 48 (T23): 0.85 s with neither, the EPS faulted 0.53 s in."""
+  def setUp(self):
+    from opendbc.safety.tests.common import CANPackerSafety
+    from opendbc.safety.tests.libsafety import libsafety_py
+    self.libsafety_py = libsafety_py
+    self.spacker = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+    self.cp, self.cp_sp, self.cc, self.cs = gv70_controller()
+    self.safety.set_safety_hooks(structs.CarParams.SafetyModel.hyundaiCanfd, int(self.cp.safetyConfigs[-1].safetyParam))
+    self.safety.init_tests()
+    self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
+    self.cs.cam_lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 1}
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
+    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = dbc_defaults("CCNC_0x161"), dbc_defaults("CCNC_0x162"), dbc_defaults("FR_CMR_03_50ms")
+    self.cs.out = structs.CarState()
+    self.cs.out.vCruiseCluster = 40.0
+    self.cc.frame = 0
+    self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
+    self.hud = structs.CarControl.HUDControl()
+    self.t = 0
+    self._panda_icon = 0
+
+  def _cycle(self, icon, ind, steer_req, lat_active, enabled, camera_first, icon_between=None):
+    """One 10 ms cycle: the camera's status reaches the panda, the controller sends (0xCB, then its MDPS copy), the panda decides; the camera's 0xCB
+    is on the bus before ours (camera_first) or after; icon_between: a camera icon frame between the camera's 0xCB and ours (R1 F1). The controller
+    sees the icon the panda had at the end of the previous cycle (CAN latency). Returns (ours 0xCB, camera 0xCB, ours MDPS, real MDPS) as they reach
+    the car / the camera."""
+    self.t += 10_000
+    self.safety.set_timer(self.t)
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = self._panda_icon, ind
+    if self.t % 50_000 == 0:
+      self.safety.safety_rx_hook(self.spacker.make_can_msg_safety("CCNC_0x161", 2, {"LFA_ICON": icon}))
+      self._panda_icon = icon
+    self.safety.safety_rx_hook(self.spacker.make_can_msg_safety("LFA", 2, {"LKA_SysIndReq": ind}))
+    cc = structs.CarControl()
+    cc.enabled, cc.latActive = enabled, lat_active
+    msgs = self.cc.create_canfd_msgs(steer_req, 1 if steer_req else 0, 0.0, 0.0, False, self.hud, self.cs, cc)
+    self.cc.frame += 1
+    camera = camera_first and self.safety.safety_fwd_hook(2, 0xCB) == 0
+    real_mdps = camera_first and self.safety.safety_fwd_hook(0, 0xEA) == 2
+    if icon_between is not None:
+      self.safety.safety_rx_hook(self.spacker.make_can_msg_safety("CCNC_0x161", 2, {"LFA_ICON": icon_between}))
+      self._panda_icon = icon_between
+    tx = {a: [bool(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(m[0], m[2], m[1]))) for m in msgs if m[0] == a] for a in (0xCB, 0xEA)}
+    if not camera_first:
+      camera = self.safety.safety_fwd_hook(2, 0xCB) == 0
+      real_mdps = self.safety.safety_fwd_hook(0, 0xEA) == 2
+    return sum(tx[0xCB]), int(camera), sum(tx[0xEA]), int(real_mdps)
+
+  _panda_icon = 0
+
+  def _run(self, phases, icon_between_at=None):
+    """phases: (seconds, icon, ind, steer_req, lat_active, enabled). In both bus orders: never two 0xCB or two MDPS in a cycle; a cycle without a
+    0xCB only at a switch of sender (the sender after it differs from the one before) and never two in a row."""
+    for camera_first in (False, True):
+      self.setUp()
+      if self._allow:
+        getattr(self.safety, self._allow)(True)
+      last, gap_from = 'ours', None
+      for seconds, icon, ind, steer_req, lat_active, enabled in phases:
+        for _ in range(int(seconds * 100)):
+          between = icon_between_at(self.t + 10_000) if icon_between_at else None
+          ours, cam, ours_mdps, real_mdps = self._cycle(icon, ind, steer_req, lat_active, enabled, camera_first, between)
+          where = f"t={self.t} (camera first: {camera_first})"
+          self.assertLessEqual(ours + cam, 1, f"two 0xCB senders at {where}")
+          self.assertLessEqual(ours_mdps + real_mdps, 1, f"two MDPS senders at {where}")
+          if ours + cam == 0:
+            self.assertIsNone(gap_from, f"two cycles without 0xCB at {where}")
+            gap_from = last
+          else:
+            now = 'ours' if ours else 'cam'
+            if gap_from is not None:
+              self.assertNotEqual(now, gap_from, f"a cycle without 0xCB before {where}, not at a switch")
+            last, gap_from = now, None
+
+  _allow = None
+
+  def test_route_48_cruise_on_steering_off_nudge(self):
+    """Openpilot cruise on (panda controls_allowed), steering on, then off by the LFA button, the car's nudge comes and goes, then openpilot steers
+    again in the middle of a nudge."""
+    self._allow = "set_controls_allowed"
+    self._run([
+      (2.0, 0, 2, True, True, True),    # openpilot steers, the camera's icon settles at 0, no lane departure
+      (1.5, 0, 2, False, False, True),  # LFA off: steering off, cruise on
+      (2.0, 0, 3, False, False, True),  # the car's nudge (route 48 35:59)
+      (1.5, 0, 2, False, False, True),  # nudge ends
+      (1.0, 0, 3, False, False, True),  # again
+      (1.0, 0, 3, True, True, True),    # openpilot steers again mid-nudge
+      (1.0, 0, 2, True, True, True),
+    ])
+
+  def test_from_boot_and_with_the_cars_lfa(self):
+    """No permission (cruise off), the car's LFA (icon 2) and its blink, nudges: the same invariant."""
+    self._run([
+      (2.0, 0, 3, False, False, False),
+      (1.0, 2, 2, False, False, False),
+      (0.3, 3, 3, False, False, False),
+      (2.0, 0, 3, False, False, False),
+      (1.0, 0, 1, False, False, False),
+    ])
+
+  def test_takeover_pause_with_permission_then_resume(self):
+    """MADS on (lateral permission), a takeover pause (no request) during a nudge, then the request returns."""
+    self._allow = "set_controls_allowed_lateral"
+    self._run([
+      (2.0, 0, 2, True, True, False),
+      (1.0, 0, 3, False, True, False),
+      (1.0, 0, 3, True, True, False),
+      (1.0, 0, 2, True, True, False),
+    ])
+
+  def test_camera_icon_between_the_senders(self):
+    """R1 F1 for the whole pipeline: while the camera's nudge steers, an icon frame (LFA 2, blink 3, standby 1) arrives between the camera's 0xCB
+    and ours, once each, in both bus orders; then openpilot steers again."""
+    self._allow = "set_controls_allowed"
+    between = {4_000_000: 2, 6_000_000: 3, 8_000_000: 1}
+    self._run([
+      (2.0, 0, 2, True, True, True),
+      (1.5, 0, 2, False, False, True),
+      (6.0, 0, 3, False, False, True),
+      (1.0, 0, 3, True, True, True),
+    ], icon_between_at=lambda t: between.get(t))
 
 
 class TestOtherConfigsUnchanged(unittest.TestCase):
