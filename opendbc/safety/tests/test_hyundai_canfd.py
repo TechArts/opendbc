@@ -1383,21 +1383,96 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._cam_icon(2)
     self.assertFalse(self._cb_fwd())
 
-  def test_lka_frames_blocked_while_mads_on_or_paused(self):
-    self._own_lat_then_off()
+  def test_lka_window_follows_openpilot_steering_not_its_permission(self):
+    """Route 48 35:59-37:02 (T23): openpilot cruise on (controls_allowed), steering off by the LFA button, openpilot's frames inactive. The camera's
+    nudge must reach the car: the window opens once openpilot has sent no accepted ACTIVE frame for 0.2 s, whatever the permission says, and stays
+    shut while openpilot steers. Before, the window needed both permissions off, and openpilot (which had stopped sending for the nudge) left the car
+    with no 0xCB for 0.85 s; the EPS flagged 0.53 s into each gap."""
+    for allow in ("controls", "lateral"):
+      with self.subTest(allow=allow):
+        self._init()
+        self.safety.set_timer(0)
+        getattr(self.safety, f"set_controls_allowed{'_lateral' if allow == 'lateral' else ''}")(True)
+        self.assertTrue(self._cb(True))  # openpilot steers at t=0
+        self._cam_run(0, 1_600_000, 0, 3)
+        self.assertTrue(self._cb_fwd())  # 1.6 s without an ACTIVE frame: the nudge passes, permission or not
+        self.assertTrue(self._mdps_fwd())
+        self.assertFalse(self._cb(False))  # one sender
+        self.assertFalse(self._mdps())
+        self.assertTrue(self._scc_fwd() or allow == "controls")  # longitudinal untouched (openpilot's while it has cruise)
+
+  def _open_window_with_cruise_on(self):
+    self._init()
+    self.safety.set_controls_allowed(True)
     self._cam_run(0, 2_000_000, 0, 3)
     self.assertTrue(self._cb_fwd())
-    self.safety.set_controls_allowed_lateral(True)  # MADS on, and also paused (the panda sees no difference: the permission stays)
+    self.assertFalse(self._cb(False))
+
+  def test_takeover_handover_camera_first_in_the_cycle(self):
+    """Openpilot starts steering inside the window and the camera's frame comes first in every cycle: the camera's frame of the hand-over cycle
+    passes, ours is dropped and closes the window; from the next cycle only ours. Exactly one 0xCB per cycle."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.assertFalse(self._cb(True))  # dropped, the window closes
+    for t in range(2_020_000, 2_300_000, 10_000):
+      self.safety.set_timer(t)
+      self._cam_ind(3)
+      self.assertFalse(self._cb_fwd(), f"t={t}")
+      self.assertTrue(self._cb(True), f"t={t}")
+
+  def test_takeover_handover_ours_first_in_the_cycle(self):
+    """Same, ours comes first: ours is dropped and closes the window, so the camera's frame of that cycle is blocked too: one empty cycle (a 20 ms gap
+    at most; never two senders), then only ours."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertFalse(self._cb(True))
+    self.assertFalse(self._cb_fwd())  # the one empty cycle
+    for t in range(2_020_000, 2_300_000, 10_000):
+      self.safety.set_timer(t)
+      self._cam_ind(3)
+      self.assertTrue(self._cb(True), f"t={t}")
+      self.assertFalse(self._cb_fwd(), f"t={t}")
+
+  def test_lka_window_opens_0_2_s_after_the_last_active_frame(self):
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self._cam_run(0, 2_000_000, 0, 3)
+    self.safety.set_timer(2_000_000)
+    self.assertFalse(self._cb(True))  # hand-over: dropped, the window closes
     self.assertFalse(self._cb_fwd())
-    self.assertFalse(self._mdps_fwd())
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb(True))   # openpilot steers, last ACTIVE frame at 2.01 s
+    self._cam_run(2_020_000, 2_200_000, 0, 3)
+    self.assertFalse(self._cb_fwd())  # 0.19 s after the last ACTIVE frame: still shut
     self.assertTrue(self._cb(False))
+    self._cam_run(2_200_000, 2_220_000, 0, 3)
+    self.assertTrue(self._cb_fwd())   # 0.21 s: open again
+    self.assertFalse(self._cb(False))
+
+  def test_rejected_active_frames_do_not_hold_the_window_shut(self):
+    """An ACTIVE frame the panda rejects (no permission) is not openpilot steering: it must not close the window, or the car would get neither."""
+    self._init()
+    self._cam_run(0, 2_000_000, 0, 3)
+    self.assertTrue(self._cb_fwd())
+    self.assertFalse(self._cb(True))  # no permission
+    self.assertTrue(self._cb_fwd())
+
+  def test_no_mixed_sender_with_cruise_on_and_steering_off(self):
+    """Every 10 ms with openpilot cruise on and steering off: the camera's frame or openpilot's inactive frame reaches the car, never both or neither
+    (icon 0 / LFA / blink, lane departure on and off)."""
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self.safety.set_timer(0)
     self.assertTrue(self._cb(True))
-    self.safety.set_controls_allowed_lateral(False)
-    self.safety.set_controls_allowed(True)  # controls (ACC + steering) allowed
-    self.assertFalse(self._cb_fwd())
-    self.assertFalse(self._mdps_fwd())
-    self.safety.set_controls_allowed(False)
-    self.assertTrue(self._cb_fwd())  # lateral is off again: the nudge may steer
+    for t in range(10_000, 6_000_000, 10_000):
+      self.safety.set_timer(t)
+      icon = 2 if 2_000_000 <= t < 3_000_000 else 3 if 3_000_000 <= t < 3_050_000 else 0
+      if t % 50_000 == 0:
+        self._cam_icon(icon)
+      self._cam_ind(3 if t % 100_000 < 60_000 else 2)
+      self.assertNotEqual(self._cb_fwd(), self._cb(False), f"t={t}")
+      self.assertEqual(self._cb_fwd(), self._mdps_fwd())
 
   def test_no_mixed_frame_leak_around_the_window(self):
     self._own_lat_then_off()

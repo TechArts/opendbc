@@ -52,13 +52,16 @@ class AxisOwner:
     return self.owner
 
 
-# The panda's lane-keeping window (hyundai_canfd.h): camera LFA_ICON 0 for >= 1.5 s and LKA_SysIndReq 3 within 0.5 s. Ours is a strict subset
-# (a later start, an earlier end, as seen through the CAN latency), so whenever we think the camera steers, the panda really forwards its frame,
-# and the car never sees a gap in 0xCB; the panda drops our inactive frames while its window is open, so the two never interleave.
+# The panda's lane-keeping window (hyundai_canfd.h): camera LFA_ICON 0 for >= 1.5 s and LKA_SysIndReq 3 within 0.5 s, while openpilot is not steering
+# (no accepted ACTIVE 0xCB for 0.2 s, whatever its permission). Ours is a strict subset (a later start, an earlier end, as seen through the CAN latency,
+# and 0.3 s without an ACTIVE frame), so whenever we go silent for the camera, the panda really forwards its frame, and the car never sees a gap in 0xCB;
+# the panda drops our inactive frames while its window is open, so the two never interleave. Route 48 (T23): our silence keyed on CC.latActive while the
+# panda still required both permissions off; with openpilot cruise on the car got no 0xCB for 0.85 s and the EPS faulted, 5 times.
 LKA_ICON_SETTLE_FRAMES = int(1.7 / DT_CTRL)  # panda 1.5 s (LFA's on/off blink lasts <= 1.3 s)
 LKA_HOLD_FRAMES = int(0.3 / DT_CTRL)         # panda 0.5 s (longest LKA_SysIndReq gap inside a nudge: 0.33 s, seen once)
 LKA_ICON_LFA = (1, 2)                        # camera LFA_ICON: grey (on, not steering) / green (on, steering)
 LFA_PRESS_BLINK_FRAMES = int(1.5 / DT_CTRL)  # after an LFA button press the camera's icon blinks within 0.3 s (route 34: 0.25 s); no blink in this time = it ignored it
+LAT_IDLE_FRAMES = int(0.3 / DT_CTRL)         # panda 0.2 s (HYUNDAI_CANFD_HB_OP_IDLE_US) without an accepted ACTIVE frame = openpilot not steering
 
 
 class LkaWindow:
@@ -134,6 +137,7 @@ class CameraHandback:
     self.main_down = False
     self.button_release_frame: int | None = None
     self.cutoff = False                        # a driver action ended the engagement and CC.enabled has not followed yet: 'off' frames from now on
+    self.steer_frame: int | None = None        # the last frame we sent an ACTIVE 0xCB (openpilot steering)
 
   def button_lock(self, CS, frame: int) -> bool:
     """Mirror of the panda's button pre-arm (hyundai_canfd.h): from the CANCEL press (camera main on) or the engage press (main button, camera main off) until
@@ -160,8 +164,8 @@ class CameraHandback:
     self.button_armed = False
     return False
 
-  def update(self, CC, CS, openpilot_long: bool, frame: int) -> tuple[bool, bool]:
-    """Returns (send lateral, send longitudinal) for this frame."""
+  def update(self, CC, CS, openpilot_long: bool, frame: int, steer_req: bool = False) -> tuple[bool, bool]:
+    """Returns (send lateral, send longitudinal) for this frame. steer_req: this frame's 0xCB would be ACTIVE."""
     button_type = structs.CarState.ButtonEvent.Type
     brake_edge = CS.out.brakePressed and not self.prev_brake_pressed
     self.prev_brake_pressed = CS.out.brakePressed
@@ -170,11 +174,15 @@ class CameraHandback:
     driver_cruise = brake_edge or button_type.cancel in pressed or button_type.mainCruise in pressed
     # lateral: always ours from the start (inactive frames too: the camera's own request, LFA lane centering included, must not reach the EPS,
     # also after a main press that turns the car's LFA on), except while the car's own lane-keeping nudge (LKA) steers with openpilot
-    # steering off: then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we send nothing (the panda decides the same, see LkaWindow)
+    # not steering (no ACTIVE frame for LAT_IDLE_FRAMES, cruise on or off): then the panda forwards the camera's 0xCB / MDPS and rejects ours, so we
+    # send nothing (the panda decides the same, see LkaWindow). An ACTIVE request sends at once: the panda drops it and closes its window.
     if any(be.type == structs.CarState.ButtonEvent.Type.lkas and be.pressed for be in CS.out.buttonEvents):
       self.lka_window.lfa_pressed(frame)
     lka_nudge = self.lka_window.update(CS.cam_lfa_icon, CS.cam_lka_ind, frame)
-    send_lat = not (lka_nudge and not CC.latActive)
+    if steer_req:
+      self.steer_frame = frame
+    not_steering = self.steer_frame is None or frame - self.steer_frame > LAT_IDLE_FRAMES
+    send_lat = not (lka_nudge and not_steering)
     active = bool(CC.enabled and openpilot_long)
     # the panda drops the permission at the driver action (brake edge, CANCEL, main press) and rejects our active frames from then on; the controller's
     # enabled flag follows a cycle or two later. Our frames are 'off' from this frame on, so the car sees no gap while the camera's frames are blocked.
