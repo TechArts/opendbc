@@ -169,6 +169,29 @@ static uint32_t hyundai_canfd_hb_cam_cb_ts = 0U;        // the camera's last for
 static bool hyundai_canfd_hb_op_cb_since_cam = false;  // our 0xCB reached the car since the camera's last 0xCB decision, less than
 static uint32_t hyundai_canfd_hb_op_cb_ts = 0U;         // HYUNDAI_CANFD_HB_LAT_CYCLE_US ago: the camera's frame now would be a second sender
 static const uint32_t HYUNDAI_CANFD_HB_LAT_CYCLE_US = 15000U;           // 1.5 cycles
+static const uint32_t HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US = 7000U;      // the real MDPS and our copy less than this apart = the same 10 ms cycle
+static bool hyundai_canfd_hb_real_mdps_seen = false;   // the real MDPS (bus 0 -> 2) / our MDPS copy (bus 2) reached the camera less than
+static uint32_t hyundai_canfd_hb_real_mdps_ts = 0U;     // HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US ago: the other one must not follow in the same cycle
+static bool hyundai_canfd_hb_op_mdps_seen = false;     // (the owner can switch between the two; R1 v2, fuzz)
+static uint32_t hyundai_canfd_hb_op_mdps_ts = 0U;
+
+// MDPS 0xEA to the camera: ours = openpilot's copy (TX bus 2), else the real one (forwarded 0 -> 2). True = it may pass
+static bool hyundai_canfd_handback_mdps_ok(bool ours) {
+  const uint32_t now = microsecond_timer_get();
+  const bool other_recent = ours ? (hyundai_canfd_hb_real_mdps_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_real_mdps_ts) < HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US))
+                                 : (hyundai_canfd_hb_op_mdps_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_mdps_ts) < HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US));
+  const bool owner = ours ? (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) : (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM);
+  const bool ok = owner && !other_recent;
+  if (ok && ours) {
+    hyundai_canfd_hb_op_mdps_seen = true;
+    hyundai_canfd_hb_op_mdps_ts = now;
+  } else if (ok) {
+    hyundai_canfd_hb_real_mdps_seen = true;
+    hyundai_canfd_hb_real_mdps_ts = now;
+  } else {
+  }
+  return ok;
+}
 
 // the lock was armed by a CANCEL press that is down or was released less than the settle time ago
 static bool hyundai_canfd_hb_btn_settling(void) {
@@ -288,12 +311,32 @@ static bool hyundai_canfd_handback_camera_lka_open(void) {
          hyundai_canfd_hb_cam_lka_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_lka_ts) <= HYUNDAI_CANFD_HB_LKA_HOLD_US);
 }
 
+static const uint32_t HYUNDAI_CANFD_HB_LAT_HOLD_US = 20000U;  // after the slot came back to openpilot, no switch to the camera for this long: two switches
+static bool hyundai_canfd_hb_ours_hold = false;               // in a row would drop two frames in a row (fuzz: the nudge hold ends and a new nudge
+static uint32_t hyundai_canfd_hb_ours_since_ts = 0U;          // frame arrives within one cycle)
+
+static void hyundai_canfd_handback_lat_to_ours(void) {
+  if (hyundai_canfd_hb_lat_state != HYUNDAI_CANFD_HB_LAT_OURS) {
+    hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;
+    hyundai_canfd_hb_ours_hold = true;
+    hyundai_canfd_hb_ours_since_ts = microsecond_timer_get();
+  }
+}
+
+// the camera may take the slot: its window is open and the slot has been openpilot's for at least HYUNDAI_CANFD_HB_LAT_HOLD_US
+static bool hyundai_canfd_handback_cam_may_take(bool eligible) {
+  if (hyundai_canfd_hb_ours_hold && (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_canfd_hb_ours_since_ts) >= HYUNDAI_CANFD_HB_LAT_HOLD_US)) {
+    hyundai_canfd_hb_ours_hold = false;  // expired: an old timestamp never looks recent again after the timer wraps
+  }
+  return eligible && !hyundai_canfd_hb_ours_hold;
+}
+
 // our 0xCB: true = it may reach the car (the owner rules above), from the window decision made before this frame
 static bool hyundai_canfd_handback_lat_tx_ok(bool eligible) {
   const uint32_t now = microsecond_timer_get();
   bool ok = false;
   if (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) {
-    if (eligible) {
+    if (hyundai_canfd_handback_cam_may_take(eligible)) {
       hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_TO_CAM;  // the camera's nudge: our frame is the one dropped at the switch
       hyundai_canfd_hb_lat_state_ts = now;
     } else {
@@ -301,7 +344,7 @@ static bool hyundai_canfd_handback_lat_tx_ok(bool eligible) {
     }
   } else if (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM) {
     if (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_cb_ts) > HYUNDAI_CANFD_HB_LAT_SWITCH_US) {
-      hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;  // the camera stopped sending
+      hyundai_canfd_handback_lat_to_ours();  // the camera stopped sending
       ok = true;
     } else if (!eligible) {
       hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_TO_OURS;  // openpilot steers (or the window closed): ours is the frame dropped at the switch
@@ -310,7 +353,7 @@ static bool hyundai_canfd_handback_lat_tx_ok(bool eligible) {
     }
   } else {  // TO_CAM, TO_OURS: waiting for the camera's frame; it did not come
     if (safety_get_ts_elapsed(now, hyundai_canfd_hb_lat_state_ts) > HYUNDAI_CANFD_HB_LAT_SWITCH_US) {
-      hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;
+      hyundai_canfd_handback_lat_to_ours();
       ok = true;
     }
   }
@@ -322,17 +365,19 @@ static bool hyundai_canfd_handback_lat_fwd_ok(void) {
   const uint32_t now = microsecond_timer_get();
   const bool eligible = hyundai_canfd_handback_camera_lka_open();
   bool ok = false;
-  if ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_TO_CAM) || (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM) ||
-      ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) &&
-       !(hyundai_canfd_hb_op_cb_since_cam && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_cb_ts) <= HYUNDAI_CANFD_HB_LAT_CYCLE_US)))) {
-    ok = eligible;  // (from OURS only when no frame of ours went out since the camera's last one: openpilot is silent, nothing to drop)
+  if ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_TO_CAM) || (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM)) {
+    ok = eligible;
+  } else if ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) &&
+             !(hyundai_canfd_hb_op_cb_since_cam && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_cb_ts) <= HYUNDAI_CANFD_HB_LAT_CYCLE_US))) {
+    ok = hyundai_canfd_handback_cam_may_take(eligible);  // directly only when no frame of ours went out since the camera's last one (openpilot silent)
+  } else {
   }
   hyundai_canfd_hb_op_cb_since_cam = false;
   if (ok) {
     hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_CAM;
     hyundai_canfd_hb_cam_cb_ts = now;
   } else {
-    hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;  // TO_OURS ends here: this camera frame is the one dropped at the switch
+    hyundai_canfd_handback_lat_to_ours();  // TO_OURS ends here: this camera frame is the one dropped at the switch
   }
   return ok;
 }
@@ -533,7 +578,7 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
       // openpilot's MDPS copy only while it owns lateral (OURS); otherwise the real MDPS is forwarded (CAM) and a second sender would interleave.
       // At a switch (TO_CAM / TO_OURS) neither: the camera may miss one MDPS frame, never get two
       hyundai_canfd_handback_step();
-      if (hyundai_canfd_hb_lat_state != HYUNDAI_CANFD_HB_LAT_OURS) {
+      if (!hyundai_canfd_handback_mdps_ok(true)) {
         tx = false;
       }
     } else {
@@ -684,7 +729,7 @@ static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
       return !hyundai_canfd_handback_lat_fwd_ok();
     }
     if ((bus_num == 0) && (addr == 0xEA)) {
-      return hyundai_canfd_hb_lat_state != HYUNDAI_CANFD_HB_LAT_CAM;  // the real MDPS reaches the camera only while the camera's 0xCB steers
+      return !hyundai_canfd_handback_mdps_ok(false);  // the real MDPS reaches the camera only while the camera's 0xCB steers
     }
     if ((bus_num == 2) && (addr == 0x1A0) && hyundai_longitudinal) {
       hyundai_canfd_handback_lock_release();
@@ -829,9 +874,15 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_canfd_hb_op_steer_ts = 0U;
   hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;
   hyundai_canfd_hb_lat_state_ts = 0U;
+  hyundai_canfd_hb_ours_hold = false;
+  hyundai_canfd_hb_ours_since_ts = 0U;
   hyundai_canfd_hb_cam_cb_ts = 0U;
   hyundai_canfd_hb_op_cb_since_cam = false;
   hyundai_canfd_hb_op_cb_ts = 0U;
+  hyundai_canfd_hb_real_mdps_seen = false;
+  hyundai_canfd_hb_real_mdps_ts = 0U;
+  hyundai_canfd_hb_op_mdps_seen = false;
+  hyundai_canfd_hb_op_mdps_ts = 0U;
   hyundai_canfd_hb_long_op = false;
   hyundai_canfd_hb_long_action = false;
   hyundai_canfd_hb_long_action_ts = 0U;

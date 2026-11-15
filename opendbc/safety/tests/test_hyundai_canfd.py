@@ -1506,6 +1506,64 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self.assertTrue(self._cb(True))
     self.assertTrue(self._mdps())
 
+  def test_mdps_real_then_switch_then_copy_in_one_cycle(self):
+    """R1 v2 / fuzz seed 0: the real MDPS passes while the camera owns the slot, an icon frame closes the window, the camera's 0xCB is blocked
+    (owner back to openpilot), then openpilot's MDPS copy in the same cycle: dropped; the next cycle only the copy."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.safety.set_timer(2_020_000)
+    self.assertTrue(self._mdps_fwd())
+    self._cam_icon(2)
+    self.assertFalse(self._cb_fwd())
+    self.assertFalse(self._mdps())
+    self.safety.set_timer(2_030_000)
+    self.assertFalse(self._mdps_fwd())
+    self.assertTrue(self._mdps())
+
+  def test_random_bus_orders_never_give_two_senders(self):
+    """Fuzz (seeded): random event order inside each 10 ms cycle (camera status, the camera's 0xCB, ours, both MDPS), timer jitter, dropped camera
+    frames, permission flips, openpilot ACTIVE / inactive / silent, icon and nudge changes. Never two 0xCB or two MDPS in a cycle; never two cycles
+    in a row without a 0xCB while both senders tried with valid frames."""
+    import random
+    for seed in range(20):
+      rng = random.Random(seed)
+      self._init()
+      t = rng.randrange(0, 0xFFFFFFFF)
+      icon, ind, allowed, mode, prev_empty = 0, 2, rng.random() < 0.5, 'silent', False
+      for c in range(2000):
+        t = (t + 10_000 + rng.randint(-1500, 1500)) & 0xFFFFFFFF
+        allowed = (not allowed) if rng.random() < 0.003 else allowed
+        mode = rng.choice(['active', 'inactive', 'silent']) if rng.random() < 0.01 else mode
+        icon = rng.choice([0, 0, 0, 1, 2, 3]) if rng.random() < 0.004 else icon
+        ind = rng.choice([2, 3, 3, 1]) if rng.random() < 0.02 else ind
+        self.safety.set_controls_allowed(allowed)
+        events = ['icon', 'ind', 'cam', 'ours', 'real_mdps', 'ours_mdps']
+        rng.shuffle(events)
+        cam_sends = rng.random() > 0.02
+        got = dict.fromkeys(events, False)
+        for e in events:
+          self.safety.set_timer(t)
+          t = (t + rng.randint(0, 600)) & 0xFFFFFFFF
+          if e == 'icon' and (c % 5 == 0 or rng.random() < 0.01):
+            self._cam_icon(icon)
+          elif e == 'ind':
+            self._cam_ind(ind)
+          elif e == 'cam' and cam_sends:
+            got[e] = self._cb_fwd()
+          elif e == 'ours' and mode != 'silent':
+            got[e] = bool(self._cb(mode == 'active'))
+          elif e == 'real_mdps':
+            got[e] = self._mdps_fwd()
+          elif e == 'ours_mdps' and mode != 'silent':
+            got[e] = bool(self._mdps())
+        where = f"seed {seed} cycle {c} (mode {mode}, allowed {allowed}, icon {icon}, ind {ind}, order {events})"
+        self.assertFalse(got['ours'] and got['cam'], "two 0xCB senders, " + where)
+        self.assertFalse(got['ours_mdps'] and got['real_mdps'], "two MDPS senders, " + where)
+        empty = cam_sends and (mode == 'inactive' or (mode == 'active' and allowed)) and not (got['ours'] or got['cam'])
+        self.assertFalse(empty and prev_empty, "two cycles without 0xCB, " + where)
+        prev_empty = empty
+
   def test_the_idle_boundary_inside_one_cycle_never_gives_two(self):
     """R1: openpilot's inactive frame at last ACTIVE + 199.9 ms, the camera's at + 200.1 ms in the same cycle: the camera takes over only after a
     cycle without openpilot's frame."""
