@@ -1383,21 +1383,289 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self._cam_icon(2)
     self.assertFalse(self._cb_fwd())
 
-  def test_lka_frames_blocked_while_mads_on_or_paused(self):
-    self._own_lat_then_off()
+  def test_lka_window_follows_openpilot_steering_not_its_permission(self):
+    """Route 48 35:59-37:02 (T23): openpilot cruise on (controls_allowed), steering off by the LFA button, openpilot's frames inactive. The camera's
+    nudge must reach the car: the window opens once openpilot has sent no accepted ACTIVE frame for 0.2 s, whatever the permission says, and stays
+    shut while openpilot steers. Before, the window needed both permissions off, and openpilot (which had stopped sending for the nudge) left the car
+    with no 0xCB for 0.85 s; the EPS flagged 0.53 s into each gap."""
+    for allow in ("controls", "lateral"):
+      with self.subTest(allow=allow):
+        self._init()
+        self.safety.set_timer(0)
+        getattr(self.safety, f"set_controls_allowed{'_lateral' if allow == 'lateral' else ''}")(True)
+        self.assertTrue(self._cb(True))  # openpilot steers at t=0
+        self._cam_run(0, 1_600_000, 0, 3)
+        self.assertTrue(self._cb_fwd())  # 1.6 s without an ACTIVE frame: the nudge passes, permission or not
+        self.assertTrue(self._mdps_fwd())
+        self.assertFalse(self._cb(False))  # one sender
+        self.assertFalse(self._mdps())
+        self.assertTrue(self._scc_fwd() or allow == "controls")  # longitudinal untouched (openpilot's while it has cruise)
+
+  def _open_window_with_cruise_on(self):
+    self._init()
+    self.safety.set_controls_allowed(True)
     self._cam_run(0, 2_000_000, 0, 3)
     self.assertTrue(self._cb_fwd())
-    self.safety.set_controls_allowed_lateral(True)  # MADS on, and also paused (the panda sees no difference: the permission stays)
-    self.assertFalse(self._cb_fwd())
-    self.assertFalse(self._mdps_fwd())
+    self.assertFalse(self._cb(False))
+
+  def test_takeover_handover_camera_first_in_the_cycle(self):
+    """Openpilot starts steering inside the window and the camera's frame comes first in every cycle: the camera's frame of the hand-over cycle
+    passes, ours is dropped and closes the window; from the next cycle only ours. Exactly one 0xCB per cycle."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.assertFalse(self._cb(True))  # dropped, the window closes
+    for t in range(2_020_000, 2_300_000, 10_000):
+      self.safety.set_timer(t)
+      self._cam_ind(3)
+      self.assertFalse(self._cb_fwd(), f"t={t}")
+      self.assertTrue(self._cb(True), f"t={t}")
+
+  def test_takeover_handover_ours_first_in_the_cycle(self):
+    """Same, ours comes first: ours is dropped and closes the window, so the camera's frame of that cycle is blocked too: one empty cycle (a 20 ms gap
+    at most; never two senders), then only ours."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertFalse(self._cb(True))
+    self.assertFalse(self._cb_fwd())  # the one empty cycle
+    for t in range(2_020_000, 2_300_000, 10_000):
+      self.safety.set_timer(t)
+      self._cam_ind(3)
+      self.assertTrue(self._cb(True), f"t={t}")
+      self.assertFalse(self._cb_fwd(), f"t={t}")
+
+  def _sweep(self, t0, t1, icon_at, ind_at, active_at=lambda t: False, camera_first=True):
+    """10 ms cycles, camera status every cycle (icon every 50 ms), then both senders in the given order, then both MDPS senders. Never two 0xCB or
+    two MDPS frames in a cycle; never two cycles in a row without a 0xCB. Returns [(ours, camera)] per cycle."""
+    out, prev_empty = [], False
+    for t in range(t0, t1, 10_000):
+      self.safety.set_timer(t)
+      if t % 50_000 == 0:
+        self._cam_icon(icon_at(t))
+      self._cam_ind(ind_at(t))
+      if camera_first:
+        cam = self._cb_fwd()
+        ours = self._cb(active_at(t))
+      else:
+        ours = self._cb(active_at(t))
+        cam = self._cb_fwd()
+      self.assertFalse(ours and cam, f"two 0xCB senders at t={t}")
+      empty = not (ours or cam)
+      self.assertFalse(empty and prev_empty, f"two cycles without 0xCB at t={t}")
+      prev_empty = empty
+      self.assertFalse(self._mdps() and self._mdps_fwd(), f"two MDPS senders at t={t}")
+      out.append((ours, cam))
+    return out
+
+  def test_lka_window_opens_0_2_s_after_the_last_active_frame(self):
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self._cam_run(0, 2_000_000, 0, 3)
+    self.assertTrue(self._cb_fwd())    # the camera's nudge steers
+    self.safety.set_timer(2_010_000)
+    self.assertFalse(self._cb(True))   # openpilot steers: this frame is the one dropped at the switch
+    self.assertFalse(self._cb_fwd())   # the camera's next frame is blocked: openpilot's now
+    self.safety.set_timer(2_020_000)
+    self.assertTrue(self._cb(True))    # last ACTIVE frame at 2.02 s
+    self._cam_run(2_030_000, 2_210_000, 0, 3)
+    self.assertFalse(self._cb_fwd())   # 0.19 s after the last ACTIVE frame: still openpilot's
     self.assertTrue(self._cb(False))
-    self.assertTrue(self._cb(True))
-    self.safety.set_controls_allowed_lateral(False)
-    self.safety.set_controls_allowed(True)  # controls (ACC + steering) allowed
+    self._cam_run(2_220_000, 2_230_000, 0, 3)
+    self.assertFalse(self._cb(False))  # 0.21 s: openpilot is not steering; its frame is the one dropped at the switch
+    self.assertTrue(self._cb_fwd())    # the camera's
+    self.assertFalse(self._cb(False))
+
+  def test_camera_status_between_the_two_senders_never_gives_two(self):
+    """R1 F1: the camera's 0xCB has passed this cycle, then a status frame closes the window (icon 1 / 2 / blink) before openpilot's frame:
+    openpilot's frame (ACTIVE or not) is the one dropped at the switch, the camera's next frame is blocked, openpilot's next passes."""
+    for icon in (1, 2, 3):
+      for active in (True, False):
+        with self.subTest(icon=icon, active=active):
+          self._open_window_with_cruise_on()
+          self.safety.set_timer(2_010_000)
+          self.assertTrue(self._cb_fwd())
+          self._cam_icon(icon)
+          self.assertFalse(self._cb(active))
+          self.assertFalse(self._mdps())
+          self.safety.set_timer(2_020_000)
+          self.assertFalse(self._cb_fwd())
+          self.assertTrue(self._cb(active))
+
+  def test_mdps_copy_not_accepted_after_the_real_one_at_a_takeover(self):
+    """R1: the camera's nudge steers and the real MDPS reaches the camera; openpilot takes over: its ACTIVE 0xCB is dropped, and its MDPS copy of
+    the same cycle must be dropped too (the real one already went to the camera), from the next cycle only the copy."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.assertTrue(self._mdps_fwd())
+    self.assertFalse(self._cb(True))
+    self.assertFalse(self._mdps())
+    self.safety.set_timer(2_020_000)
     self.assertFalse(self._cb_fwd())
     self.assertFalse(self._mdps_fwd())
-    self.safety.set_controls_allowed(False)
-    self.assertTrue(self._cb_fwd())  # lateral is off again: the nudge may steer
+    self.assertTrue(self._cb(True))
+    self.assertTrue(self._mdps())
+
+  def test_mdps_real_then_switch_then_copy_in_one_cycle(self):
+    """R1 v2 / fuzz seed 0: the real MDPS passes while the camera owns the slot, an icon frame closes the window, the camera's 0xCB is blocked
+    (owner back to openpilot), then openpilot's MDPS copy in the same cycle: dropped; the next cycle only the copy."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.safety.set_timer(2_020_000)
+    self.assertTrue(self._mdps_fwd())
+    self._cam_icon(2)
+    self.assertFalse(self._cb_fwd())
+    self.assertFalse(self._mdps())
+    self.safety.set_timer(2_030_000)
+    self.assertFalse(self._mdps_fwd())
+    self.assertTrue(self._mdps())
+
+  def test_silent_openpilot_gets_the_nudge_at_once_after_a_switch_back(self):
+    """R1 v3 F1: the camera steers the nudge at 100 Hz; the indicator stops (last 3 at 2.0 s), openpilot resumes inactive frames (its 0.3 s hold
+    is shorter, dropped while the camera owns), the panda's 0.5 s hold lapses at the camera frame of 2.51 s (blocked, slot back to openpilot), a new
+    indicator 3 comes right after and openpilot goes silent again: the camera's 2.52 s frame passes (one missing frame, not two)."""
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self._cam_run(0, 2_000_000, 0, 3)
+    for t in range(2_000_000, 2_510_000, 10_000):
+      self.safety.set_timer(t)
+      if t % 50_000 == 0:
+        self._cam_icon(0)
+      if t > 2_000_000:
+        self._cam_ind(2)
+      self.assertTrue(self._cb_fwd(), f"t={t}")
+      if t >= 2_310_000:
+        self.assertFalse(self._cb(False), f"t={t}")  # openpilot's inactive frames while the camera owns: dropped
+    self.safety.set_timer(2_510_000)
+    self.assertFalse(self._cb_fwd())  # the panda's hold lapsed: blocked, the slot is openpilot's
+    self.safety.set_timer(2_510_100)
+    self._cam_ind(3)                  # a new nudge frame; openpilot goes silent (its window reopens)
+    self.safety.set_timer(2_520_000)
+    self.assertTrue(self._cb_fwd())   # nothing of openpilot's to drop: the camera's frame passes at once
+
+  def test_mdps_marks_expire_across_a_timer_wrap(self):
+    """R1 v3: the MDPS sender marks are retired once 7 ms passed (at the next MDPS frame, 100 Hz in the car), so one timer wrap later an old mark
+    does not alias to 'recent' and block the other sender."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.assertTrue(self._mdps_fwd())  # real MDPS mark at 2.01 s
+    self.safety.set_timer(2_030_000)
+    self.assertFalse(self._mdps())     # the camera's slot: the copy is dropped; the 2.01 s mark is retired here
+    self.safety.set_timer((2_010_000 + 0x100000000 + 1_000) & 0xFFFFFFFF)  # one wrap later: the old mark would alias to 1 ms
+    self._cam_icon(2)
+    self.assertFalse(self._cb_fwd())   # the window closed: the slot is openpilot's
+    self.assertTrue(self._mdps())       # the copy passes: no stale real-MDPS mark
+
+  def test_random_bus_orders_never_give_two_senders(self):
+    """Fuzz (seeded): random event order inside each 10 ms cycle (camera status, the camera's 0xCB, ours, both MDPS), timer jitter, dropped camera
+    frames, permission flips, openpilot ACTIVE / inactive / silent, icon and nudge changes. Never two 0xCB or two MDPS in a cycle; never two cycles
+    in a row without a 0xCB while both senders tried with valid frames."""
+    import random
+    for seed in range(20):
+      rng = random.Random(seed)
+      self._init()
+      t = rng.randrange(0, 0xFFFFFFFF)
+      icon, ind, allowed, mode, prev_empty = 0, 2, rng.random() < 0.5, 'silent', False
+      for c in range(2000):
+        t = (t + 10_000 + rng.randint(-1500, 1500)) & 0xFFFFFFFF
+        allowed = (not allowed) if rng.random() < 0.003 else allowed
+        mode = rng.choice(['active', 'inactive', 'silent']) if rng.random() < 0.01 else mode
+        icon = rng.choice([0, 0, 0, 1, 2, 3]) if rng.random() < 0.004 else icon
+        ind = rng.choice([2, 3, 3, 1]) if rng.random() < 0.02 else ind
+        self.safety.set_controls_allowed(allowed)
+        events = ['icon', 'ind', 'cam', 'ours', 'real_mdps', 'ours_mdps']
+        rng.shuffle(events)
+        cam_sends = rng.random() > 0.02
+        got = dict.fromkeys(events, False)
+        for e in events:
+          self.safety.set_timer(t)
+          t = (t + rng.randint(0, 600)) & 0xFFFFFFFF
+          if e == 'icon' and (c % 5 == 0 or rng.random() < 0.01):
+            self._cam_icon(icon)
+          elif e == 'ind':
+            self._cam_ind(ind)
+          elif e == 'cam' and cam_sends:
+            got[e] = self._cb_fwd()
+          elif e == 'ours' and mode != 'silent':
+            got[e] = bool(self._cb(mode == 'active'))
+          elif e == 'real_mdps':
+            got[e] = self._mdps_fwd()
+          elif e == 'ours_mdps' and mode != 'silent':
+            got[e] = bool(self._mdps())
+        where = f"seed {seed} cycle {c} (mode {mode}, allowed {allowed}, icon {icon}, ind {ind}, order {events})"
+        self.assertFalse(got['ours'] and got['cam'], "two 0xCB senders, " + where)
+        self.assertFalse(got['ours_mdps'] and got['real_mdps'], "two MDPS senders, " + where)
+        empty = cam_sends and (mode == 'inactive' or (mode == 'active' and allowed)) and not (got['ours'] or got['cam'])
+        self.assertFalse(empty and prev_empty, "two cycles without 0xCB, " + where)
+        prev_empty = empty
+
+  def test_the_idle_boundary_inside_one_cycle_never_gives_two(self):
+    """R1: openpilot's inactive frame at last ACTIVE + 199.9 ms, the camera's at + 200.1 ms in the same cycle: the camera takes over only after a
+    cycle without openpilot's frame."""
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self._cam_run(0, 2_000_000, 0, 3)
+    self.safety.set_timer(2_000_000)
+    self.assertTrue(self._cb(True))
+    self._cam_run(2_010_000, 2_190_000, 0, 3)
+    self.safety.set_timer(2_199_900)
+    self.assertTrue(self._cb(False))
+    self.safety.set_timer(2_200_100)
+    self.assertFalse(self._cb_fwd())
+    self.assertFalse(self._mdps_fwd())
+
+  def test_mdps_follows_the_0xcb_owner_in_both_orders(self):
+    """R1: the camera gets the real MDPS only while its own 0xCB steers, openpilot's copy only while openpilot's does; at a switch it may miss one,
+    never get two (route 48 data: real ACI state 1, the copy 2)."""
+    for camera_first in (True, False):
+      with self.subTest(camera_first=camera_first):
+        self._init()
+        self.safety.set_controls_allowed(True)
+        self.assertTrue(self._cb(True))
+        self._sweep(10_000, 6_000_000, lambda t: 0, lambda t: 3 if 2_000_000 <= t < 4_000_000 else 2,
+                    active_at=lambda t: t < 1_500_000 or t >= 3_500_000, camera_first=camera_first)
+
+  def test_steering_timestamp_expires_across_a_timer_wrap(self):
+    """R1 F2: after the 0.2 s idle the steering mark is retired, so 71.6 min later (one timer wrap) the old timestamp does not look recent again."""
+    self._init()
+    self.safety.set_controls_allowed(True)
+    T = 10_000_000
+    self.safety.set_timer(T)
+    self.assertTrue(self._cb(True))
+    self._cam_run(T + 10_000, T + 2_000_000, 0, 3)
+    self.assertFalse(self._cb(False))
+    self.assertTrue(self._cb_fwd())     # the camera's, mark retired
+    self._cam_run(0xFFF00000, 0xFFFFFFFF, 0, 3)
+    self._cam_run(0, T - 10_000, 0, 3)
+    for t in range(T, T + 300_000, 10_000):
+      self.safety.set_timer(t)
+      self._cam_icon(0)
+      self._cam_ind(3)
+      self.assertTrue(self._cb_fwd(), f"t={t}")
+      self.assertTrue(self._mdps_fwd(), f"t={t}")
+
+  def test_rejected_active_frames_do_not_hold_the_window_shut(self):
+    """An ACTIVE frame the panda rejects (no permission) is not openpilot steering: it must not close the window, or the car would get neither."""
+    self._init()
+    self._cam_run(0, 2_000_000, 0, 3)
+    self.assertTrue(self._cb_fwd())
+    self.assertFalse(self._cb(True))  # no permission
+    self.assertTrue(self._cb_fwd())
+
+  def test_no_mixed_sender_with_cruise_on_and_steering_off(self):
+    """Every 10 ms with openpilot cruise on and steering off, both bus orders: never two senders, never two cycles without one (icon 0 / LFA /
+    blink, lane departure on and off)."""
+    for camera_first in (True, False):
+      with self.subTest(camera_first=camera_first):
+        self._init()
+        self.safety.set_controls_allowed(True)
+        self.safety.set_timer(0)
+        self.assertTrue(self._cb(True))
+        out = self._sweep(10_000, 6_000_000, lambda t: 2 if 2_000_000 <= t < 3_000_000 else 3 if 3_000_000 <= t < 3_050_000 else 0,
+                          lambda t: 3 if t % 100_000 < 60_000 else 2, camera_first=camera_first)
+        self.assertTrue(any(cam for _, cam in out))  # the nudge actually passed
 
   def test_no_mixed_frame_leak_around_the_window(self):
     self._own_lat_then_off()
@@ -1431,15 +1699,12 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
         self.assertTrue(self._mdps())
 
   def test_no_mixed_sender_from_boot(self):
-    self._init()
-    for t in range(0, 6_000_000, 10_000):  # icon 0 / LFA / blink, ind 3 on and off: either the camera's frame or openpilot's, never both or neither
-      self.safety.set_timer(t)
-      icon = 2 if 2_000_000 <= t < 3_000_000 else 3 if 3_000_000 <= t < 3_050_000 else 0
-      if t % 50_000 == 0:
-        self._cam_icon(icon)
-      self._cam_ind(3 if t % 100_000 < 60_000 else 2)
-      self.assertNotEqual(self._cb_fwd(), self._cb(False))
-      self.assertEqual(self._cb_fwd(), self._mdps_fwd())
+    for camera_first in (True, False):
+      with self.subTest(camera_first=camera_first):
+        self._init()
+        out = self._sweep(0, 6_000_000, lambda t: 2 if 2_000_000 <= t < 3_000_000 else 3 if 3_000_000 <= t < 3_050_000 else 0,
+                          lambda t: 3 if t % 100_000 < 60_000 else 2, camera_first=camera_first)
+        self.assertTrue(any(cam for _, cam in out))
 
   def test_lka_passes_from_boot(self):
     self._init()
