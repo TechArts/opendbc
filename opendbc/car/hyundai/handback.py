@@ -53,10 +53,11 @@ class AxisOwner:
 
 
 # The panda's lane-keeping window (hyundai_canfd.h): camera LFA_ICON 0 for >= 1.5 s and LKA_SysIndReq 3 within 0.5 s, while openpilot is not steering
-# (no accepted ACTIVE 0xCB for 0.2 s, whatever its permission). Ours is a strict subset (a later start, an earlier end, as seen through the CAN latency,
-# and 0.3 s without an ACTIVE frame), so whenever we go silent for the camera, the panda really forwards its frame, and the car never sees a gap in 0xCB;
-# the panda drops our inactive frames while its window is open, so the two never interleave. Route 48 (T23): our silence keyed on CC.latActive while the
-# panda still required both permissions off; with openpilot cruise on the car got no 0xCB for 0.85 s and the EPS faulted, 5 times.
+# (no accepted ACTIVE 0xCB for 0.2 s, whatever its permission); the panda's sender state machine decides frame by frame and drops our frames while
+# the camera's are forwarded. Ours is a strict subset (a later start, an earlier end, as seen through the CAN latency, and 0.3 s without an ACTIVE
+# frame), so whenever we go silent for the camera, the panda forwards its frame; the car misses at most one 0xCB at a switch of sender (10 ms) and
+# never gets two. Route 48 (T23): our silence keyed on CC.latActive while the panda still required both permissions off; with openpilot cruise on
+# the car got no 0xCB for 0.85 s and the EPS faulted 0.53 s in, 5 times.
 LKA_ICON_SETTLE_FRAMES = int(1.7 / DT_CTRL)  # panda 1.5 s (LFA's on/off blink lasts <= 1.3 s)
 LKA_HOLD_FRAMES = int(0.3 / DT_CTRL)         # panda 0.5 s (longest LKA_SysIndReq gap inside a nudge: 0.33 s, seen once)
 LKA_ICON_LFA = (1, 2)                        # camera LFA_ICON: grey (on, not steering) / green (on, steering)

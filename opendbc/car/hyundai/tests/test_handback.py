@@ -578,8 +578,8 @@ class TestCarControllerHandback(unittest.TestCase):
 
 
 class TestLateralSenderWithPanda(unittest.TestCase):
-  """The car controller and the real panda (libsafety) on the same camera frames, every 10 ms: the car gets exactly one 0xCB per cycle (ours accepted
-  or the camera's forwarded), at most one empty cycle at a hand-over, never two senders. Route 48 (T23): 0.85 s with neither, the EPS faulted 0.53 s in."""
+  """The car controller and the real panda (libsafety) on the same camera frames, every 10 ms: never two 0xCB or MDPS senders; a missing 0xCB only
+  at a switch of sender, never two cycles in a row, in both bus orders. Route 48 (T23): 0.85 s with neither, the EPS faulted 0.53 s in."""
   def setUp(self):
     from opendbc.safety.tests.common import CANPackerSafety
     from opendbc.safety.tests.libsafety import libsafety_py
@@ -599,43 +599,60 @@ class TestLateralSenderWithPanda(unittest.TestCase):
     self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
     self.hud = structs.CarControl.HUDControl()
     self.t = 0
+    self._panda_icon = 0
 
-  def _cycle(self, icon, ind, steer_req, lat_active, enabled, camera_first):
-    """One 10 ms cycle: the camera's frames reach the panda, the controller sends, the panda decides (camera_first: the camera's 0xCB is on the bus
-    before ours in this cycle). Returns how many 0xCB reach the car."""
+  def _cycle(self, icon, ind, steer_req, lat_active, enabled, camera_first, icon_between=None):
+    """One 10 ms cycle: the camera's status reaches the panda, the controller sends (0xCB, then its MDPS copy), the panda decides; the camera's 0xCB
+    is on the bus before ours (camera_first) or after; icon_between: a camera icon frame between the camera's 0xCB and ours (R1 F1). The controller
+    sees the icon the panda had at the end of the previous cycle (CAN latency). Returns (ours 0xCB, camera 0xCB, ours MDPS, real MDPS) as they reach
+    the car / the camera."""
     self.t += 10_000
     self.safety.set_timer(self.t)
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = self._panda_icon, ind
     if self.t % 50_000 == 0:
       self.safety.safety_rx_hook(self.spacker.make_can_msg_safety("CCNC_0x161", 2, {"LFA_ICON": icon}))
+      self._panda_icon = icon
     self.safety.safety_rx_hook(self.spacker.make_can_msg_safety("LFA", 2, {"LKA_SysIndReq": ind}))
-    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = icon, ind
     cc = structs.CarControl()
     cc.enabled, cc.latActive = enabled, lat_active
     msgs = self.cc.create_canfd_msgs(steer_req, 1 if steer_req else 0, 0.0, 0.0, False, self.hud, self.cs, cc)
     self.cc.frame += 1
     camera = camera_first and self.safety.safety_fwd_hook(2, 0xCB) == 0
-    ours = [bool(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(m[0], m[2], m[1]))) for m in msgs if m[0] == 0xCB]
+    real_mdps = camera_first and self.safety.safety_fwd_hook(0, 0xEA) == 2
+    if icon_between is not None:
+      self.safety.safety_rx_hook(self.spacker.make_can_msg_safety("CCNC_0x161", 2, {"LFA_ICON": icon_between}))
+      self._panda_icon = icon_between
+    tx = {a: [bool(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(m[0], m[2], m[1]))) for m in msgs if m[0] == a] for a in (0xCB, 0xEA)}
     if not camera_first:
       camera = self.safety.safety_fwd_hook(2, 0xCB) == 0
-    return sum(ours) + int(camera)
+      real_mdps = self.safety.safety_fwd_hook(0, 0xEA) == 2
+    return sum(tx[0xCB]), int(camera), sum(tx[0xEA]), int(real_mdps)
 
-  def _run(self, phases):
-    """phases: (seconds, icon, ind, steer_req, lat_active, enabled). In both bus orders: never two 0xCB in a cycle; a cycle without one only right
-    where openpilot asks to steer inside a nudge (its first frame is dropped and the window closes), and never two in a row."""
+  _panda_icon = 0
+
+  def _run(self, phases, icon_between_at=None):
+    """phases: (seconds, icon, ind, steer_req, lat_active, enabled). In both bus orders: never two 0xCB or two MDPS in a cycle; a cycle without a
+    0xCB only at a switch of sender (the sender after it differs from the one before) and never two in a row."""
     for camera_first in (False, True):
       self.setUp()
       if self._allow:
         getattr(self.safety, self._allow)(True)
-      prev_req, prev_n = False, 1
+      last, gap_from = 'ours', None
       for seconds, icon, ind, steer_req, lat_active, enabled in phases:
         for _ in range(int(seconds * 100)):
-          n = self._cycle(icon, ind, steer_req, lat_active, enabled, camera_first)
+          between = icon_between_at(self.t + 10_000) if icon_between_at else None
+          ours, cam, ours_mdps, real_mdps = self._cycle(icon, ind, steer_req, lat_active, enabled, camera_first, between)
           where = f"t={self.t} (camera first: {camera_first})"
-          self.assertLessEqual(n, 1, f"two senders at {where}")
-          if n == 0:
-            self.assertTrue(steer_req and not prev_req, f"no 0xCB at {where}, not at a takeover")
-            self.assertEqual(prev_n, 1, f"two cycles without 0xCB at {where}")
-          prev_req, prev_n = steer_req, n
+          self.assertLessEqual(ours + cam, 1, f"two 0xCB senders at {where}")
+          self.assertLessEqual(ours_mdps + real_mdps, 1, f"two MDPS senders at {where}")
+          if ours + cam == 0:
+            self.assertIsNone(gap_from, f"two cycles without 0xCB at {where}")
+            gap_from = last
+          else:
+            now = 'ours' if ours else 'cam'
+            if gap_from is not None:
+              self.assertNotEqual(now, gap_from, f"a cycle without 0xCB before {where}, not at a switch")
+            last, gap_from = now, None
 
   _allow = None
 
@@ -672,6 +689,18 @@ class TestLateralSenderWithPanda(unittest.TestCase):
       (1.0, 0, 3, True, True, False),
       (1.0, 0, 2, True, True, False),
     ])
+
+  def test_camera_icon_between_the_senders(self):
+    """R1 F1 for the whole pipeline: while the camera's nudge steers, an icon frame (LFA 2, blink 3, standby 1) arrives between the camera's 0xCB
+    and ours, once each, in both bus orders; then openpilot steers again."""
+    self._allow = "set_controls_allowed"
+    between = {4_000_000: 2, 6_000_000: 3, 8_000_000: 1}
+    self._run([
+      (2.0, 0, 2, True, True, True),
+      (1.5, 0, 2, False, False, True),
+      (6.0, 0, 3, False, False, True),
+      (1.0, 0, 3, True, True, True),
+    ], icon_between_at=lambda t: between.get(t))
 
 
 class TestOtherConfigsUnchanged(unittest.TestCase):

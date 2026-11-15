@@ -150,8 +150,25 @@ static uint32_t hyundai_canfd_hb_cam_icon_ts = 0U;     // when the last camera 0
 static bool hyundai_canfd_hb_cam_lka_seen = false;     // a camera 0x12A with LKA_SysIndReq 3 was seen since init
 static uint32_t hyundai_canfd_hb_cam_lka_ts = 0U;      // the last one
 static const uint32_t HYUNDAI_CANFD_HB_OP_IDLE_US = 200000U;            // openpilot sent no accepted ACTIVE 0xCB for this long = it is not steering
-static bool hyundai_canfd_hb_op_steer_seen = false;    // openpilot sent an accepted ACTIVE 0xCB since init
+static bool hyundai_canfd_hb_op_steer_seen = false;    // openpilot sent an accepted ACTIVE 0xCB less than HYUNDAI_CANFD_HB_OP_IDLE_US ago (cleared when it expires)
 static uint32_t hyundai_canfd_hb_op_steer_ts = 0U;     // the last one
+// Which 0xCB / MDPS 0xEA sender the car (and the camera) get: an explicit owner, so two senders never meet on the bus whatever the order of the
+// frames and status messages (R1 on 3a8016aa: a status frame between the two senders, the 0.2 s boundary inside a cycle, the MDPS copy after the
+// real one). A switch happens only after the old sender's frame was dropped or did not come: OURS -> TO_CAM (our frame dropped) -> CAM (the
+// camera's next frame forwarded), or OURS -> CAM directly when none of our frames went out since the camera's last one (openpilot silent);
+// CAM -> TO_OURS (our frame dropped) -> OURS (the camera's next frame blocked). At most one cycle without a 0xCB at a switch, never two senders.
+// A camera that stops for HYUNDAI_CANFD_HB_LAT_SWITCH_US hands back without that frame. The MDPS copy follows OURS, the real MDPS follows CAM.
+static const uint8_t HYUNDAI_CANFD_HB_LAT_OURS = 0U;
+static const uint8_t HYUNDAI_CANFD_HB_LAT_TO_CAM = 1U;
+static const uint8_t HYUNDAI_CANFD_HB_LAT_CAM = 2U;
+static const uint8_t HYUNDAI_CANFD_HB_LAT_TO_OURS = 3U;
+static const uint32_t HYUNDAI_CANFD_HB_LAT_SWITCH_US = 25000U;          // 2.5 cycles: the other sender's frame did not come
+static uint8_t hyundai_canfd_hb_lat_state = 0U;         // HYUNDAI_CANFD_HB_LAT_*
+static uint32_t hyundai_canfd_hb_lat_state_ts = 0U;     // when TO_CAM / TO_OURS started
+static uint32_t hyundai_canfd_hb_cam_cb_ts = 0U;        // the camera's last forwarded 0xCB (CAM)
+static bool hyundai_canfd_hb_op_cb_since_cam = false;  // our 0xCB reached the car since the camera's last 0xCB decision, less than
+static uint32_t hyundai_canfd_hb_op_cb_ts = 0U;         // HYUNDAI_CANFD_HB_LAT_CYCLE_US ago: the camera's frame now would be a second sender
+static const uint32_t HYUNDAI_CANFD_HB_LAT_CYCLE_US = 15000U;           // 1.5 cycles
 
 // the lock was armed by a CANCEL press that is down or was released less than the settle time ago
 static bool hyundai_canfd_hb_btn_settling(void) {
@@ -261,12 +278,63 @@ static void hyundai_canfd_handback_camera_lka(const CANPacket_t *msg) {
 // HYUNDAI_CANFD_HB_OP_IDLE_US), and the window is open
 static bool hyundai_canfd_handback_camera_lka_open(void) {
   const uint32_t now = microsecond_timer_get();
-  const bool op_steering = (controls_allowed || controls_allowed_lateral) && hyundai_canfd_hb_op_steer_seen &&
-                           (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_steer_ts) < HYUNDAI_CANFD_HB_OP_IDLE_US);
+  if (hyundai_canfd_hb_op_steer_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_steer_ts) >= HYUNDAI_CANFD_HB_OP_IDLE_US)) {
+    hyundai_canfd_hb_op_steer_seen = false;  // expired: an old timestamp never looks recent again after the timer wraps
+  }
+  const bool op_steering = (controls_allowed || controls_allowed_lateral) && hyundai_canfd_hb_op_steer_seen;
   return !op_steering &&
          hyundai_canfd_hb_cam_icon_zero && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_ts) <= HYUNDAI_CANFD_HB_LKA_STALE_US) &&
          (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_zero_ts) >= HYUNDAI_CANFD_HB_LKA_ICON_SETTLE_US) &&
          hyundai_canfd_hb_cam_lka_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_lka_ts) <= HYUNDAI_CANFD_HB_LKA_HOLD_US);
+}
+
+// our 0xCB: true = it may reach the car (the owner rules above), from the window decision made before this frame
+static bool hyundai_canfd_handback_lat_tx_ok(bool eligible) {
+  const uint32_t now = microsecond_timer_get();
+  bool ok = false;
+  if (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) {
+    if (eligible) {
+      hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_TO_CAM;  // the camera's nudge: our frame is the one dropped at the switch
+      hyundai_canfd_hb_lat_state_ts = now;
+    } else {
+      ok = true;
+    }
+  } else if (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM) {
+    if (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_cb_ts) > HYUNDAI_CANFD_HB_LAT_SWITCH_US) {
+      hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;  // the camera stopped sending
+      ok = true;
+    } else if (!eligible) {
+      hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_TO_OURS;  // openpilot steers (or the window closed): ours is the frame dropped at the switch
+      hyundai_canfd_hb_lat_state_ts = now;
+    } else {
+    }
+  } else {  // TO_CAM, TO_OURS: waiting for the camera's frame; it did not come
+    if (safety_get_ts_elapsed(now, hyundai_canfd_hb_lat_state_ts) > HYUNDAI_CANFD_HB_LAT_SWITCH_US) {
+      hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;
+      ok = true;
+    }
+  }
+  return ok;
+}
+
+// the camera's 0xCB: true = forward it to the car
+static bool hyundai_canfd_handback_lat_fwd_ok(void) {
+  const uint32_t now = microsecond_timer_get();
+  const bool eligible = hyundai_canfd_handback_camera_lka_open();
+  bool ok = false;
+  if ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_TO_CAM) || (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM) ||
+      ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) &&
+       !(hyundai_canfd_hb_op_cb_since_cam && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_cb_ts) <= HYUNDAI_CANFD_HB_LAT_CYCLE_US)))) {
+    ok = eligible;  // (from OURS only when no frame of ours went out since the camera's last one: openpilot is silent, nothing to drop)
+  }
+  hyundai_canfd_hb_op_cb_since_cam = false;
+  if (ok) {
+    hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_CAM;
+    hyundai_canfd_hb_cam_cb_ts = now;
+  } else {
+    hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;  // TO_OURS ends here: this camera frame is the one dropped at the switch
+  }
+  return ok;
 }
 
 static void hyundai_canfd_handback_buttons(int cruise_button, bool main_button) {
@@ -462,9 +530,10 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 
   if ((msg->addr == 0xEAU) && (msg->bus == 2U)) {
     if (hyundai_canfd_handback) {
-      // openpilot's MDPS copy only while it owns lateral; otherwise the real MDPS is forwarded and a second sender would interleave
+      // openpilot's MDPS copy only while it owns lateral (OURS); otherwise the real MDPS is forwarded (CAM) and a second sender would interleave.
+      // At a switch (TO_CAM / TO_OURS) neither: the camera may miss one MDPS frame, never get two
       hyundai_canfd_handback_step();
-      if (hyundai_canfd_handback_camera_lka_open()) {
+      if (hyundai_canfd_hb_lat_state != HYUNDAI_CANFD_HB_LAT_OURS) {
         tx = false;
       }
     } else {
@@ -486,17 +555,20 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 
     if (hyundai_canfd_handback) {
       hyundai_canfd_handback_step();
-      // openpilot owns lateral: its frames (also inactive) pass, except while the camera's lane-keeping nudge steers (one sender only). An ACTIVE frame
-      // (with permission) marks openpilot as steering. Inside the window it is dropped and the window closes at once: the camera's next 0xCB is
-      // blocked and openpilot's next frame passes. Never two senders; the car may miss one frame at that hand-over (the camera's frame of this
-      // cycle, if it comes after ours: a gap of at most two cycles, against 0.5 s before the EPS flagged on route 48)
-      const bool lka_open = hyundai_canfd_handback_camera_lka_open();
+      // one 0xCB sender (see HYUNDAI_CANFD_HB_LAT_*): openpilot's frames (also inactive) while it owns lateral, the camera's lane-departure nudge
+      // while openpilot is not steering. An accepted ACTIVE frame (with permission) marks openpilot as steering: the window closes, and if the
+      // camera owns the slot this frame is the one dropped at the switch. Never two senders; at most one cycle without a frame at a switch
+      // (route 48: 0.85 s without a frame, the EPS flagged 0.53 s in)
       if (tx && steer_angle_req && (controls_allowed || controls_allowed_lateral)) {
         hyundai_canfd_hb_op_steer_seen = true;
         hyundai_canfd_hb_op_steer_ts = microsecond_timer_get();
       }
-      if (lka_open) {
+      if (!hyundai_canfd_handback_lat_tx_ok(hyundai_canfd_handback_camera_lka_open())) {
         tx = false;
+      }
+      if (tx) {
+        hyundai_canfd_hb_op_cb_since_cam = true;
+        hyundai_canfd_hb_op_cb_ts = microsecond_timer_get();
       }
     }
   }
@@ -609,10 +681,10 @@ static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
     // block the camera's frame only while openpilot owns the axis (the car's own relay/static blocking is disabled for these addresses)
     hyundai_canfd_handback_step();
     if ((bus_num == 2) && (addr == 0xCB)) {
-      return !hyundai_canfd_handback_camera_lka_open();
+      return !hyundai_canfd_handback_lat_fwd_ok();
     }
     if ((bus_num == 0) && (addr == 0xEA)) {
-      return !hyundai_canfd_handback_camera_lka_open();
+      return hyundai_canfd_hb_lat_state != HYUNDAI_CANFD_HB_LAT_CAM;  // the real MDPS reaches the camera only while the camera's 0xCB steers
     }
     if ((bus_num == 2) && (addr == 0x1A0) && hyundai_longitudinal) {
       hyundai_canfd_handback_lock_release();
@@ -755,6 +827,11 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_canfd_hb_cam_lka_ts = 0U;
   hyundai_canfd_hb_op_steer_seen = false;
   hyundai_canfd_hb_op_steer_ts = 0U;
+  hyundai_canfd_hb_lat_state = HYUNDAI_CANFD_HB_LAT_OURS;
+  hyundai_canfd_hb_lat_state_ts = 0U;
+  hyundai_canfd_hb_cam_cb_ts = 0U;
+  hyundai_canfd_hb_op_cb_since_cam = false;
+  hyundai_canfd_hb_op_cb_ts = 0U;
   hyundai_canfd_hb_long_op = false;
   hyundai_canfd_hb_long_action = false;
   hyundai_canfd_hb_long_action_ts = 0U;
