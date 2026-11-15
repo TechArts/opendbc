@@ -1521,6 +1521,43 @@ class TestHyundaiCanfdCameraHandback(CcncLfaAltCase):
     self.assertFalse(self._mdps_fwd())
     self.assertTrue(self._mdps())
 
+  def test_silent_openpilot_gets_the_nudge_at_once_after_a_switch_back(self):
+    """R1 v3 F1: the camera steers the nudge at 100 Hz; the indicator stops (last 3 at 2.0 s), openpilot resumes inactive frames (its 0.3 s hold
+    is shorter, dropped while the camera owns), the panda's 0.5 s hold lapses at the camera frame of 2.51 s (blocked, slot back to openpilot), a new
+    indicator 3 comes right after and openpilot goes silent again: the camera's 2.52 s frame passes (one missing frame, not two)."""
+    self._init()
+    self.safety.set_controls_allowed(True)
+    self._cam_run(0, 2_000_000, 0, 3)
+    for t in range(2_000_000, 2_510_000, 10_000):
+      self.safety.set_timer(t)
+      if t % 50_000 == 0:
+        self._cam_icon(0)
+      if t > 2_000_000:
+        self._cam_ind(2)
+      self.assertTrue(self._cb_fwd(), f"t={t}")
+      if t >= 2_310_000:
+        self.assertFalse(self._cb(False), f"t={t}")  # openpilot's inactive frames while the camera owns: dropped
+    self.safety.set_timer(2_510_000)
+    self.assertFalse(self._cb_fwd())  # the panda's hold lapsed: blocked, the slot is openpilot's
+    self.safety.set_timer(2_510_100)
+    self._cam_ind(3)                  # a new nudge frame; openpilot goes silent (its window reopens)
+    self.safety.set_timer(2_520_000)
+    self.assertTrue(self._cb_fwd())   # nothing of openpilot's to drop: the camera's frame passes at once
+
+  def test_mdps_marks_expire_across_a_timer_wrap(self):
+    """R1 v3: the MDPS sender marks are retired once 7 ms passed (at the next MDPS frame, 100 Hz in the car), so one timer wrap later an old mark
+    does not alias to 'recent' and block the other sender."""
+    self._open_window_with_cruise_on()
+    self.safety.set_timer(2_010_000)
+    self.assertTrue(self._cb_fwd())
+    self.assertTrue(self._mdps_fwd())  # real MDPS mark at 2.01 s
+    self.safety.set_timer(2_030_000)
+    self.assertFalse(self._mdps())     # the camera's slot: the copy is dropped; the 2.01 s mark is retired here
+    self.safety.set_timer((2_010_000 + 0x100000000 + 1_000) & 0xFFFFFFFF)  # one wrap later: the old mark would alias to 1 ms
+    self._cam_icon(2)
+    self.assertFalse(self._cb_fwd())   # the window closed: the slot is openpilot's
+    self.assertTrue(self._mdps())       # the copy passes: no stale real-MDPS mark
+
   def test_random_bus_orders_never_give_two_senders(self):
     """Fuzz (seeded): random event order inside each 10 ms cycle (camera status, the camera's 0xCB, ours, both MDPS), timer jitter, dropped camera
     frames, permission flips, openpilot ACTIVE / inactive / silent, icon and nudge changes. Never two 0xCB or two MDPS in a cycle; never two cycles

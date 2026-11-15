@@ -178,8 +178,14 @@ static uint32_t hyundai_canfd_hb_op_mdps_ts = 0U;
 // MDPS 0xEA to the camera: ours = openpilot's copy (TX bus 2), else the real one (forwarded 0 -> 2). True = it may pass
 static bool hyundai_canfd_handback_mdps_ok(bool ours) {
   const uint32_t now = microsecond_timer_get();
-  const bool other_recent = ours ? (hyundai_canfd_hb_real_mdps_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_real_mdps_ts) < HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US))
-                                 : (hyundai_canfd_hb_op_mdps_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_mdps_ts) < HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US));
+  // expire both marks first: an old timestamp never looks recent again after the timer wraps (R1 v3)
+  if (hyundai_canfd_hb_real_mdps_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_real_mdps_ts) >= HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US)) {
+    hyundai_canfd_hb_real_mdps_seen = false;
+  }
+  if (hyundai_canfd_hb_op_mdps_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_mdps_ts) >= HYUNDAI_CANFD_HB_MDPS_SAME_CYCLE_US)) {
+    hyundai_canfd_hb_op_mdps_seen = false;
+  }
+  const bool other_recent = ours ? hyundai_canfd_hb_real_mdps_seen : hyundai_canfd_hb_op_mdps_seen;
   const bool owner = ours ? (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) : (hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_CAM);
   const bool ok = owner && !other_recent;
   if (ok && ours) {
@@ -323,7 +329,8 @@ static void hyundai_canfd_handback_lat_to_ours(void) {
   }
 }
 
-// the camera may take the slot: its window is open and the slot has been openpilot's for at least HYUNDAI_CANFD_HB_LAT_HOLD_US
+// the camera may take the slot from openpilot's frame (which is then dropped): its window is open and the slot has been openpilot's for at least
+// HYUNDAI_CANFD_HB_LAT_HOLD_US. Taking it while openpilot is silent drops nothing and needs no hold (R1 v3: else up to 30 ms without 0xCB)
 static bool hyundai_canfd_handback_cam_may_take(bool eligible) {
   if (hyundai_canfd_hb_ours_hold && (safety_get_ts_elapsed(microsecond_timer_get(), hyundai_canfd_hb_ours_since_ts) >= HYUNDAI_CANFD_HB_LAT_HOLD_US)) {
     hyundai_canfd_hb_ours_hold = false;  // expired: an old timestamp never looks recent again after the timer wraps
@@ -369,7 +376,7 @@ static bool hyundai_canfd_handback_lat_fwd_ok(void) {
     ok = eligible;
   } else if ((hyundai_canfd_hb_lat_state == HYUNDAI_CANFD_HB_LAT_OURS) &&
              !(hyundai_canfd_hb_op_cb_since_cam && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_cb_ts) <= HYUNDAI_CANFD_HB_LAT_CYCLE_US))) {
-    ok = hyundai_canfd_handback_cam_may_take(eligible);  // directly only when no frame of ours went out since the camera's last one (openpilot silent)
+    ok = eligible;  // directly only when no frame of ours went out since the camera's last one (openpilot silent: nothing to drop, no hold)
   } else {
   }
   hyundai_canfd_hb_op_cb_since_cam = false;
