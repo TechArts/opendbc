@@ -121,6 +121,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     self.BASELINE_VM = VehicleModel(get_baseline_safety_cp())
     self.apply_angle_last = 0
     self.lat_unsent = False
+    self.lat_sent = True  # the last cycle sent our 0xCB (False while the camera's hand-back owns the slot)
+    self.lat_resync = False  # this cycle's 0xCB is the inactive re-sync frame after an unsent cycle (T24)
     self.panda_check = PandaAngleCheck()
 
     self.accel_last = 0
@@ -191,6 +193,13 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
       apply_steer_req = lat_active and apply_torque != 0 and apply_angle is not None
+      # After a cycle without our 0xCB the panda steps from the last frame we sent, not from apply_angle_last: an ACTIVE frame now is replaced by
+      # one inactive frame at the measured angle, which puts both on the wheel (route 55 3:18.15, T24: 0.21 s unsent, then 87 ACTIVE frames rejected,
+      # 0.54 s without 0xCB). The hand-back counts it as a steering request, so it is sent: the panda's angle check runs on it even while the
+      # camera still owns the slot.
+      self.lat_resync = apply_steer_req and not self.lat_sent
+      if self.lat_resync:
+        apply_angle = None
 
       # Failsafe if we detected we'd violate safety. The measured angle is clipped to +-STEER_ANGLE_MAX (360 deg) on purpose: the panda
       # (lateral.h steer_angle_cmd_checks_vm, HYUNDAI_CANFD_ANGLE_STEERING_LIMITS.max_angle 3600) clamps the allowed INACTIVE band to
@@ -340,8 +349,10 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     # steering control
     send_lat, send_long = True, True
     if self.handback:
-      send_lat, send_long = self.handback.update(CC, CS, self.CP.openpilotLongitudinalControl, self.frame, steer_req=bool(apply_steer_req))
+      send_lat, send_long = self.handback.update(CC, CS, self.CP.openpilotLongitudinalControl, self.frame,
+                                                 steer_req=bool(apply_steer_req) or self.lat_resync)
 
+    self.lat_sent = send_lat
     if send_lat:
       lfa_alt_counter = self.handback.lfa_alt_counter.next(CS.cam_lfa_alt.get("COUNTER")) if self.handback else None
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque, self.apply_angle_last,
