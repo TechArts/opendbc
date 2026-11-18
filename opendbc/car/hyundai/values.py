@@ -638,6 +638,14 @@ class CAR(Platforms):
     CarSpecs(wheelbase=2.87, steerRatio=14.6),
     flags=HyundaiFlags.CANFD_RADAR_SCC,
   )
+  GENESIS_GV70_2ND_GEN = HyundaiCanFDPlatformConfig(
+    [
+      HyundaiCarDocs("Genesis GV70 (2.5T Trim, without HDA II) 2026", "Lane Follow Assist 2", car_parts=CarParts.common([CarHarness.hyundai_a])),
+    ],
+    # 2.5T AWD: wheelbase 113.2 in (Car and Driver); variable-ratio steering, so steerRatio is the value learned on the car
+    # (liveParameters 15.17, 2026-11-07). Angle steering (LFA_ALT), CCNC and camera SCC are detected from the fingerprint
+    CarSpecs(wheelbase=2.875, steerRatio=15.2),
+  )
   GENESIS_GV70_ELECTRIFIED_1ST_GEN = HyundaiCanFDPlatformConfig(
     [
       HyundaiCarDocs("Genesis GV70 Electrified (Australia Only) 2022", "All", car_parts=CarParts.common([CarHarness.hyundai_q])),
