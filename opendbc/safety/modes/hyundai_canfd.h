@@ -120,6 +120,9 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   // brake press
   if (msg_matches(msg, 0x175U, pt_bus)) {
     brake_pressed = GET_BIT(msg, 81U);
+    if (brake_pressed && hyundai_long_main_button_engage) {
+      hyundai_common_cancel_resume_disarm();  // a brake press during a pause-key hold cancels the resume, also when released again before the key
+    }
   }
 
   // vehicle moving

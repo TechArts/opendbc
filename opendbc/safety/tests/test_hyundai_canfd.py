@@ -1142,6 +1142,104 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.assertTrue(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": 0, "aReqRaw": 0, "aReqValue": 0})))
     self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": 1, "aReqRaw": 1.0, "aReqValue": 1.0})))
 
+  def test_pause_key_is_a_pause_resume_toggle(self):
+    self._init()
+    self._press_main()
+    self._tap(self.CANCEL)  # pause: the release does not resume
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())  # resume on release, not on press
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._tap(self.CANCEL)  # and pause again
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pause_key_does_not_resume_with_main_off(self):
+    self._init()
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._press_main()
+    self._tap(self.CANCEL)
+    self._button(self.CANCEL)
+    self._camera_main(False)  # main goes off while the key is down
+    self._button(0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pause_key_does_not_resume_on_a_held_brake(self):
+    self._init()
+    self._press_main()
+    self._tap(self.CANCEL)
+    self._brake(1)  # held at standstill: no rising-edge or moving exit after this
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._brake(0)
+    self._tap(self.CANCEL)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pause_key_without_flag_only_cancels(self):
+    self._init(param_sp=self.BASE_SP)
+    self._press_main()  # main toggles (MADS), no engage
+    self.assertTrue(self.safety.get_acc_main_on())
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._tap(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pause_key_resume_is_gated_like_the_stock_one(self):
+    # a resume needs the press to have started with controls off: a press that started with controls on only exits
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    for _ in range(3):
+      self._button(self.CANCEL)
+    self._button(0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  # --- policy: during a pause-key hold any brake press, main change or lag fault disarms the pending resume; the release only pauses
+  def _hold_resume_released(self, interrupt):
+    self._init()
+    self._press_main()
+    self._tap(self.CANCEL)  # paused: main on, controls off
+    self.assertFalse(self.safety.get_controls_allowed())
+    for _ in range(7):
+      self._button(self.CANCEL)
+    interrupt()
+    self._button(0)
+    return self.safety.get_controls_allowed()
+
+  def test_hold_brake_pressed_and_released_disarms(self):
+    def interrupt():
+      self._brake(1)
+      self._brake(0)
+    self.assertFalse(self._hold_resume_released(interrupt))
+    # pause only: a fresh press starts clean
+    for _ in range(3):
+      self._button(self.CANCEL)
+    self._button(0)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_hold_main_off_then_on_disarms(self):
+    def interrupt():
+      self._camera_main(False)
+      self._camera_main(True)
+    self.assertFalse(self._hold_resume_released(interrupt))
+
+  def test_hold_main_off_disarms(self):
+    self.assertFalse(self._hold_resume_released(lambda: self._camera_main(False)))
+
+  def test_hold_lag_fault_disarms(self):
+    def interrupt():
+      self.safety.set_timer(5_000_000)
+      self.safety.safety_tick()
+    self.assertFalse(self._hold_resume_released(interrupt))
+
+  def test_hold_safety_reinit_disarms(self):
+    # a lost heartbeat re-initializes the safety: the pending resume is gone with it
+    self.assertFalse(self._hold_resume_released(lambda: self._init() or self.safety.set_controls_allowed(False)))
+
+  def test_hold_without_fault_still_resumes(self):
+    self.assertTrue(self._hold_resume_released(lambda: None))
+
 
 if __name__ == "__main__":
   unittest.main()

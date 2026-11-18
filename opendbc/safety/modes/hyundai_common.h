@@ -87,6 +87,10 @@ static uint32_t main_press_ts;
 static bool camera_main_rise_valid;
 static uint32_t camera_main_rise_ts;
 
+// main-button engage: the pause key (CANCEL) is a pause/resume toggle like the stock cruise. A press that starts with controls off and main on
+// resumes controls on its release (like RES); a press that starts with controls on only exits them
+static bool cancel_resume_armed;
+
 void hyundai_common_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_EV_GAS = 1;
   const uint16_t HYUNDAI_PARAM_HYBRID_GAS = 2;
@@ -117,6 +121,7 @@ void hyundai_common_init(uint16_t param) {
   mads_main_off_keeps_lateral = false;
   main_press_valid = false;
   camera_main_rise_valid = false;
+  cancel_resume_armed = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
   acc_main_on_mismatches = 0U;
@@ -146,6 +151,19 @@ void hyundai_common_cruise_state_check(const bool cruise_engaged) {
   }
 }
 
+// main-button engage: a pause-key resume request lives only for one uninterrupted hold. A brake press, a main change (off, or off and on again) or a
+// lag fault (safety_rx_checks_invalid) while the key is down cancels it: the release then only pauses, the driver has to start a new press. A lost
+// heartbeat re-initializes the safety (init resets the request). The heartbeat engaged-mismatch counts are not part of this: openpilot cannot see them
+static void hyundai_common_cancel_resume_disarm(void) {
+  cancel_resume_armed = false;
+}
+
+static void hyundai_common_cancel_resume_fault_check(void) {
+  if (safety_rx_checks_invalid) {
+    hyundai_common_cancel_resume_disarm();
+  }
+}
+
 void hyundai_common_cruise_buttons_check(const int cruise_button, const bool main_button) {
   if ((cruise_button == HYUNDAI_BTN_RESUME) || (cruise_button == HYUNDAI_BTN_SET) || (cruise_button == HYUNDAI_BTN_CANCEL) || main_button) {
     hyundai_last_button_interaction = 0U;
@@ -154,6 +172,8 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
   }
 
   if (hyundai_longitudinal) {
+    hyundai_common_cancel_resume_fault_check();
+
     // enter controls on falling edge of resume or set. With main-button engage a release with main off must not arm controls
     bool set = (cruise_button != HYUNDAI_BTN_SET) && (cruise_button_prev == HYUNDAI_BTN_SET);
     bool res = (cruise_button != HYUNDAI_BTN_RESUME) && (cruise_button_prev == HYUNDAI_BTN_RESUME);
@@ -163,7 +183,19 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
 
     // exit controls on cancel press
     if (cruise_button == HYUNDAI_BTN_CANCEL) {
+      if ((cruise_button_prev != HYUNDAI_BTN_CANCEL) && hyundai_long_main_button_engage) {
+        cancel_resume_armed = !controls_allowed && acc_main_on;  // decided once, at the start of the press
+      }
       controls_allowed = false;
+    }
+
+    // main-button engage: a pause-key press that started with controls off resumes them on its release, if main is still on and the brake is
+    // not held (openpilot does not engage on a held brake either)
+    if ((cruise_button != HYUNDAI_BTN_CANCEL) && (cruise_button_prev == HYUNDAI_BTN_CANCEL)) {
+      if (cancel_resume_armed && acc_main_on && !brake_pressed) {
+        controls_allowed = true;
+      }
+      cancel_resume_armed = false;
     }
 
     // main-button engage: the press only marks the engage request, the camera's main state does the rest (hyundai_common_camera_main_update)
@@ -193,6 +225,10 @@ void hyundai_common_camera_main_update(const bool camera_main) {
   const bool rising = camera_main && !acc_main_on;
   const bool falling = !camera_main && acc_main_on;
   acc_main_on = camera_main;
+
+  if (rising || falling) {
+    hyundai_common_cancel_resume_disarm();  // main changed during a pause-key hold
+  }
 
   if (rising) {
     camera_main_rise_valid = true;
