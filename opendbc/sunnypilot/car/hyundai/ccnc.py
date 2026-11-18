@@ -206,7 +206,9 @@ class CcncCarController:
     if not self.ccnc_lfa_steering:
       return can_sends
 
-    can_sends.append(create_ccnc_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt if self.lfa_alt_steering else None))
+    # no MDPS copy until a real MDPS frame has been received; the panda forwards the real one until our first copy
+    if CS.mdps:
+      can_sends.append(create_ccnc_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt if self.lfa_alt_steering else None))
 
     if self.CP.openpilotLongitudinalControl:
       if not CC.enabled or CC.hudControl.leadDistanceBars != self.lead_distance_bars_last:

@@ -10,7 +10,7 @@ from opendbc.sunnypilot.car.hyundai.values import ANGLE_MODEL_MASK, ANGLE_STEERI
 from opendbc.car.structs import CarParams
 from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.common import away_round, round_speed
+from opendbc.safety.tests.common import away_round, round_speed, make_msg
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.hyundai_common import HyundaiButtonBase, HyundaiLongitudinalBase
 from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm, AngleSteeringLimitsVM
@@ -574,7 +574,7 @@ class HyundaiCanfdLFAAltAngleBase(TestHyundaiCanfdLKASteeringAltAngle):
 
   TX_MSGS = [[0xCB, 0], [0x1A0, 0], [0x1CF, 2], [0x161, 0], [0x162, 0], [0xEA, 2]]
   RELAY_MALFUNCTION_ADDRS = {0: (0xCB, 0x161, 0x162), 2: (0xEA,)}
-  FWD_BLACKLISTED_ADDRS = {0: [0xEA], 2: [0xCB, 0x161, 0x162]}
+  FWD_BLACKLISTED_ADDRS = {2: [0xCB, 0x161, 0x162]}  # 0xEA is forwarded until openpilot sends its own
 
   PT_BUS = 0
   SCC_BUS = 2
@@ -604,6 +604,29 @@ class HyundaiCanfdLFAAltAngleBase(TestHyundaiCanfdLKASteeringAltAngle):
     self.assertFalse(self._tx(self.packer.make_can_msg_safety("LFA", 0, {})))
     self.assertFalse(self._tx(self.packer.make_can_msg_safety("LFAHDA_CLUSTER", 0, {})))
 
+  def test_mdps_forwarded_until_openpilot_sends_its_own(self):
+    # the camera needs an MDPS at all times: the real one reaches it until our copy starts, then only ours
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+    self.assertTrue(self._tx(make_msg(2, 0xEA, 24)))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0xEA))
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0x12A))  # only 0xEA is affected
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, self.SAFETY_PARAM)  # a new init starts forwarding it again
+    self.safety.init_tests()
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+
+  def test_mdps_copy_only_on_camera_bus(self):
+    self.assertFalse(self._tx(make_msg(0, 0xEA, 24)))
+    self.assertEqual(2, self.safety.safety_fwd_hook(0, 0xEA))
+
+  def test_mdps_forward_stays_blocked_without_lfa_alt(self):
+    # outside LFA_ALT the static block stays: the other CCNC lists never forward the real 0xEA
+    self.safety.set_current_safety_param_sp(self.SAFETY_PARAM_SP & ~HyundaiSafetyFlagsSP.CANFD_LFA_ALT_STEER)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, self.SAFETY_PARAM)
+    self.safety.init_tests()
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0xEA))
+    self._tx(make_msg(2, 0xEA, 24))
+    self.assertEqual(-1, self.safety.safety_fwd_hook(0, 0xEA))
+
   def test_lfa_alt_requires_angle_ccnc(self):
     lfa_alt = self.packer.make_can_msg_safety("LFA_ALT", 0, {"ADAS_ActvACILvl2Sta": 1})
     for param, param_sp in ((self.SAFETY_PARAM, self.SAFETY_PARAM_SP & ~HyundaiSafetyFlagsSP.CCNC),
@@ -631,7 +654,7 @@ class TestHyundaiCanfdLFAAltAngle(HyundaiCanfdLFAAltAngleBase):
 class TestHyundaiCanfdLFAAltAngleLong(HyundaiLongitudinalBase, HyundaiCanfdLFAAltAngleBase):
 
   RELAY_MALFUNCTION_ADDRS = {0: (0xCB, 0x1A0, 0x161, 0x162), 2: (0x1CF, 0xEA)}
-  FWD_BLACKLISTED_ADDRS = {0: [0x1CF, 0xEA], 2: [0xCB, 0x1A0, 0x161, 0x162]}
+  FWD_BLACKLISTED_ADDRS = {0: [0x1CF], 2: [0xCB, 0x1A0, 0x161, 0x162]}
 
   DISABLED_ECU_UDS_MSG = (0x7D0, 0)
   DISABLED_ECU_ACTUATION_MSG = (0x1a0, 0)
