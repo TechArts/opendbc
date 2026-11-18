@@ -171,6 +171,9 @@ class HyundaiFlags(IntFlag):
 
   HAS_BSM = 2 ** 27  # blind spot monitoring
 
+  # MRR35 front radar on ACAN (bus 1) streams 32 tracks in 0x3A5-0x3C4
+  CANFD_MRR35_RADAR = 2 ** 28
+
 
 @dataclass
 class HyundaiCarDocs(CarDocs):
@@ -645,6 +648,8 @@ class CAR(Platforms):
     # 2.5T AWD: wheelbase 113.2 in (Car and Driver); variable-ratio steering, so steerRatio is the value learned on the car
     # (liveParameters 15.17, 2026-11-07). Angle steering (LFA_ALT), CCNC and camera SCC are detected from the fingerprint
     CarSpecs(wheelbase=2.875, steerRatio=15.2),
+    dbc_dict={Bus.pt: "hyundai_canfd_generated", Bus.radar: "hyundai_radar_3a5_3c4_generated"},
+    flags=HyundaiFlags.CANFD_MRR35_RADAR,
   )
   GENESIS_GV70_ELECTRIFIED_1ST_GEN = HyundaiCanFDPlatformConfig(
     [
