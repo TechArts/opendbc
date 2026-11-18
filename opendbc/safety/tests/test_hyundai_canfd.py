@@ -1100,6 +1100,48 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.assertTrue(self.safety.get_acc_main_on())
     self.assertEqual(0, self.safety.get_acc_main_on_mismatches())
 
+  def _camera_acc(self, acc_mode, main=1):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"ACCMode": acc_mode, "MainMode_ACC": main}))
+    self.cam = bool(main)
+
+  def _scc_fwd(self):
+    return self.safety.safety_fwd_hook(2, 0x1A0)
+
+  def test_stock_acc_never_reaches_the_car(self):
+    """F21/F23 (stock ACC lock-out): with openpilot longitudinal the camera's 0x1A0 is a statically blocked relay-checked message, so no ACC-active
+    frame of the camera reaches the car in any state: before the engage, after it, on a pause or cancel press, when the camera engages by itself,
+    after a brake or main off. Openpilot's own frames (ACCMode 0 when not engaged) are the only 0x1A0 the car sees."""
+    for param_sp in (None, self.BASE_SP):  # with and without main-button engage
+      with self.subTest(param_sp=param_sp):
+        self._init(param_sp=param_sp)
+        self.assertEqual(-1, self._scc_fwd())
+        self._press_main()
+        self.assertEqual(-1, self._scc_fwd())
+        self._camera_acc(1)
+        self.assertEqual(-1, self._scc_fwd())
+        self._tap(self.CANCEL)
+        self._camera_acc(1)  # the pause key is the camera's resume key too
+        self.assertEqual(-1, self._scc_fwd())
+        self._brake(1)
+        self._camera_acc(2)
+        self.assertEqual(-1, self._scc_fwd())
+        self._camera_acc(4, main=0)
+        self.assertEqual(-1, self._scc_fwd())
+
+  def test_camera_acc_engaging_by_itself_does_not_enter_controls(self):
+    self._init()
+    self._camera_acc(4)  # main on, standby
+    self._camera_acc(1)  # the camera engages without a driver press for openpilot
+    self._camera_acc(1)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertEqual(-1, self._scc_fwd())
+
+  def test_stock_acc_openpilot_off_frames_pass_safety(self):
+    # the replacement frame for the camera's own: ACCMode 0, no acceleration, allowed without controls
+    self._init()
+    self.assertTrue(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": 0, "aReqRaw": 0, "aReqValue": 0})))
+    self.assertFalse(self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"ACCMode": 1, "aReqRaw": 1.0, "aReqValue": 1.0})))
+
 
 if __name__ == "__main__":
   unittest.main()
