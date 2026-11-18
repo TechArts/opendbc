@@ -811,5 +811,295 @@ class TestHyundaiCanfdLFASteeringCCNCLong(TestHyundaiCanfdLFASteeringLongBase, T
         self.assertTrue(self._tx(self._button_msg(btn, main_button=main_btn, bus=self.BUTTONS_TX_BUS)))
 
 
+class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
+  """CCNC LFA_ALT camera-SCC longitudinal: the camera's own MainMode_ACC (bus 2 0x1A0) is the main cruise state. Its rising edge with a main
+  button press nearby engages openpilot longitudinal, its falling edge disengages. A press the camera ignores or a camera change without a
+  press does nothing."""
+
+  BASE = HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.LONG
+  BASE_SP = HyundaiSafetyFlagsSP.CANFD_ANGLE_STEERING | HyundaiSafetyFlagsSP.CCNC | HyundaiSafetyFlagsSP.CANFD_LFA_ALT_STEER
+  FLAG = HyundaiSafetyFlagsSP.MAIN_BUTTON_ENGAGE
+  SET, RESUME, CANCEL = 2, 1, 4
+
+  def setUp(self):
+    self.packer = common.CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)
+
+  def _init(self, param=None, param_sp=None, toggleable=True):
+    param = self.BASE if param is None else param
+    param_sp = (self.BASE_SP | self.FLAG) if param_sp is None else param_sp
+    if toggleable:
+      param_sp |= HyundaiSafetyFlagsSP.LONG_MAIN_CRUISE_TOGGLEABLE
+    self.safety.set_current_safety_param_sp(int(param_sp))
+    self.safety.set_safety_hooks(CarParams.SafetyModel.hyundaiCanfd, int(param))
+    self.safety.init_tests()
+    self.safety.set_timer(0)
+    self.cam = False
+
+  def _button(self, buttons=0, main=0):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
+
+  def _brake(self, pressed):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
+
+  def _camera_main(self, on):
+    self.cam = on
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 2, {"MainMode_ACC": int(on)}))
+
+  def _press_main(self, frames=3, camera=True):
+    """A main press; the camera toggles its main state on the first frame of it (unless it ignores the press)."""
+    for i in range(frames):
+      self._button(main=1)
+      if i == 0 and camera:
+        self._camera_main(not self.cam)
+    self._button(main=0)
+
+  def _tap(self, btn, frames=3):
+    for _ in range(frames):
+      self._button(btn)
+    self._button(0)
+
+  def test_main_press_engages(self):
+    self._init()
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(main=1)  # a press alone does not change main: only the camera does
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._camera_main(True)
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_camera_ignores_press(self):
+    self._init()
+    self._press_main(camera=False)  # e.g. brake held at low speed: the stock car does not engage either
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(100_000_000)
+    self._camera_main(True)  # much later, no press near it
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_camera_reacts_before_press_is_seen(self):
+    self._init()
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(200_000)
+    self._button(main=1)
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_camera_main_without_press_does_not_arm(self):
+    self._init()
+    self._camera_main(True)
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(2_000_000)
+    self._button(main=1)  # a press long after: nothing to pair with
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_stale_press_does_not_arm(self):
+    self._init()
+    self._button(main=1)
+    self._button(main=0)
+    self.safety.set_timer(2_000_000)
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_camera_main_falling_disengages_and_keeps_lateral(self):
+    self._init()
+    self.safety.set_mads_params(True, False, False)
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed() and self.safety.get_controls_allowed_lateral())
+    self._camera_main(False)  # also without a press (e.g. the car switched ACC off)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_does_not_toggle_by_press_alone(self):
+    self._init()
+    self._press_main(camera=False)
+    self._press_main(camera=False)
+    self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_second_main_press_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._press_main()  # camera: main off
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._press_main()  # and again: engage
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_long_press_is_one_transition(self):
+    self._init()
+    self._press_main(frames=200)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())
+
+  def test_main_press_engages_at_standstill_and_moving(self):
+    for speed in (0, 20):
+      with self.subTest(speed=speed):
+        self._init()
+        self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": speed * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+        self._press_main()
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_without_flag_main_never_engages(self):
+    self._init(param_sp=self.BASE_SP)
+    self._press_main()
+    self.assertTrue(self.safety.get_acc_main_on())  # main still toggles (MADS)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_flag_requires_ccnc_lfa_alt_long(self):
+    # the flag alone, without the rest of the config, is ignored
+    full = self.BASE_SP | self.FLAG
+    for param, param_sp in ((self.BASE & ~HyundaiSafetyFlags.LONG, full), (self.BASE & ~HyundaiSafetyFlags.CAMERA_SCC, full),
+                            (self.BASE, full & ~HyundaiSafetyFlagsSP.CCNC), (self.BASE, full & ~HyundaiSafetyFlagsSP.CANFD_LFA_ALT_STEER),
+                            (self.BASE, full & ~HyundaiSafetyFlagsSP.CANFD_ANGLE_STEERING),
+                            (self.BASE | HyundaiSafetyFlags.CANFD_ALT_BUTTONS, full), (self.BASE | HyundaiSafetyFlags.CANFD_LKA_STEER_MSG, full)):
+      with self.subTest(param=int(param), param_sp=int(param_sp)):
+        self._init(param, param_sp)
+        self._press_main()
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_toggleable_flag_irrelevant(self):
+    self._init(toggleable=False)  # the camera, not a toggled flag, is the main state
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_cancel_still_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(self.CANCEL)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_acc_main_on())  # pause: main stays on
+
+  def test_cancel_wins_over_simultaneous_main(self):
+    self._init()
+    self._button(self.CANCEL, main=1)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_brake_still_disengages(self):
+    self._init()
+    self._press_main()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._brake(1)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_set_resume_without_flag_unchanged(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init(param_sp=self.BASE_SP)
+        self._button(btn)
+        self.assertFalse(self.safety.get_controls_allowed())  # engages on release, not press
+        self._button(0)
+        self.assertTrue(self.safety.get_controls_allowed())
+        self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_set_resume_with_main_off_does_not_arm(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init()
+        self._button(btn)
+        self._button(0)
+        self.assertFalse(self.safety.get_acc_main_on())
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._press_main(camera=False)  # camera main still off after an ignored press
+        self._button(btn)
+        self._button(0)
+        self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_set_resume_with_main_on_arms(self):
+    for btn in (self.SET, self.RESUME):
+      with self.subTest(btn=btn):
+        self._init()
+        self._press_main()
+        self._button(self.CANCEL)  # main stays on, controls off
+        self._button(0)
+        self.assertTrue(self.safety.get_acc_main_on())
+        self.assertFalse(self.safety.get_controls_allowed())
+        self._button(btn)
+        self._button(0)
+        self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_set_after_main_off_does_not_rearm(self):
+    self._init()
+    self._press_main()  # engage
+    self._press_main()  # main off
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._button(self.SET)
+    self._button(0)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_init_resets_flag(self):
+    self._init()
+    self._init(param_sp=self.BASE_SP)
+    self._press_main()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def _lateral_on(self, param_sp=None):
+    self._init(param_sp=param_sp)
+    self.safety.set_mads_params(True, False, False)
+    self._press_main()  # main on: also requests lateral
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_off_keeps_lateral_with_flag(self):
+    self._lateral_on()
+    self._press_main()  # second press: main off ends cruise only
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_main_off_drops_lateral_without_flag(self):
+    self._init(param_sp=self.BASE_SP)
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._button(main=1)
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_other_lateral_exits_unchanged_with_flag(self):
+    # heartbeat mismatch (sunnypilot ended lateral, e.g. LFA button) still exits after 3 checks
+    self._lateral_on()
+    self.safety.set_heartbeat_engaged_mads(True)
+    for _ in range(5):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.set_heartbeat_engaged_mads(False)
+    for _ in range(3):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_flag_resets_on_init(self):
+    self._lateral_on()
+    self._init(param_sp=self.BASE_SP)
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self._button(main=1)
+    self._button(main=0)
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_openpilot_scc_control_not_part_of_main_state(self):
+    # our own MainMode_ACC in SCC_CONTROL is not compared with the camera's: no desync exit in this config
+    self._init()
+    self.safety.set_mads_params(True, False, False)
+    self._press_main()
+    for _ in range(10):
+      self.safety.safety_tx_hook(self.packer.make_can_msg_safety("SCC_CONTROL", 0, {"MainMode_ACC": 0}))
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertEqual(0, self.safety.get_acc_main_on_mismatches())
+
+
 if __name__ == "__main__":
   unittest.main()

@@ -15,6 +15,7 @@ class HyundaiSafetyFlagsSP:
   HAS_LDA_BUTTON = 4
   NON_SCC = 8
   CCNC = 16
+  MAIN_BUTTON_ENGAGE = 32  # the camera's main state engages openpilot longitudinal (CCNC LFA_ALT camera-SCC long only)
   CANFD_LFA_ALT_STEER = 64
   CANFD_ANGLE_STEERING = 128
 

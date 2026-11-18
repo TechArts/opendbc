@@ -230,6 +230,10 @@ class CarInterface(CarInterfaceBase):
       ret.flags |= HyundaiFlagsSP.CANFD_LFA_ALT_STEER.value
       ret.safetyParam |= HyundaiSafetyFlagsSP.CANFD_LFA_ALT_STEER
 
+      # CCNC LFA_ALT camera SCC with openpilot longitudinal: the camera's main state engages openpilot cruise (same conditions as the panda)
+      if stock_cp.openpilotLongitudinalControl and not stock_cp.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
+        ret.safetyParam |= HyundaiSafetyFlagsSP.MAIN_BUTTON_ENGAGE
+
     if ret.flags & HyundaiFlagsSP.CCNC and lka_steering:
       # this needs to be figured out for ccNC cars with an ADAS Driving ECU
       stock_cp.alphaLongitudinalAvailable = False

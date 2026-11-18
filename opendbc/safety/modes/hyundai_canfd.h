@@ -143,6 +143,9 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     hyundai_common_cruise_state_check(cruise_engaged);
     acc_main_on = GET_BIT(msg, 66U);
   }
+  if (msg_matches(msg, 0x1a0U, scc_bus) && hyundai_longitudinal && hyundai_long_main_button_engage) {
+    hyundai_common_camera_main_update(GET_BIT(msg, 66U));
+  }
 
   hyundai_common_reset_acc_main_on_mismatches();
 }
@@ -282,8 +285,10 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
       tx = false;
     }
 
-    acc_main_on_tx = GET_BIT(msg, 66U);
-    hyundai_common_acc_main_on_sync();
+    if (!hyundai_long_main_button_engage) {  // there the camera's main state is the only source, nothing to compare
+      acc_main_on_tx = GET_BIT(msg, 66U);
+      hyundai_common_acc_main_on_sync();
+    }
   }
 
   return tx;
@@ -365,6 +370,11 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_canfd_lka_steer_msg_alt = GET_FLAG(param, HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT);
   hyundai_canfd_lfa_alt_steer = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CANFD_LFA_ALT_STEER) && hyundai_canfd_angle_steering &&
                                 !hyundai_canfd_lka_steer_msg && hyundai_camera_scc && hyundai_ccnc;
+  // main button engage: the camera's main state engages openpilot longitudinal; only valid with the CCNC LFA_ALT camera-SCC long config
+  hyundai_long_main_button_engage = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_MAIN_BUTTON_ENGAGE) && hyundai_canfd_lfa_alt_steer &&
+                                    hyundai_longitudinal && !hyundai_canfd_alt_buttons;
+  // the main button is the cruise button on this config, so main off ends cruise only
+  mads_main_off_keeps_lateral = hyundai_long_main_button_engage;
 
   safety_config ret;
   if (hyundai_longitudinal) {
@@ -397,7 +407,15 @@ static safety_config hyundai_canfd_init(uint16_t param) {
         {0xEA,  2, 24, .check_relay = true},  // MDPS
       };
 
-      if (hyundai_canfd_alt_buttons) {
+      // main-button engage follows the camera's own MainMode_ACC (bus 2 0x1A0), so that frame must be a checked rx message
+      static RxCheck hyundai_canfd_long_camera_main_rx_checks[] = {
+        HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(0)
+        HYUNDAI_CANFD_SCC_ADDR_CHECK(2)
+      };
+
+      if (hyundai_long_main_button_engage) {
+        SET_RX_CHECKS(hyundai_canfd_long_camera_main_rx_checks, ret);
+      } else if (hyundai_canfd_alt_buttons) {
         SET_RX_CHECKS(hyundai_canfd_alt_buttons_long_rx_checks, ret);
       } else {
         SET_RX_CHECKS(hyundai_canfd_long_rx_checks, ret);
