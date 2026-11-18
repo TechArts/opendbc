@@ -195,16 +195,24 @@ class CcncCarController:
           self.lead_distance_filter.update(self.lead_distance)
 
     if self.frame % 5 == 0:
-      lat_active = self.mads.lat_active if self.mads.enable_mads else CC.enabled
-      paused = self.mads.enable_mads and self.mads.paused
+      lat_active, paused, long_enabled_icons = self.dash_states(CS, CC)
       set_speed = self._get_set_speed(CS.out.vCruiseCluster, CS.is_metric)
 
-      can_sends.append(create_ccnc_0x161(self.packer, self.CAN, self.frame, CS.msg_161, CC.enabled, lat_active, paused,
+      can_sends.append(create_ccnc_0x161(self.packer, self.CAN, self.frame, CS.msg_161, long_enabled_icons, lat_active, paused,
                                          self.CP.openpilotLongitudinalControl, CS.main_cruise_enabled, CC.cruiseControl.override,
                                          CC.hudControl, set_speed, CS.out.vEgo, self.lead_visible,
                                          self.frame - self.distance_bar_frame < 400))
-      can_sends.append(create_ccnc_0x162(self.packer, self.CAN, CS.msg_162, CC.enabled, self.CP.openpilotLongitudinalControl,
+      can_sends.append(create_ccnc_0x162(self.packer, self.CAN, CS.msg_162, long_enabled_icons, self.CP.openpilotLongitudinalControl,
                                          CS.main_cruise_enabled, CC.cruiseControl.override, self.lead_visible,
                                          self.lead_distance_filter.x))
 
     return can_sends
+
+  def dash_states(self, CS, CC):
+    """(lat_active, lat_paused, cruise_shown) for the dash: what each axis is really doing, independent of the other. A steering fault is not a
+    pause (wheel hidden, not grey), and a faulted ACC shows no cruise at all."""
+    lat_active = self.mads.lat_active if self.mads.enable_mads else CC.enabled
+    paused = self.mads.enable_mads and self.mads.paused
+    if not lat_active and (CS.out.steerFaultTemporary or CS.out.steerFaultPermanent):
+      paused = False
+    return lat_active, paused, bool(CC.enabled and not CS.out.accFaulted)
