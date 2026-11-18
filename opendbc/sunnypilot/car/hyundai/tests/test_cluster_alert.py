@@ -20,13 +20,13 @@ class FakeCAN:
   ECAN = 0
 
 
-CLUSTER_FIELDS = [f"ALERTS_{i}" for i in range(1, 6)] + [f"SOUNDS_{i}" for i in range(1, 5)] + list(FAULT_VALUES)
+CLUSTER_FIELDS_161 = [f"ALERTS_{i}" for i in range(1, 6)] + [f"SOUNDS_{i}" for i in range(1, 5)]
 
 
 def stock_frames(**overrides):
   msg_161 = {"ALERTS_1": 0, "ALERTS_2": 0, "ALERTS_3": 0, "ALERTS_4": 0, "ALERTS_5": 0, "SOUNDS_1": 0, "SOUNDS_2": 0, "SOUNDS_3": 0,
-             "SOUNDS_4": 0, "LFA_ICON": 0, **FAULT_VALUES}
-  msg_162 = {"VIBRATE": 0}
+             "SOUNDS_4": 0, "LFA_ICON": 0}
+  msg_162 = {"VIBRATE": 0, **FAULT_VALUES}
   msg_161.update(overrides)
   return msg_161, msg_162
 
@@ -64,9 +64,9 @@ class TestCcncClusterAlert(unittest.TestCase):
     for alert, overrides_list in cases.items():
       for overrides in overrides_list:
         msg_161, msg_162 = stock_frames(**overrides)
-        before = {k: msg_161[k] for k in CLUSTER_FIELDS}
+        before = {k: msg_161[k] for k in CLUSTER_FIELDS_161}
         out_161, out_162 = run_ccnc(msg_161, msg_162, alert)
-        self.assertEqual({k: out_161[k] for k in CLUSTER_FIELDS}, before, (alert, overrides))
+        self.assertEqual({k: out_161[k] for k in CLUSTER_FIELDS_161}, before, (alert, overrides))
         self.assertEqual(out_162["VIBRATE"], 0, (alert, overrides))
 
   def test_unrelated_stock_alert_does_not_block(self):
@@ -76,9 +76,9 @@ class TestCcncClusterAlert(unittest.TestCase):
 
   def test_faults_untouched(self):
     for alert in (ClusterAlert.red, ClusterAlert.green):
-      out_161, _ = run_ccnc(*stock_frames(), alert)
+      _, out_162 = run_ccnc(*stock_frames(), alert)
       for k, v in FAULT_VALUES.items():
-        self.assertEqual(out_161[k], v)
+        self.assertEqual(out_162[k], v)
 
   def test_stock_target_field_never_overwritten_in_long_and_non_long(self):
     # the stock frame decides, in long and non-long mode
@@ -104,12 +104,14 @@ class TestCcncClusterAlert(unittest.TestCase):
     out_161, out_162 = run_ccnc(*stock_frames(), ClusterAlert.red)
     parser = CANParser(DBC, [("CCNC_0x161", 0), ("CCNC_0x162", 0)], 0)
     for name, vals in (("CCNC_0x161", out_161), ("CCNC_0x162", out_162)):
-      addr, dat, bus = packer.make_can_msg(name, 0, {k: v for k, v in vals.items() if k not in FAULT_VALUES})
+      addr, dat, bus = packer.make_can_msg(name, 0, vals)
       parser.update([(0, [(addr, dat, bus)])])
     self.assertEqual((parser.vl["CCNC_0x161"]["ALERTS_3"], parser.vl["CCNC_0x161"]["SOUNDS_3"], parser.vl["CCNC_0x162"]["VIBRATE"]), (18, 5, 1))
+    for k, v in FAULT_VALUES.items():  # the camera's real faults survive the re-sent frame
+      self.assertEqual(parser.vl["CCNC_0x162"][k], v)
     out_161, out_162 = run_ccnc(*stock_frames(), ClusterAlert.green)
     for name, vals in (("CCNC_0x161", out_161), ("CCNC_0x162", out_162)):
-      addr, dat, bus = packer.make_can_msg(name, 0, {k: v for k, v in vals.items() if k not in FAULT_VALUES})
+      addr, dat, bus = packer.make_can_msg(name, 0, vals)
       parser.update([(0, [(addr, dat, bus)])])
     self.assertEqual((parser.vl["CCNC_0x161"]["ALERTS_5"], parser.vl["CCNC_0x161"]["SOUNDS_2"]), (11, 2))
 
