@@ -11,6 +11,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR
+from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.car.hyundai.panda_angle import PandaAngleCheck
 from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
 from opendbc.car.hyundai.takeover import TakeoverFilter, STEP_CAP_DEG
@@ -24,7 +25,7 @@ from opendbc.sunnypilot.car.hyundai.lfa_alt import LFA_ALT_ANGLE_LIMITS, create_
 from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
 from opendbc.sunnypilot.car.hyundai.mads import MadsCarController
-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -132,6 +133,11 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     self.BASELINE_VM = VehicleModel(get_baseline_safety_cp())
     self.apply_angle_last = 0
     self.lat_unsent = False  # latActive, but no ACTIVE 0xCB goes out this cycle (gain 0, driver takeover, or a request the panda would reject)
+    self.lat_sent = True  # the last cycle sent our 0xCB (False while the camera's lane-keeping nudge owns the slot)
+    self.lat_resync = False  # this cycle's 0xCB is the inactive re-sync frame after an unsent cycle (T24)
+
+    # camera hand-back (GV70 CCNC LFA_ALT): openpilot sends the lateral frames except while the car's own lane-keeping nudge steers, see handback.py
+    self.handback = CameraHandback() if CP_SP.safetyParam & HyundaiSafetyFlagsSP.CAMERA_HANDBACK else None
     self.panda_check = PandaAngleCheck(calc_slip_factor(self.VM), CP.steerRatio, CP.wheelbase)
 
     # GV70 steering takeover (HyundaiTakeover*), steer feel (HyundaiSteerFeel) and curve hold (HyundaiCurveHold)
@@ -200,6 +206,13 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
                                                    self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
       apply_steer_req = lat_active and apply_torque != 0 and apply_angle is not None
+      # After a cycle without our 0xCB the panda steps from the last frame we sent, not from apply_angle_last: an ACTIVE frame now is replaced by
+      # one inactive frame at the measured angle, which puts both on the wheel (route 55 3:18.15, T24: 0.21 s unsent, then 87 ACTIVE frames rejected,
+      # 0.54 s without 0xCB). The hand-back counts it as a steering request, so it is sent: the panda's angle check runs on it even while the
+      # camera still owns the slot.
+      self.lat_resync = bool(apply_steer_req) and not self.lat_sent
+      if self.lat_resync:
+        apply_angle = None
 
       # Failsafe if we detected we'd violate safety. The measured angle is clipped to +-STEER_ANGLE_MAX on purpose: the panda (lateral.h
       # steer_angle_cmd_checks_vm, max_angle of the LFA_ALT limits) clamps the allowed INACTIVE band to [clamp(measured) -+ 1], so an INACTIVE request at a
@@ -328,9 +341,16 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     lka_steering = self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG
     lka_steering_long = lka_steering and self.CP.openpilotLongitudinalControl
 
-    # steering control
+    # steering control: openpilot sends 0xCB (and the MDPS copy) except while the car's own lane-keeping nudge steers
+    send_lat = True
+    if self.handback:
+      send_lat = self.handback.update(CS, self.frame, steer_req=bool(apply_steer_req) or self.lat_resync)
+    self.send_lat = send_lat
+    self.lat_sent = send_lat
     if self.lfa_alt_steering:
-      can_sends.append(create_lfa_alt(self.packer, self.CAN, apply_steer_req, self.apply_angle_last, apply_torque))
+      if send_lat:
+        lfa_alt_counter = self.handback.lfa_alt_counter.next(CS.lfa_alt.get("COUNTER")) if self.handback else None
+        can_sends.append(create_lfa_alt(self.packer, self.CAN, apply_steer_req, self.apply_angle_last, apply_torque, lfa_alt_counter))
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CP_SP, self.CAN, CC.enabled, apply_steer_req, apply_torque,
                                                              self.apply_angle_last, self.lkas_icon))

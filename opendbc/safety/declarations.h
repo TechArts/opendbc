@@ -185,6 +185,7 @@ typedef struct {
   const uint8_t max_counter;         // maximum value of the counter. 0 means that the counter check is skipped
   const bool ignore_quality_flag;    // true if quality flag check is skipped
   const bool ignore_frequency_check; // true if minimum frequency enforcement is skipped
+  const bool optional;               // the message may be absent: it is only read in the rx hook, a lag never disables controls
 } CanMsgCheck;
 
 typedef struct {

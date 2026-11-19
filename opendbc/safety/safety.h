@@ -328,24 +328,28 @@ void safety_tick(void) {
   bool rx_checks_invalid = false;
   uint32_t ts = microsecond_timer_get();
   for (int i=0; i < current_safety_config.rx_checks_len; i++) {
-    uint32_t elapsed_time = safety_get_ts_elapsed(ts, current_safety_config.rx_checks[i].status.last_timestamp);
-    // lag threshold is max of: 1s and MAX_MISSED_MSGS * expected timestep.
-    // Quite conservative to not risk false triggers.
-    // 2s of lag is worse case, since the function is called at 1Hz
-    uint32_t frequency = current_safety_config.rx_checks[i].msg[current_safety_config.rx_checks[i].status.index].frequency;
-    uint32_t timestep = 1e6 / frequency;
-    bool lagging = elapsed_time > SAFETY_MAX(timestep * MAX_MISSED_MSGS, 1e6);
-    current_safety_config.rx_checks[i].status.lagging = lagging;
-    if (lagging) {
-      controls_allowed = false;
-      mads_exit_controls(MADS_DISENGAGE_REASON_LAG);
-    }
+    if (current_safety_config.rx_checks[i].msg[current_safety_config.rx_checks[i].status.index].optional) {
+      current_safety_config.rx_checks[i].status.lagging = false;  // read in the rx hook only; the hook's own staleness rules apply
+    } else {
+      uint32_t elapsed_time = safety_get_ts_elapsed(ts, current_safety_config.rx_checks[i].status.last_timestamp);
+      // lag threshold is max of: 1s and MAX_MISSED_MSGS * expected timestep.
+      // Quite conservative to not risk false triggers.
+      // 2s of lag is worse case, since the function is called at 1Hz
+      uint32_t frequency = current_safety_config.rx_checks[i].msg[current_safety_config.rx_checks[i].status.index].frequency;
+      uint32_t timestep = 1e6 / frequency;
+      bool lagging = elapsed_time > SAFETY_MAX(timestep * MAX_MISSED_MSGS, 1e6);
+      current_safety_config.rx_checks[i].status.lagging = lagging;
+      if (lagging) {
+        controls_allowed = false;
+        mads_exit_controls(MADS_DISENGAGE_REASON_LAG);
+      }
 
-    // enforce minimum frequency for safety-relevant messages
-    bool frequency_invalid = !current_safety_config.rx_checks[i].msg[current_safety_config.rx_checks[i].status.index].ignore_frequency_check && (frequency < 10U);
-    if (lagging || frequency_invalid || !is_msg_valid(current_safety_config.rx_checks, i)) {
-      rx_checks_invalid = true;
-      controls_allowed = false;
+      // enforce minimum frequency for safety-relevant messages
+      bool frequency_invalid = !current_safety_config.rx_checks[i].msg[current_safety_config.rx_checks[i].status.index].ignore_frequency_check && (frequency < 10U);
+      if (lagging || frequency_invalid || !is_msg_valid(current_safety_config.rx_checks, i)) {
+        rx_checks_invalid = true;
+        controls_allowed = false;
+      }
     }
   }
 

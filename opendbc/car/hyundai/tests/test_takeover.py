@@ -8,7 +8,7 @@ from opendbc.car.hyundai.panda_angle import PandaAngleCheck
 from opendbc.car.hyundai.takeover import TakeoverFilter, ENTER_FRAMES, RESUME_FRAMES, FAULT_FRAMES, GUARD_FRAMES, CONVERGE_DEG
 from opendbc.car.hyundai.tests.gv70 import car_params, dbc_defaults, gv70_controller
 from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
-from opendbc.sunnypilot.car.hyundai.values import HyundaiAngleSteeringModel, HyundaiFlagsSP
+from opendbc.sunnypilot.car.hyundai.values import HyundaiAngleSteeringModel, HyundaiFlagsSP, HyundaiSafetyFlagsSP
 
 ICON_OFF, ICON_PAUSED, ICON_ACTIVE = 0, 1, 2  # CCNC_0x161 LFA_ICON: hidden / grey / green
 EPS_ANGLE_MAX = 175.0  # LFA_ALT: the EPS faults on a request beyond it (lfa_alt.py LFA_ALT_ANGLE_LIMITS)
@@ -1015,6 +1015,122 @@ class TestBlockedResumeRoute39(unittest.TestCase):
           self.assertLessEqual(abs(req - wheel), 11.0, f"frame {i}: request {req:.1f}, wheel {wheel:.1f}")
           wheel += max(-1.0, min(1.0, req - wheel))
         self.assertAlmostEqual(wheel, model, delta=1.0)
+
+
+class TestNudgeResumeRoute55(unittest.TestCase):
+  """Route 55 3:16.9-3:19.0 (T24), closed loop against the real panda (libsafety, CAMERA_HANDBACK): 14.3 m/s, openpilot steering with lateral
+  permission, cruise off. The driver holds the wheel (takeover pause), the car's lane-departure nudge comes, so the camera's 0xCB reaches the car and
+  ours is not sent; the driver lets go during the nudge and openpilot steers again while the nudge window is open. On the car the first ACTIVE frame
+  was 1.0 deg from the last frame sent, the panda rejected all 87 ACTIVE frames and no 0xCB reached the car for 0.54 s (EPS flag). The fix is the
+  controller's lat_resync: the first ACTIVE frame after an unsent cycle goes out as one inactive frame at the measured angle."""
+
+  V = 14.3
+  camera_first = False
+
+  def setUp(self):
+    from opendbc.safety.tests.common import CANPackerSafety
+    from opendbc.safety.tests.libsafety import libsafety_py
+    self.libsafety_py = libsafety_py
+    self.packer = CANPackerSafety("hyundai_canfd_generated")
+    self.safety = libsafety_py.libsafety
+    self.cc, self.cs = _carcontroller(150, curve_hold=True)
+    self.assertTrue(self.cc.CP_SP.safetyParam & HyundaiSafetyFlagsSP.CAMERA_HANDBACK)
+    self.safety.set_current_safety_param_sp(self.cc.CP_SP.safetyParam)
+    self.safety.set_safety_hooks(structs.CarParams.SafetyModel.hyundaiCanfd, int(self.cc.CP.safetyConfigs[-1].safetyParam))
+    self.safety.init_tests()
+    self.safety.set_controls_allowed_lateral(True)
+    self.t = 0
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)
+
+  def _cycle(self, wheel, model, torque, ind, camera_first):
+    """One 10 ms cycle: the camera's status, the speed and the wheel reach the panda, the controller sends, the panda decides (the camera's 0xCB on the
+    bus before ours or after). Returns (ours ACTIVE and accepted, any 0xCB reached the car)."""
+    self.t += 10_000
+    self.safety.set_timer(self.t)
+    if self.t % 50_000 == 0:
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CCNC_0x161", 2, {"LFA_ICON": 0}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("LFA", 2, {"LKA_SysIndReq": ind}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("WHEEL_SPEEDS", 0, {f"WHL_Spd{p}Val": self.V * 3.6 for p in ("FL", "FR", "RL", "RR")}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("MDPS", 0, {"MDPS_EstStrAnglVal": wheel}))
+    self.cs.out = structs.CarState(vEgo=self.V, vEgoRaw=self.V, steeringTorque=torque, steeringPressed=abs(torque) > 100, steeringAngleDeg=wheel)
+    self.cs.cam_lfa_icon, self.cs.cam_lka_ind = 0, ind
+    self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
+    self.cs.lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 1}
+    self.cs.msg_161, self.cs.msg_162, self.cs.msg_1b5 = (dbc_defaults(m) for m in ("CCNC_0x161", "CCNC_0x162", "FR_CMR_03_50ms"))
+    self.cs.main_cruise_enabled = False
+    self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
+    self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
+    CC = structs.CarControl(latActive=True, enabled=False)
+    CC.actuators.steeringAngleDeg = model
+    camera = camera_first and self.safety.safety_fwd_hook(2, 0xCB) == 0
+    _, sends = self.cc.update(CC.as_reader(), structs.CarControlSP(), self.cs, 0)
+    cb = [s for s in sends if s[0] == 0xCB]
+    ok = [bool(self.safety.safety_tx_hook(self.libsafety_py.make_CANPacket(s[0], s[2], s[1]))) for s in cb]
+    if not camera_first:
+      camera = self.safety.safety_fwd_hook(2, 0xCB) == 0
+    active_ok = any(o and (bytes(s[1])[3] >> 4) == 2 for s, o in zip(cb, ok, strict=True))
+    return active_ok, camera or any(ok)
+
+  def _run(self, release_s, wheel_rate):
+    """2 s steering at 5.3 deg, 0.5 s held (torque 300), then the nudge (1.0 s) during which the driver lets go after release_s and the camera moves
+    the wheel at wheel_rate deg/s, then 1.5 s with the model at -3.5 deg. Returns (longest run of cycles without a 0xCB at the car after the nudge
+    starts, accepted ACTIVE frames in the 1.0 s after the nudge ends)."""
+    wheel, gap, longest, active_after = 5.3, 0, 0, 0
+    phases = [(200, 5.3, 0.0, 2), (50, 5.3, 300.0, 2)]
+    phases += [(1, None, 300.0 if i < release_s * 100 else 0.0, 3) for i in range(100)]
+    phases += [(150, -3.5, 0.0, 2)]
+    cycle = 0
+    for n, model, torque, ind in phases:
+      for _ in range(n):
+        if ind == 3:
+          wheel += wheel_rate / 100
+        active_ok, reached = self._cycle(wheel, wheel if model is None else model, torque, ind, self.camera_first)
+        cycle += 1
+        if cycle > 250:
+          gap = 0 if reached else gap + 1
+          longest = max(longest, gap)
+        if 350 < cycle <= 450:
+          active_after += active_ok
+    return longest, active_after
+
+  def test_route_55_resume_during_the_nudge(self):
+    """The driver lets go 0.3-0.7 s into the nudge while the camera moves the wheel (0 to -6 deg/s): the car never goes two cycles without a 0xCB,
+    and openpilot steers again after the takeover hold (> 0.5 s of accepted ACTIVE frames in the 1.0 s after the nudge), in both bus orders."""
+    for camera_first in (False, True):
+      for release_s in (0.3, 0.5, 0.7):
+        for wheel_rate in (0.0, -3.0, -6.0):
+          with self.subTest(camera_first=camera_first, release_s=release_s, wheel_rate=wheel_rate):
+            self.setUp()
+            self.camera_first = camera_first
+            longest, active_after = self._run(release_s, wheel_rate)
+            self.assertLessEqual(longest, 1, "cycles in a row without a 0xCB at the car")
+            self.assertGreater(active_after, 50, "accepted ACTIVE frames in the 1.0 s after the nudge")
+
+  def test_first_active_frame_after_an_unsent_cycle_is_one_inactive_frame(self):
+    """The controller side of the fix: after a cycle without our 0xCB (the camera's nudge owned the slot) the next ACTIVE request is replaced by one
+    inactive frame at the measured angle (lat_resync), then ACTIVE frames follow."""
+    kinds = []
+    for step in range(6):
+      self.cc.lat_sent = step != 0  # step 0 follows an unsent cycle
+      self.cs.out = structs.CarState(vEgo=self.V, vEgoRaw=self.V, steeringAngleDeg=5.3)
+      self.cs.cam_lfa_icon, self.cs.cam_lka_ind = 0, 2
+      self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
+      self.cs.lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 1}
+      self.cs.msg_161, self.cs.msg_162 = dbc_defaults("CCNC_0x161"), dbc_defaults("CCNC_0x162")
+      self.cs.cruise_info = {"COUNTER": 50, "ACC_ObjDist": 0, "ACC_ObjRelSpd": 0}
+      self.cc.tuning = SimpleNamespace(stopping=False, actual_accel=0.0, jerk_lower=0.5, jerk_upper=0.5)
+      self.cc.frame = 2 + step * 2  # off the icon cadence
+      CC = structs.CarControl(latActive=True, enabled=False)
+      CC.actuators.steeringAngleDeg = 5.3
+      _, sends = self.cc.update(CC.as_reader(), structs.CarControlSP(), self.cs, 0)
+      cb = [s for s in sends if s[0] == 0xCB]
+      self.assertEqual(len(cb), 1)
+      kinds.append(bytes(cb[0][1])[3] >> 4)
+      self.assertEqual(self.cc.lat_resync, step == 0)
+    self.assertEqual(kinds[0], 1)  # inactive (ADAS_ActvACILvl2Sta 1), one frame
+    self.assertEqual(set(kinds[1:]), {2})  # ACTIVE after that
 
 
 class TestPandaAngleCheck(unittest.TestCase):

@@ -1,13 +1,14 @@
 import unittest
 
-from opendbc.can import CANParser
+from opendbc.can import CANPacker, CANParser
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR, DBC
-from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController
+from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController, create_ccnc_0x161
+from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.sunnypilot.car.hyundai.mads import MadsDataSP
 
 DBC_NAME = "hyundai_canfd_generated"
@@ -83,6 +84,109 @@ class TestDashStates(unittest.TestCase):
         out = self._icons(enabled=enabled, lat_active=lat_active)
         self.assertEqual(out["LFA_ICON"], LFA_GREEN if lat_active else LFA_GREY)
         self.assertEqual(out["SETSPEED_HUD"], 2 if enabled else 1)
+
+
+def _ccnc_0x161(lat_active=False, paused=False, passthrough_lat=False, camera_lfa_on=False, msg_161=None):
+  """The 0x161 frame create_ccnc_0x161 builds (openpilot long, main cruise on, not engaged)."""
+  fingerprint = gen_empty_fingerprint()
+  can = CanBus(None, fingerprint)
+  hud = structs.CarControl.HUDControl(leadDistanceBars=2)
+  msg = create_ccnc_0x161(CANPacker(DBC_NAME), can, 5, msg_161 if msg_161 is not None else _defaults("CCNC_0x161"), False, lat_active, paused, True,
+                          True, False, hud, 62, 20.0, False, False, None, passthrough_lat, camera_lfa_on)
+  parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], msg[2])
+  parser.update([(0, [msg])])
+  return parser.vl["CCNC_0x161"]
+
+
+class TestCameraLfaIcon(unittest.TestCase):
+  def test_blocked_camera_lfa_shows_grey_never_green(self):
+    # openpilot steering is off but the car's own LFA is on (it cannot steer: the panda blocks its lane centering): grey wheel, no centre line
+    out = _ccnc_0x161(camera_lfa_on=True)
+    self.assertEqual((out["LFA_ICON"], out["CENTERLINE"]), (LFA_GREY, 0))
+    out = _ccnc_0x161(camera_lfa_on=False)
+    self.assertEqual((out["LFA_ICON"], out["CENTERLINE"]), (LFA_OFF, 0))
+
+  def test_openpilot_state_wins_when_it_steers_or_pauses(self):
+    self.assertEqual(_ccnc_0x161(paused=True, camera_lfa_on=True)["LFA_ICON"], LFA_GREY)
+    self.assertEqual(_ccnc_0x161(lat_active=True, camera_lfa_on=True)["LFA_ICON"], LFA_GREEN)
+
+  def test_lka_nudge_keeps_the_cameras_own_fields(self):
+    # the camera's lane-keeping nudge steers (no frame of ours): its dash fields, LKA icon and warning included, pass through as received
+    cam = _defaults("CCNC_0x161")
+    cam.update({"LFA_ICON": 0, "LKA_ICON": 4, "LANELINE_LEFT": 4})
+    out = _ccnc_0x161(passthrough_lat=True, camera_lfa_on=True, msg_161=cam)
+    self.assertEqual((out["LFA_ICON"], out["LKA_ICON"], out["LANELINE_LEFT"]), (0, 4, 4))
+
+
+class TestPassthrough(unittest.TestCase):
+  """Lateral only: the cruise axis is never handed back (there is no longitudinal passthrough)."""
+
+  def _camera(self):
+    m161 = _defaults("CCNC_0x161")
+    m161.update({"LFA_ICON": 2, "LKA_ICON": 4, "CENTERLINE": 1, "LANELINE_LEFT": 6, "LANELINE_RIGHT": 6, "LCA_LEFT_ICON": 2, "SETSPEED": 2,
+                 "SETSPEED_HUD": 2, "SETSPEED_SPEED": 33, "DISTANCE": 3})
+    return m161
+
+  def test_camera_lateral_kept(self):
+    out = _ccnc_0x161(passthrough_lat=True, msg_161=self._camera())
+    self.assertEqual((out["LFA_ICON"], out["LKA_ICON"], out["CENTERLINE"], out["LANELINE_LEFT"], out["LANELINE_RIGHT"], out["LCA_LEFT_ICON"]),
+                     (2, 4, 1, 6, 6, 2))
+    self.assertEqual((out["SETSPEED_HUD"], out["SETSPEED"], out["DISTANCE"]), (1, 1, 4))  # cruise is still ours (main on, standby)
+
+  def test_lateral_is_ours_without_passthrough(self):
+    out = _ccnc_0x161(msg_161=self._camera())
+    self.assertEqual((out["LFA_ICON"], out["LKA_ICON"], out["CENTERLINE"], out["LANELINE_LEFT"], out["LCA_LEFT_ICON"]), (0, 3, 0, 0, 0))
+
+  def test_fault_passthrough_kept(self):
+    cam = self._camera()
+    cam.update({"ALERTS_1": 3, "ALERTS_2": 7})
+    out = _ccnc_0x161(passthrough_lat=True, msg_161=cam)
+    self.assertEqual((out["ALERTS_1"], out["ALERTS_2"]), (3, 7))
+
+
+class TestHandbackDash(unittest.TestCase):
+  """CcncCarController.update: the dash follows the hand-back state (the camera's nudge steers, or the car's blocked LFA is on)."""
+
+  def setUp(self):
+    self.cc, self.cs = _carcontroller()
+    self.cs.out = structs.CarState(vEgo=20.0, vCruiseCluster=100.0)
+    self.cs.mdps = {"MDPS_ADASAciActvSta_Lv2": 1}
+    self.cs.lfa_alt = {"COUNTER": 100, "ADAS_ActvACILvl2Sta": 2}
+    self.cs.cruise_info = {"COUNTER": 50, "MainMode_ACC": 1}
+    cam = _defaults("CCNC_0x161")
+    cam.update({"LFA_ICON": 0, "LKA_ICON": 4, "LANELINE_LEFT": 4})
+    self.cs.msg_161, self.cs.msg_162 = cam, _defaults("CCNC_0x162")
+    self.cs.main_cruise_enabled = True
+    self.cc.frame = 5
+    self.cc.mads = MadsDataSP(False, False, False, False)
+    self.cc.handback = CameraHandback()
+
+  def _out(self, send_lat, lfa_on=False):
+    self.cc.send_lat = send_lat
+    self.cc.handback.lka_window.lfa_on = lfa_on
+    msgs = CcncCarController.update(self.cc, self.cs, structs.CarControl())
+    parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], 0)
+    parser.update([(0, [next(m for m in msgs if m[0] == 0x161)])])
+    return parser.vl["CCNC_0x161"], {m[0] for m in msgs}
+
+  def test_camera_nudge_passes_its_dash_fields_and_the_mdps_copy_stops(self):
+    out, sent = self._out(send_lat=False)
+    self.assertEqual((out["LFA_ICON"], out["LKA_ICON"], out["LANELINE_LEFT"]), (0, 4, 4))
+    self.assertNotIn(0xEA, sent)
+
+  def test_openpilot_sending_lateral_owns_the_fields_and_the_mdps_copy(self):
+    out, sent = self._out(send_lat=True)
+    self.assertEqual((out["LFA_ICON"], out["LKA_ICON"], out["LANELINE_LEFT"]), (0, 3, 0))
+    self.assertIn(0xEA, sent)
+
+  def test_blocked_cars_lfa_is_grey_while_openpilot_is_off(self):
+    self.assertEqual(self._out(send_lat=True, lfa_on=True)[0]["LFA_ICON"], LFA_GREY)
+    self.assertEqual(self._out(send_lat=True, lfa_on=False)[0]["LFA_ICON"], LFA_OFF)
+
+  def test_cruise_axis_is_not_handed_back(self):
+    self.cs.msg_161.update({"SETSPEED": 2, "SETSPEED_HUD": 2, "SETSPEED_SPEED": 33})
+    out, _ = self._out(send_lat=False)  # the camera's nudge steers, the cruise icon is still openpilot's: main on, standby
+    self.assertEqual((out["SETSPEED"], out["SETSPEED_HUD"]), (1, 1))
 
 
 if __name__ == "__main__":

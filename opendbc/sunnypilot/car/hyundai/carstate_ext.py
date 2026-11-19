@@ -11,7 +11,7 @@ from enum import StrEnum
 from opendbc.car import Bus, structs
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags, CAR
-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 
 
 class CarStateExt:
@@ -25,6 +25,8 @@ class CarStateExt:
     self.mdps = {}
     self.cruise_buttons_msg = {}
     self.lfa_alt = {}
+    self.cam_lfa_icon = None  # the camera's own LFA_ICON (0x161) and LKA_SysIndReq (0x12A), None until seen (CAMERA_HANDBACK lane-keeping window)
+    self.cam_lka_ind = None
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -101,6 +103,11 @@ class CarStateExt:
       self.cruise_buttons_msg = copy.copy(cp.vl["CRUISE_BUTTONS"])
       if self.CP_SP.flags & HyundaiFlagsSP.CANFD_LFA_ALT_STEER:
         self.lfa_alt = copy.copy(cp_cam.vl["LFA_ALT"])
+        if self.CP_SP.safetyParam & HyundaiSafetyFlagsSP.CAMERA_HANDBACK:
+          # the camera's lane-keeping signals, also while the panda blocks its 0xCB: LFA_ICON (0x161) and LKA_SysIndReq (0x12A, 3 = lane departure)
+          lka = cp_cam.vl["LFA"]  # registers the message in the parser
+          self.cam_lka_ind = lka["LKA_SysIndReq"] if cp_cam.ts_nanos["LFA"]["COUNTER"] else None
+          self.cam_lfa_icon = self.msg_161["LFA_ICON"] if cp_cam.ts_nanos["CCNC_0x161"]["COUNTER"] else None
 
     if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
       self.cruise_buttons_msg = copy.copy(cp.vl[self.cruise_btns_msg_canfd])

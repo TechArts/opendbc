@@ -18,6 +18,7 @@ class HyundaiSafetyFlagsSP:
   MAIN_BUTTON_ENGAGE = 32  # the camera's main state engages openpilot longitudinal (CCNC LFA_ALT camera-SCC long only)
   CANFD_LFA_ALT_STEER = 64
   CANFD_ANGLE_STEERING = 128
+  CAMERA_HANDBACK = 256  # GV70 LFA_ALT: the camera's lane-keeping nudge passes while openpilot is not steering (reserved bit, see the port contract)
 
 
 # Angle steering vehicle model IDs — encoded in safety_param_sp bits [11:14]. Bit 15 stays unused: CarParamsSP.safetyParam is Int16.

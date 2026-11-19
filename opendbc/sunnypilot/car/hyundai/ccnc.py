@@ -62,19 +62,23 @@ def create_ccnc_mdps(packer, CAN, mdps, lfa_alt=None):
 
 
 def create_ccnc_0x161(packer, CAN, frame, msg_161, enabled, lat_active, paused, long_enabled, main_cruise_enabled, gas_override,
-                      hud_control, set_speed, v_ego, lead_visible, show_distance_bars, cluster_alert=None):
+                      hud_control, set_speed, v_ego, lead_visible, show_distance_bars, cluster_alert=None, passthrough_lat=False, camera_lfa_on=False):
+  """passthrough_lat: openpilot does not own the lateral axis this frame (the car's own lane-keeping nudge steers), so the camera's own dash fields for it
+  are kept as received. camera_lfa_on: the car's own LFA is on but cannot steer (openpilot steering is off and the panda blocks its lane centering): its
+  icon is shown grey, never green, while openpilot's lateral state is off."""
   values = msg_161.copy()
 
-  values.update({
-    "LKA_ICON": 4 if lat_active else 3,
-    "LFA_ICON": 2 if lat_active else 1 if paused else 0,
-    "LANELINE_LEFT": 6 if lat_active else 0,
-    "LANELINE_RIGHT": 6 if lat_active else 0,
-    "CENTERLINE": 1 if lat_active else 0,
-    "LCA_LEFT_ICON": 2 if lat_active else 0,
-    "LCA_RIGHT_ICON": 2 if lat_active else 0,
-    "DAW_ICON": 0,
-  })
+  if not passthrough_lat:
+    values.update({
+      "LKA_ICON": 4 if lat_active else 3,
+      "LFA_ICON": 2 if lat_active else 1 if paused or camera_lfa_on else 0,
+      "LANELINE_LEFT": 6 if lat_active else 0,
+      "LANELINE_RIGHT": 6 if lat_active else 0,
+      "CENTERLINE": 1 if lat_active else 0,
+      "LCA_LEFT_ICON": 2 if lat_active else 0,
+      "LCA_RIGHT_ICON": 2 if lat_active else 0,
+    })
+  values["DAW_ICON"] = 0
 
   # suppress consider taking a break and its chime
   if values["ALERTS_2"] == 5:
@@ -172,6 +176,8 @@ def create_ccnc_alt_buttons(packer, CAN, cruise_buttons_msg, cnt, btn):
 
 class CcncCarController:
   def __init__(self, CP, CP_SP):
+    self.handback = None  # CameraHandback on the GV70 (CAMERA_HANDBACK), set by the car controller
+    self.send_lat = True  # openpilot sends the lateral frames (0xCB, MDPS copy) this frame, False while the camera's nudge steers
     self.ccnc_lfa_steering = bool(CP_SP.flags & HyundaiFlagsSP.CCNC and not (CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG))
     self.lfa_alt_steering = bool(CP_SP.flags & HyundaiFlagsSP.CANFD_LFA_ALT_STEER)
     self.ccnc_lka_alt_buttons = bool(CP_SP.flags & HyundaiFlagsSP.CCNC and CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG and
@@ -217,7 +223,7 @@ class CcncCarController:
       return can_sends
 
     # no MDPS copy until a real MDPS frame has been received; the panda forwards the real one until our first copy
-    if CS.mdps:
+    if CS.mdps and self.send_lat:
       can_sends.append(create_ccnc_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt if self.lfa_alt_steering else None))
 
     if self.CP.openpilotLongitudinalControl:
@@ -242,10 +248,14 @@ class CcncCarController:
       lat_active, paused, long_enabled_icons = self.dash_states(CS, CC)
       set_speed = self._get_set_speed(CS.out.vCruiseCluster, CS.is_metric)
 
+      # the camera's own lateral fields while its nudge steers and openpilot's lateral axis is off, a grey wheel while its (blocked) LFA is on
+      passthrough_lat = not self.send_lat and not lat_active and not paused
+      camera_lfa_on = bool(self.handback and self.handback.lka_window.lfa_on)
+
       can_sends.append(create_ccnc_0x161(self.packer, self.CAN, self.frame, CS.msg_161, long_enabled_icons, lat_active, paused,
                                          self.CP.openpilotLongitudinalControl, CS.main_cruise_enabled, CC.cruiseControl.override,
                                          CC.hudControl, set_speed, CS.out.vEgo, self.lead_visible,
-                                         self.frame - self.distance_bar_frame < 400, self.cluster_alert))
+                                         self.frame - self.distance_bar_frame < 400, self.cluster_alert, passthrough_lat, camera_lfa_on))
       can_sends.append(create_ccnc_0x162(self.packer, self.CAN, CS.msg_162, long_enabled_icons, self.CP.openpilotLongitudinalControl,
                                          CS.main_cruise_enabled, CC.cruiseControl.override, self.lead_visible,
                                          self.lead_distance_filter.x, CS.msg_161, self.cluster_alert))

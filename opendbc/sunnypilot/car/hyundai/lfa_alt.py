@@ -27,7 +27,7 @@ def lfa_alt_steering(CP: structs.CarParams, CP_SP: structs.CarParamsSP, fingerpr
               LFA_ALT_MSG in fingerprint[cam_bus])
 
 
-def create_lfa_alt(packer, CAN, lat_active, apply_angle, tq_redc_gain):
+def create_lfa_alt(packer, CAN, lat_active, apply_angle, tq_redc_gain, counter=None):
   values = {
     "ADAS_ActvACISta": 0,
     "ADAS_ActvACILvl2Sta": ACI_ACTIVE if lat_active else ACI_INACTIVE,
@@ -36,6 +36,8 @@ def create_lfa_alt(packer, CAN, lat_active, apply_angle, tq_redc_gain):
     "FCA_ESA_ActvSta": 0,
     "FCA_ESA_TqBstGainVal": 0,
   }
+  if counter is not None:
+    values["COUNTER"] = counter  # continues the camera's own counter (hand-back), else the packer's
   return packer.make_can_msg("LFA_ALT", CAN.ECAN, values)
 
 

@@ -7,7 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 
 import unittest
 
-from opendbc.can import CANPacker
+from opendbc.can import CANPacker, CANParser
 from opendbc.car import gen_empty_fingerprint, structs
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
@@ -61,6 +61,26 @@ class TestLfaAlt(unittest.TestCase):
         addr, dat, bus = create_lfa_alt(packer, CanBus(CP), lat_active, 0., gain)
         assert (addr, bus) == (LFA_ALT_MSG, 0)
         assert safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat)), (alpha_long, lat_active)
+
+  def test_counter_argument(self):
+    """The camera hand-back continues the camera's own counter: given, it is the frame's COUNTER; without it the packer counts on its own."""
+    CP, _ = get_params((LFA_ALT_MSG, *CCNC), True)
+    can, packer = CanBus(CP), CANPacker("hyundai_canfd_generated")
+    parser = CANParser("hyundai_canfd_generated", [("LFA_ALT", 0)], can.ECAN)
+
+    def counter(frame):
+      addr, dat, bus = frame
+      assert (addr, bus) == (LFA_ALT_MSG, can.ECAN)
+      parser.update([(0, [(addr, dat, bus)])])
+      return parser.vl["LFA_ALT"]["COUNTER"]
+
+    for given in (0, 1, 100, 255):  # the DBC counter is 8 bits
+      assert counter(create_lfa_alt(packer, can, True, 12.3, 0.5, given)) == given
+    first = counter(create_lfa_alt(packer, can, True, 12.3, 0.5, None))  # no counter given: the packer counts on its own
+    assert counter(create_lfa_alt(packer, can, True, 12.3, 0.5)) == (first + 1) % 256
+    assert counter(create_lfa_alt(packer, can, False, 0.0, 0.0, 77)) == 77  # inactive frames follow too
+    parser.update([(0, [create_lfa_alt(packer, can, True, 12.3, 0.5, 5)])])
+    assert parser.vl["LFA_ALT"]["ADAS_StrAnglReqVal"] == 12.3 and parser.vl["LFA_ALT"]["ADAS_ActvACILvl2Sta"] == 2  # only the counter differs
 
 
 if __name__ == "__main__":

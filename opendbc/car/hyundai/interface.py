@@ -234,6 +234,10 @@ class CarInterface(CarInterfaceBase):
       if stock_cp.openpilotLongitudinalControl and not stock_cp.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
         ret.safetyParam |= HyundaiSafetyFlagsSP.MAIN_BUTTON_ENGAGE
 
+      # GV70: the car's own lane-keeping nudge passes while openpilot is not steering (panda CAMERA_HANDBACK); the camera's 0xCB / MDPS are otherwise blocked
+      if candidate == CAR.GENESIS_GV70_2ND_GEN and not stock_cp.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
+        ret.safetyParam |= HyundaiSafetyFlagsSP.CAMERA_HANDBACK
+
     if ret.flags & HyundaiFlagsSP.CCNC and lka_steering:
       # this needs to be figured out for ccNC cars with an ADAS Driving ECU
       stock_cp.alphaLongitudinalAvailable = False
