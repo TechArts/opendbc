@@ -14,14 +14,16 @@ def dbc_defaults(msg):
   return dict(CANParser(DBC_NAME, [(msg, 0)], 0).vl[msg])
 
 
-def car_params(candidate=CAR.GENESIS_GV70_2ND_GEN, alpha_long=True, lfa_alt=True):
-  """(CP, CP_SP) of the GV70 as the fingerprint detects it: LFA_ALT (0xCB) and the CCNC messages on the camera bus."""
-  fingerprint = gen_empty_fingerprint()
-  can = CanBus(None, fingerprint)
-  fingerprint[can.ECAN] = {0x1CF: 8}
-  fingerprint[can.CAM] = {0x161: 32, 0x162: 32}
-  if lfa_alt:
-    fingerprint[can.CAM][0xCB] = 24
+def car_params(candidate=CAR.GENESIS_GV70_2ND_GEN, alpha_long=True, lfa_alt=True, fingerprint=None):
+  """(CP, CP_SP) of the GV70 as the fingerprint detects it: LFA_ALT (0xCB) and the CCNC messages on the camera bus. A recorded fingerprint
+  ({bus: {address: length}}) replaces the minimal one (route replay)."""
+  if fingerprint is None:
+    fingerprint = gen_empty_fingerprint()
+    can = CanBus(None, fingerprint)
+    fingerprint[can.ECAN] = {0x1CF: 8}
+    fingerprint[can.CAM] = {0x161: 32, 0x162: 32}
+    if lfa_alt:
+      fingerprint[can.CAM][0xCB] = 24
   cp = CarInterface.get_params(candidate, fingerprint, [], alpha_long, False, False)
   return cp, CarInterface.get_params_sp(cp, candidate, fingerprint, [], alpha_long, False, False)
 
