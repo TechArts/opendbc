@@ -63,6 +63,17 @@ class TestSteerFeel(unittest.TestCase):
       # no-hands gain is still the generic ceiling
       self.assertEqual(settle(0, v_ego, 1.0, True), settle(0, v_ego, 0.0))
 
+  def test_gain_rises_fast_with_the_hand_off_and_slowly_with_a_hand_on(self):
+    """Routes 60-63: after every pause the gain restarted at 0.004 per frame (0.74 s median to 0.3). Hand off (torque under 100): 0.02 per frame."""
+    self.assertEqual(compute_torque_reduction_gain(0, 10.0, True, 0.0), 0.02)
+    self.assertEqual(compute_torque_reduction_gain(99, 10.0, True, 0.0), 0.02)
+    self.assertEqual(compute_torque_reduction_gain(100, 10.0, True, 0.0), 0.004)
+    self.assertEqual(compute_torque_reduction_gain(300, 10.0, True, 0.0), 0.004)
+    self.assertEqual(compute_torque_reduction_gain(0, 10.0, True, 0.0, 1.0, True), 0.02)  # steer feel: the target at 0 torque is the ceiling
+    self.assertAlmostEqual(settle(0, 10.0, 0.0), 0.85, delta=0.004)  # the target is unchanged
+    self.assertAlmostEqual(compute_torque_reduction_gain(0, 10.0, False, 0.5), 0.5 - 0.014, delta=0.004)  # the fall is unchanged
+    self.assertAlmostEqual(compute_torque_reduction_gain(0, 10.0, True, 0.84), 0.85, delta=0.004)  # no overshoot of the target
+
   def test_zero_when_not_active(self):
     self.assertEqual(compute_torque_reduction_gain(300, 15.0, False, 0.0, 1.0), 0.0)
 

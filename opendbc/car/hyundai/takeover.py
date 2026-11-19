@@ -3,7 +3,7 @@
 While paused the controller sends 0xCB INACTIVE at the measured angle with gain 0 (no counter-force, no angle error for the EPS to fault on).
 When the driver lets go the request is blended back to the model: angle step limited (never more than the resume rate per frame, whatever the
 wheel does; the low-speed guard's clips and the lead band that run after it stay within that step), gain ramped by the controller, and kept
-within CONVERGE_DEG of the measured angle while the wheel moves slower than the resume rate.
+within CONVERGE_DEG (CONVERGE_FREE_DEG outside the low-speed guard region) of the measured angle while the wheel moves slower than the resume rate.
 Lateral never starts (engage, blinker pause end, takeover release) while the wheel still moves faster than that: it stays paused until it calms.
 Also pauses on a temporary EPS fault and when the low-speed, large-angle cap keeps binding. Below 6 m/s at large angles the request is also kept from
 running ahead of a lagging wheel (lead_band).
@@ -18,7 +18,11 @@ from opendbc.car import DT_CTRL
 ENTER_FRAMES = 3  # |torque| above the enter threshold for this many frames starts a pause
 RESUME_FRAMES = int(1.0 / DT_CTRL)  # angle step limit after a pause
 FAULT_FRAMES = int(1.0 / DT_CTRL)  # stay paused this long after steerFaultTemporary clears
-CONVERGE_DEG = 5.0  # request stays this close to the measured angle while resuming
+CONVERGE_DEG = 5.0  # request stays this close to the measured angle while resuming inside the low-speed guard region (step_capped)
+# Outside the guard region the resume window is wider: routes 60-63 (hand off, 0-10 m/s, model asks 15 deg or more): while resuming the wheel trailed the
+# model by 24 deg below 5 m/s and 9 deg at 5-10 m/s (2.5 and -3 deg when not resuming), the request held 5 deg ahead of the wheel and the EPS turned the
+# wheel at 39 deg/s at most with an error of 3-6 deg (69-84 deg/s at 6-12 deg, gain 0.5 or more), less than the model's 50-100 deg/s turn-in.
+CONVERGE_FREE_DEG = 12.0
 WHEEL_RATE_FRAMES = 5  # frames the wheel's angular speed is measured over
 
 # low-speed guard: both short EPS faults had a request 19-29 deg ahead of the wheel at 174-182 deg and 3-4 m/s
@@ -190,7 +194,7 @@ class TakeoverFilter:
 
     if self.resuming:
       self.resume_frames = max(0, self.resume_frames - 1)
-      if self.resume_frames == 0 and abs(desired - angle) <= CONVERGE_DEG:
+      if self.resume_frames == 0 and abs(desired - angle) <= self.converge_deg(angle, v_ego):
         self.resuming = False
     return self.paused
 
@@ -200,6 +204,10 @@ class TakeoverFilter:
     Never above max_angle either: the EPS faults on a request beyond it (upstream LFA_ALT, 175 deg), so a wheel past max_angle + GUARD_MAX_ERROR
     leaves no request inside the guard band: inactive."""
     return min(max(GUARD_MAX_ANGLE, abs(angle)), self.max_angle)
+
+  @classmethod
+  def converge_deg(cls, angle: float, v_ego: float) -> float:
+    return CONVERGE_DEG if cls.step_capped(angle, v_ego) else CONVERGE_FREE_DEG
 
   @staticmethod
   def step_capped(angle: float, v_ego: float) -> bool:
@@ -240,7 +248,7 @@ class TakeoverFilter:
 
     `backstop` is the window the controller computes for every frame from what the upstream vehicle model (jerk and lateral accel), the EPS rate limit
     and the panda's own check accept after `last`; the result is always inside it and inside +-max_angle (the 175 deg EPS limit), whatever the region.
-    Outside the guard region (step_capped false): the resume blend (wheel +-CONVERGE_DEG, last +- the resume rate), then the lead band within what may
+    Outside the guard region (step_capped false): the resume blend (wheel +-CONVERGE_FREE_DEG, last +- the resume rate), then the lead band within what may
     be sent: anything between last and that request, or a step from last of the resume rate while resuming, else STEP_CAP_DEG (accepted by the panda
     below 6 m/s, see window()). Nothing changes at LEAD_SPEED and above or within LEAD_ANGLE. Inside: the request moved to the nearest point of window()
     intersected with `backstop`, then the lead band within that. None: the intersection is empty (a wheel that moves against the band, a step the panda or
@@ -260,7 +268,8 @@ class TakeoverFilter:
         step = self.resume_rate
         if lo > hi:
           return None
-        request = float(np.clip(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG), lo, hi))
+        converge = self.converge_deg(angle, v_ego)
+        request = float(np.clip(np.clip(request, angle - converge, angle + converge), lo, hi))
       lo, hi = max(lo, min(request, last - step)), min(hi, max(request, last + step))
       if lo > hi:
         return None

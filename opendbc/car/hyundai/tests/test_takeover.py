@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from opendbc.car import structs
 from opendbc.car.hyundai.panda_angle import PandaAngleCheck
-from opendbc.car.hyundai.takeover import TakeoverFilter, ENTER_FRAMES, RESUME_FRAMES, FAULT_FRAMES, GUARD_FRAMES, CONVERGE_DEG
+from opendbc.car.hyundai.takeover import TakeoverFilter, ENTER_FRAMES, RESUME_FRAMES, FAULT_FRAMES, GUARD_FRAMES, CONVERGE_DEG, CONVERGE_FREE_DEG
 from opendbc.car.hyundai.tests.gv70 import car_params, dbc_defaults, gv70_controller
 from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
 from opendbc.sunnypilot.car.hyundai.values import HyundaiAngleSteeringModel, HyundaiFlagsSP, HyundaiSafetyFlagsSP
@@ -144,12 +144,43 @@ class TestTakeoverFilter(unittest.TestCase):
       f.update(0.0, False, False, 15.0, measured, desired, True)
       req = f.limit(desired, last, measured, 15.0)
       self.assertLessEqual(abs(req - last), 1.0 + 1e-9)
-      self.assertLessEqual(abs(req - measured), CONVERGE_DEG + 1e-9)
+      self.assertLessEqual(abs(req - measured), CONVERGE_FREE_DEG + 1e-9)
       last = req
-    self.assertTrue(f.resuming)  # model still more than 5 deg away from the wheel
+    self.assertTrue(f.resuming)  # model still more than 12 deg away from the wheel
     f.update(0.0, False, False, 15.0, 58.0, desired, True)
     self.assertFalse(f.resuming)
     self.assertEqual(f.limit(desired, 58.0, 58.0, 15.0), desired)
+
+  def test_resume_window_is_wider_outside_the_guard_region(self):
+    """Routes 60-63: a 5 deg leash held the request at wheel + 5 while the model turned in at 50-100 deg per second. Outside the guard region the
+    request may lead the wheel by CONVERGE_FREE_DEG while resuming; inside (below 6 m/s past 140 deg) it stays at CONVERGE_DEG."""
+    self.assertEqual((CONVERGE_DEG, CONVERGE_FREE_DEG), (5.0, 12.0))
+    f = make()
+    run(f, 10, torque=300)
+    run(f, 50, torque=0)
+    last, measured = 20.0, 20.0
+    for _ in range(40):
+      f.update(0.0, False, False, 10.0, measured, 80.0, True)
+      last = f.limit(80.0, last, measured, 10.0)
+    self.assertEqual(last - measured, CONVERGE_FREE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(20.0, 10.0), CONVERGE_FREE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(120.0, 5.9), CONVERGE_FREE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(141.0, 5.9), CONVERGE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(141.0, 6.0), CONVERGE_FREE_DEG)
+
+  def test_resume_ends_when_the_model_is_within_the_free_window(self):
+    f = make()
+    run(f, 10, torque=300)
+    run(f, 50, torque=0)
+    for _ in range(RESUME_FRAMES):
+      f.update(0.0, False, False, 10.0, 30.0, 40.0, True)
+    self.assertFalse(f.resuming)  # 10 deg away, inside CONVERGE_FREE_DEG
+    g = make()
+    run(g, 10, torque=300)
+    run(g, 50, torque=0)
+    for _ in range(RESUME_FRAMES):
+      g.update(0.0, False, False, 10.0, 30.0, 45.0, True)
+    self.assertTrue(g.resuming)  # 15 deg away
 
   def test_resume_rate_param(self):
     f = make(rate=5)

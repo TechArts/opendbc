@@ -43,6 +43,13 @@ MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 CANCEL_BUTTON_DELAY_FRAMES = 10
 
 MAX_ANGLE_RATE = 5
+
+# The gain ramps up by 0.004 per frame (0.85 after 2.1 s) and starts at 0 after every pause. Routes 60-63: 246 lateral starts, the gain took 0.74 s (median)
+# to reach 0.3 and 83 ended in a new pause before it did. The camera's own first ACTIVE frames carry 0.62-0.85. With the hand off (torque under
+# GAIN_HANDS_OFF_TORQUE, the takeover release value) the gain rises 5 times faster; any hand on the wheel keeps the slow ramp.
+GAIN_RISE = 0.004
+GAIN_RISE_HANDS_OFF = 0.02
+GAIN_HANDS_OFF_TORQUE = 100
 ANGLE_SAFETY_BASELINE_MODEL = "KIA_SPORTAGE_HEV_2026"
 
 
@@ -66,7 +73,8 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain,
 
   else:
     target = 0.0
-  gain = rate_limit(target, last_gain, -0.014, 0.004)
+  rise = GAIN_RISE_HANDS_OFF if abs(steering_torque) < GAIN_HANDS_OFF_TORQUE else GAIN_RISE
+  gain = rate_limit(target, last_gain, -0.014, rise)
   return round(gain / 0.004) * 0.004
 
 
