@@ -32,13 +32,14 @@ class CarStateExt:
     self.cam_lka_ind = None
     self._camera_seen: dict[str, tuple[int, int]] = {}  # camera message -> (receive time, updates since it last changed)
 
-  def _camera_fresh(self, name: str, ts_nanos: int) -> bool:
+  def _camera_fresh(self, name: str, ts_nanos: int, new_only: bool = False) -> bool:
     """True while a camera message keeps arriving: its receive time moved within the last CAMERA_STALE_FRAMES updates (never received: False). The
-    panda lets the lane-keeping window expire after 0.5 s without 0x161 / 0x12A, so ours must be over strictly before."""
+    panda lets the lane-keeping window expire after 0.5 s without 0x161 / 0x12A, so ours must be over strictly before. new_only: True only in the update
+    where the message arrived (an event, for a signal whose hold LkaWindow counts itself: a cached value must not restart that hold)."""
     last_ts, age = self._camera_seen.get(name, (0, CAMERA_STALE_FRAMES + 1))
     age = 0 if ts_nanos != last_ts else min(age + 1, CAMERA_STALE_FRAMES + 1)
     self._camera_seen[name] = (ts_nanos, age)
-    return ts_nanos != 0 and age <= CAMERA_STALE_FRAMES
+    return ts_nanos != 0 and (age == 0 if new_only else age <= CAMERA_STALE_FRAMES)
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -119,7 +120,7 @@ class CarStateExt:
           # the camera's lane-keeping signals, also while the panda blocks its 0xCB: LFA_ICON (0x161) and LKA_SysIndReq (0x12A, 3 = lane departure).
           # The parser keeps the last value of a message that stopped: a signal is only passed on while its message is fresh (see _camera_fresh)
           lka = cp_cam.vl["LFA"]  # registers the message in the parser
-          self.cam_lka_ind = lka["LKA_SysIndReq"] if self._camera_fresh("LFA", cp_cam.ts_nanos["LFA"]["COUNTER"]) else None
+          self.cam_lka_ind = lka["LKA_SysIndReq"] if self._camera_fresh("LFA", cp_cam.ts_nanos["LFA"]["COUNTER"], new_only=True) else None
           self.cam_lfa_icon = self.msg_161["LFA_ICON"] if self._camera_fresh("CCNC_0x161", cp_cam.ts_nanos["CCNC_0x161"]["COUNTER"]) else None
 
     if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:

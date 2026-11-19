@@ -132,11 +132,14 @@ class TestCarStateCameraLka(unittest.TestCase):
     cp, cp_sp, _, cs = gv70_controller()
     parsers = cs.get_can_parsers(cp, cp_sp)
     t = 0
+    inds = []
     for _ in range(10):
       t += 10_000_000
       parsers[Bus.cam].update([(t, frames())])
       cs.update(parsers)
-    self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (2, 3))
+      inds.append(cs.cam_lka_ind)
+    self.assertEqual(cs.cam_lfa_icon, 2)  # the icon is a state, fresh while it keeps arriving
+    self.assertIn(3, inds)  # the indicator is an event: it is only passed on in the update its frame arrived in (see the dropout test below)
     seen = []
     for _ in range(40):  # the camera's frames stop, the car state keeps updating every 10 ms
       t += 10_000_000
@@ -145,14 +148,14 @@ class TestCarStateCameraLka(unittest.TestCase):
       seen.append((cs.cam_lfa_icon, cs.cam_lka_ind))
     # the parser stamps a message a few updates late, which only makes the window end earlier: fresh right after the last frame, stale for good by
     # CAMERA_STALE_FRAMES updates after it
-    self.assertEqual(seen[0], (2, 3))
+    self.assertEqual(seen[0][0], 2)
     self.assertEqual(seen[CAMERA_STALE_FRAMES:], [(None, None)] * (40 - CAMERA_STALE_FRAMES))
     self.assertLess(CAMERA_STALE_FRAMES * 10_000, 500_000)  # strictly inside the panda's 0.5 s
     for _ in range(8):  # and back when it resumes
       t += 10_000_000
       parsers[Bus.cam].update([(t, frames())])
       cs.update(parsers)
-    self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (2, 3))
+    self.assertEqual(cs.cam_lfa_icon, 2)
 
   def test_not_read_without_the_flag(self):
     cp, cp_sp, _, cs = gv70_controller(tweak_sp=lambda sp: setattr(sp, "safetyParam", sp.safetyParam & ~CAMERA_HANDBACK))
@@ -535,6 +538,53 @@ class TestOtherConfigsUnchanged(unittest.TestCase):
     cp = CarInterface.get_params(CAR.GENESIS_GV70_2ND_GEN, fingerprint, [], True, False, False)
     cp_sp = CarInterface.get_params_sp(cp, CAR.GENESIS_GV70_2ND_GEN, fingerprint, [], True, False, False)
     self.assertFalse(cp_sp.safetyParam & CAMERA_HANDBACK)
+
+
+class TestSelectiveLkaDropoutWithPanda(unittest.TestCase):
+  """R1 P2: only 0x12A stops after reporting LKA_SysIndReq 3 while the camera's 0x161 zero icon keeps arriving. The real CarState (parser, freshness), the
+  hand-back and the real panda on the same frames, every 10 ms. A cached indicator used to restart LkaWindow's own 0.3 s hold for 0.3 s more, so the
+  controller stayed silent ~0.6 s while the panda blocked the camera again after 0.5 s: ~10 cycles with no 0xCB sender."""
+
+  def tearDown(self):
+    from opendbc.safety.tests.libsafety import libsafety_py
+    libsafety_py.libsafety.set_current_safety_param_sp(0)
+
+  def test_no_gap_when_only_0x12a_stops(self):
+    from opendbc.safety.tests.common import CANPackerSafety
+    from opendbc.safety.tests.libsafety import libsafety_py
+    from opendbc.sunnypilot.car.hyundai.lfa_alt import create_lfa_alt
+    cp, cp_sp, cc, cs = gv70_controller()
+    safety, spacker, camera = libsafety_py.libsafety, CANPackerSafety(DBC_NAME), CANPacker(DBC_NAME)
+    safety.set_current_safety_param_sp(cp_sp.safetyParam)
+    safety.set_safety_hooks(structs.CarParams.SafetyModel.hyundaiCanfd, int(cp.safetyConfigs[-1].safetyParam))
+    safety.init_tests()
+    cs.out = structs.CarState()
+    parsers = cs.get_can_parsers(cp, cp_sp)
+    drop_us = 3_000_000
+    gap, longest, camera_cycles = 0, 0, 0
+    for frame in range(1, 600):
+      t = frame * 10_000
+      safety.set_timer(t)
+      msgs = []
+      if t % 50_000 == 0:
+        msgs.append(("CCNC_0x161", {"LFA_ICON": 0}))
+      if t < drop_us:
+        msgs.append(("LFA", {"LKA_SysIndReq": 3}))
+      for name, values in msgs:
+        safety.safety_rx_hook(spacker.make_can_msg_safety(name, 2, values))
+      parsers[Bus.cam].update([(t * 1000, [camera.make_can_msg(name, 2, values) for name, values in msgs])])
+      cs.update(parsers)
+      send_lat = cc.handback.update(cs, frame, False)
+      camera_passes = safety.safety_fwd_hook(2, 0xCB) == 0
+      ours = False
+      if send_lat:
+        addr, dat, bus = create_lfa_alt(cc.packer, cc.CAN, False, 0.0, 0.0)
+        ours = bool(safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat)))
+      camera_cycles += camera_passes
+      gap = gap + 1 if not (camera_passes or ours) else 0
+      longest = max(longest, gap)
+    self.assertGreater(camera_cycles, 100, "the nudge never reached the car")
+    self.assertLessEqual(longest, 2, "cycles in a row with neither sender")
 
 
 if __name__ == "__main__":
