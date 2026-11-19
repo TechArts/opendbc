@@ -153,6 +153,10 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   hyundai_common_reset_acc_main_on_mismatches();
 }
 
+// LFA_ALT on CCNC: the camera needs an MDPS (0xEA) at all times, so the car's real one is forwarded until openpilot
+// sends its own copy; from then on only openpilot's copy reaches the camera
+static bool hyundai_canfd_mdps_tx = false;
+
 static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   const TorqueSteeringLimits HYUNDAI_CANFD_TORQUE_STEERING_LIMITS = {
     .max_torque = 270,
@@ -188,6 +192,10 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   const AngleSteeringParams *HYUNDAI_STEERING_PARAMS = hyundai_get_angle_params(hyundai_canfd_angle_model_id);
 
   bool tx = true;
+
+  if (hyundai_canfd_lfa_alt_steer && (msg->addr == 0xEAU) && (msg->bus == 2U)) {
+    hyundai_canfd_mdps_tx = true;
+  }
 
   // steering
   unsigned int steer_addr = (hyundai_canfd_lka_steer_msg && !hyundai_longitudinal) ? hyundai_canfd_get_lka_addr() : 0x12aU;
@@ -297,6 +305,11 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
+static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
+  // block the car's MDPS toward the camera only once openpilot sends its own copy
+  return (bus_num == 0) && (addr == 0xEA) && hyundai_canfd_mdps_tx;
+}
+
 static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT = 128;
   const uint16_t HYUNDAI_PARAM_CANFD_ALT_BUTTONS = 32;
@@ -361,10 +374,11 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     {0x1CF, 2,  8, .check_relay = (longitudinal)},  /* CRUISE_BUTTONS */ \
     {0x161, 0, 32, .check_relay = true},            /* CCNC_0x161 */     \
     {0x162, 0, 32, .check_relay = true},            /* CCNC_0x162 */     \
-    {0xEA,  2, 24, .check_relay = true},            /* MDPS */           \
+    {0xEA,  2, 24, .check_relay = true, .disable_static_blocking = true}, /* MDPS, forwarded until openpilot sends its own */ \
 
   hyundai_common_init(param);
 
+  hyundai_canfd_mdps_tx = false;
   gen_crc_lookup_table_16(0x1021, hyundai_canfd_crc_lut);
   hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
   hyundai_canfd_angle_steering = GET_FLAG(current_safety_param_sp, HYUNDAI_PARAM_SP_CANFD_ANGLE_STEERING);
@@ -540,6 +554,7 @@ const safety_hooks hyundai_canfd_hooks = {
   .init = hyundai_canfd_init,
   .rx = hyundai_canfd_rx_hook,
   .tx = hyundai_canfd_tx_hook,
+  .fwd = hyundai_canfd_fwd_hook,
   .get_counter = hyundai_canfd_get_counter,
   .get_checksum = hyundai_canfd_get_checksum,
   .compute_checksum = hyundai_common_canfd_compute_checksum,

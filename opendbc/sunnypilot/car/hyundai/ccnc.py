@@ -26,6 +26,26 @@ T_FOLLOW = {1: 1.25, 2: 1.45, 3: 1.75}  # s
 TARGET_DISTANCE_MAX = 204.6  # m
 LEAD_FILTER_RC = 0.5  # s
 
+# ALERTS_2 values that are collision / emergency alerts in the CCNC_0x161 value table
+CCNC_COLLISION_ALERTS_2 = (7, 8, 9, 14, 21)
+# cluster text/chime pairs for the red/green-light cues: (alert field, text, sound field, chime)
+CCNC_CLUSTER_ALERTS = {
+  "red": ("ALERTS_3", 18, "SOUNDS_3", 5),     # "Check surroundings" + single chime
+  "green": ("ALERTS_5", 11, "SOUNDS_2", 2),   # "Leading vehicle is driving away" + single chime
+}
+
+
+def cluster_alert_free(stock_161, cluster_alert) -> bool:
+  """True if our red/green-light cue may be shown. A stock car alert always wins: stock_161 is the camera's ORIGINAL frame (before any
+  sunnypilot suppression); the cue is skipped if its ALERTS_1 is set, a collision ALERTS_2 is showing, or the target text/chime field
+  is in use."""
+  if cluster_alert not in CCNC_CLUSTER_ALERTS:
+    return False
+  alert_field, _, sound_field, _ = CCNC_CLUSTER_ALERTS[cluster_alert]
+  if stock_161["ALERTS_1"] != 0 or stock_161["ALERTS_2"] in CCNC_COLLISION_ALERTS_2:
+    return False
+  return stock_161[alert_field] == 0 and stock_161[sound_field] == 0
+
 
 def create_ccnc_mdps(packer, CAN, mdps, lfa_alt=None):
   values = {k: v for k, v in mdps.items() if k != "COUNTER"}
@@ -42,7 +62,7 @@ def create_ccnc_mdps(packer, CAN, mdps, lfa_alt=None):
 
 
 def create_ccnc_0x161(packer, CAN, frame, msg_161, enabled, lat_active, paused, long_enabled, main_cruise_enabled, gas_override,
-                      hud_control, set_speed, v_ego, lead_visible, show_distance_bars):
+                      hud_control, set_speed, v_ego, lead_visible, show_distance_bars, cluster_alert=None):
   values = msg_161.copy()
 
   values.update({
@@ -91,10 +111,16 @@ def create_ccnc_0x161(packer, CAN, frame, msg_161, enabled, lat_active, paused, 
       "TARGET_DISTANCE": target_distance if enabled else TARGET_DISTANCE_MAX,
     })
 
+  # last, after the suppressions above, but decided on the camera's original frame so any stock warning wins
+  if cluster_alert_free(msg_161, cluster_alert):
+    alert_field, alert, sound_field, sound = CCNC_CLUSTER_ALERTS[cluster_alert]
+    values.update({alert_field: alert, sound_field: sound})
+
   return packer.make_can_msg("CCNC_0x161", CAN.ECAN, values)
 
 
-def create_ccnc_0x162(packer, CAN, msg_162, enabled, long_enabled, main_cruise_enabled, gas_override, lead_visible, lead_distance):
+def create_ccnc_0x162(packer, CAN, msg_162, enabled, long_enabled, main_cruise_enabled, gas_override, lead_visible, lead_distance,
+                      msg_161=None, cluster_alert=None):
   values = msg_162.copy()
 
   if long_enabled:
@@ -103,6 +129,9 @@ def create_ccnc_0x162(packer, CAN, msg_162, enabled, long_enabled, main_cruise_e
       "LEAD_DISTANCE": min(TARGET_DISTANCE_MAX, max(0.0, lead_distance)) if lead_visible else TARGET_DISTANCE_MAX,
       "LEAD_LATERAL": 0,
     })
+
+  if msg_161 is not None and cluster_alert_free(msg_161, cluster_alert):
+    values["VIBRATE"] = 1
 
   return packer.make_can_msg("CCNC_0x162", CAN.ECAN, values)
 
@@ -177,7 +206,9 @@ class CcncCarController:
     if not self.ccnc_lfa_steering:
       return can_sends
 
-    can_sends.append(create_ccnc_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt if self.lfa_alt_steering else None))
+    # no MDPS copy until a real MDPS frame has been received; the panda forwards the real one until our first copy
+    if CS.mdps:
+      can_sends.append(create_ccnc_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt if self.lfa_alt_steering else None))
 
     if self.CP.openpilotLongitudinalControl:
       if not CC.enabled or CC.hudControl.leadDistanceBars != self.lead_distance_bars_last:
@@ -201,10 +232,10 @@ class CcncCarController:
       can_sends.append(create_ccnc_0x161(self.packer, self.CAN, self.frame, CS.msg_161, long_enabled_icons, lat_active, paused,
                                          self.CP.openpilotLongitudinalControl, CS.main_cruise_enabled, CC.cruiseControl.override,
                                          CC.hudControl, set_speed, CS.out.vEgo, self.lead_visible,
-                                         self.frame - self.distance_bar_frame < 400))
+                                         self.frame - self.distance_bar_frame < 400, self.cluster_alert))
       can_sends.append(create_ccnc_0x162(self.packer, self.CAN, CS.msg_162, long_enabled_icons, self.CP.openpilotLongitudinalControl,
                                          CS.main_cruise_enabled, CC.cruiseControl.override, self.lead_visible,
-                                         self.lead_distance_filter.x))
+                                         self.lead_distance_filter.x, CS.msg_161, self.cluster_alert))
 
     return can_sends
 

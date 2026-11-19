@@ -12,6 +12,7 @@ from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParam
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController
+from opendbc.sunnypilot.car.hyundai.cluster_alert import ClusterAlertCarController
 from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
 from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.hyundai.lfa_alt import LFA_ALT_ANGLE_LIMITS, create_lfa_alt
@@ -101,10 +102,11 @@ def parse_scaled_value(val, scale=10):
 
 
 class CarController(CarControllerBase, CcncCarController, EsccCarController, LeadDataCarController, LongitudinalController, MadsCarController,
-                    IntelligentCruiseButtonManagementInterface):
+                    IntelligentCruiseButtonManagementInterface, ClusterAlertCarController):
   def __init__(self, dbc_names, CP, CP_SP):
     CarControllerBase.__init__(self, dbc_names, CP, CP_SP)
     CcncCarController.__init__(self, CP, CP_SP)
+    ClusterAlertCarController.__init__(self)
     EsccCarController.__init__(self, CP, CP_SP)
     MadsCarController.__init__(self)
     LeadDataCarController.__init__(self, CP)
@@ -134,6 +136,7 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
   def update(self, CC, CC_SP, CS, now_nanos):
     EsccCarController.update(self, CS)
     LeadDataCarController.update(self, CC_SP)
+    self.update_cluster_alert(CC_SP, self.frame)
     MadsCarController.update(self, self.CP, CC, CC_SP, self.frame)
     if self.frame % 5 == 0:
       LongitudinalController.update(self, CC, CS)
