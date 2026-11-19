@@ -164,9 +164,12 @@ class TestTakeoverFilter(unittest.TestCase):
       last = f.limit(80.0, last, measured, 10.0)
     self.assertEqual(last - measured, CONVERGE_FREE_DEG)
     self.assertEqual(TakeoverFilter.converge_deg(20.0, 10.0), CONVERGE_FREE_DEG)
-    self.assertEqual(TakeoverFilter.converge_deg(120.0, 5.9), CONVERGE_FREE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(100.0, 5.9), CONVERGE_FREE_DEG)
     self.assertEqual(TakeoverFilter.converge_deg(141.0, 5.9), CONVERGE_DEG)
-    self.assertEqual(TakeoverFilter.converge_deg(141.0, 6.0), CONVERGE_FREE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(141.0, 6.0), CONVERGE_DEG)
+    self.assertEqual(TakeoverFilter.converge_deg(120.0, 5.0), CONVERGE_DEG + 7.0 * 0.5)  # halfway to the region by angle
+    self.assertEqual(TakeoverFilter.converge_deg(150.0, 7.5), CONVERGE_DEG + 7.0 * 0.5)  # halfway by speed
+    self.assertEqual(TakeoverFilter.converge_deg(150.0, 9.0), CONVERGE_FREE_DEG)
 
   def test_resume_ends_when_the_model_is_within_the_free_window(self):
     f = make()
@@ -654,6 +657,47 @@ class TestBlockedResumeRoute39(unittest.TestCase):
         self.assertFalse(active, f"frame {i}: ACTIVE inside the region")
     self.assertGreater(sum(a for a, _, _ in out), 20)  # ACTIVE is actually delivered once out of the region
     self._assert_active_steps(out)
+
+  def _resume_into_the_region(self, sign, wheel_at, v_at, model, wheel0, v0, frames=300):
+    """Blinker pause, then a resume outside the region (wheel0, v0) that runs into it: the wheel and the speed per frame. Every frame: one 0xCB, accepted.
+    Once ACTIVE the resume never goes inactive (no gap, no gain reset) and never restarts ACTIVE in the region. Returns [(active, wheel, v, gain)]."""
+    for _ in range(100):
+      cb, ok, active, _, _ = self._frame(False, wheel0, model, v0)
+      self.assertEqual((len(cb), ok, active), (1, [True], [False]))
+    out, started = [], False
+    for i in range(frames):
+      w, v = wheel_at(i), v_at(i)
+      cb, ok, active, _, req = self._frame(True, w, model, v)
+      self.assertEqual((len(cb), ok), (1, [True]), f"frame {i}: TX gap or rejected frame")
+      gain = self.cc.apply_torque_last
+      in_region = abs(w) > 140.0 and v < 6.0
+      if started:
+        self.assertTrue(active[0], f"sign {sign} frame {i} wheel {w:.1f} v {v:.2f}: inactive after ACTIVE (gain was reset)")
+        self.assertGreater(gain, 0.0, f"frame {i}: gain reset")
+      elif active[0]:
+        self.assertFalse(in_region, f"frame {i}: ACTIVE started inside the region")
+        started = True
+      out.append((active[0], w, v, gain))
+    self.assertTrue(started)
+    return out
+
+  def test_resume_crossing_into_the_region_on_the_wheel_angle_keeps_steering(self):
+    """3.2 m/s, resuming at 100 deg with the model far ahead, the wheel unwinds toward 175: it crosses 140 deg ACTIVE, both signs, slow and fast wheel."""
+    for sign in (1, -1):
+      for rate in (0.2, 0.5, 0.9):
+        self.setUp()
+        out = self._resume_into_the_region(sign, lambda i, sign=sign, rate=rate: sign * min(100.0 + rate * i, 175.0), lambda i: 3.2, sign * 175.0,
+                                          sign * 100.0, 3.2)
+        self.assertTrue(any(abs(w) > 140.0 for _, w, _, _ in out) and out[-1][0])
+
+  def test_resume_crossing_into_the_region_on_the_speed_keeps_steering(self):
+    """Wheel 150 deg, resuming at 8 m/s (outside the region), the car slows through 6 m/s: both signs, slow and fast braking."""
+    for sign in (1, -1):
+      for decel in (0.005, 0.02, 0.05):
+        self.setUp()
+        out = self._resume_into_the_region(sign, lambda i, sign=sign: sign * (150.0 + 0.02 * i), lambda i, decel=decel: max(8.0 - decel * i, 4.0), sign * 160.0,
+                                          sign * 150.0, 8.0, frames=600)
+        self.assertTrue(any(v < 6.0 for _, _, v, _ in out) and out[-1][0])
 
   def test_resume_with_a_slowly_unwinding_wheel(self):
     out = self._replay(lambda i: self.WHEEL + 0.5 * i)

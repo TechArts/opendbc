@@ -23,6 +23,11 @@ CONVERGE_DEG = 5.0  # request stays this close to the measured angle while resum
 # model by 24 deg below 5 m/s and 9 deg at 5-10 m/s (2.5 and -3 deg when not resuming), the request held 5 deg ahead of the wheel and the EPS turned the
 # wheel at 39 deg/s at most with an error of 3-6 deg (69-84 deg/s at 6-12 deg, gain 0.5 or more), less than the model's 50-100 deg/s turn-in.
 CONVERGE_FREE_DEG = 12.0
+# The window narrows from CONVERGE_FREE_DEG to CONVERGE_DEG over the CONVERGE_TAPER_* distance to the guard region (wheel up to STEP_CAP_ANGLE, speed
+# down to STEP_CAP_SPEED), so a resumed request never leads the wheel by more than the window inside the region allows (+- CONVERGE_DEG, last +- 1 deg)
+# on the frame the region starts. The widest narrowing per frame (7 deg / 40 deg x the wheel's deg per frame) stays below the resume rate.
+CONVERGE_TAPER_ANGLE = 40.0  # deg
+CONVERGE_TAPER_SPEED = 3.0  # m/s
 WHEEL_RATE_FRAMES = 5  # frames the wheel's angular speed is measured over
 
 # low-speed guard: both short EPS faults had a request 19-29 deg ahead of the wheel at 174-182 deg and 3-4 m/s
@@ -207,7 +212,10 @@ class TakeoverFilter:
 
   @classmethod
   def converge_deg(cls, angle: float, v_ego: float) -> float:
-    return CONVERGE_DEG if cls.step_capped(angle, v_ego) else CONVERGE_FREE_DEG
+    """Resume window (wheel +- this): CONVERGE_DEG in the guard region (step_capped), CONVERGE_FREE_DEG away from it by either the wheel angle or the
+    speed, linear in between: the region needs both a large angle and a low speed, so the nearer of the two margins sets the width."""
+    far = max((STEP_CAP_ANGLE - abs(angle)) / CONVERGE_TAPER_ANGLE, (v_ego - STEP_CAP_SPEED) / CONVERGE_TAPER_SPEED)
+    return CONVERGE_DEG + (CONVERGE_FREE_DEG - CONVERGE_DEG) * min(max(far, 0.0), 1.0)
 
   @staticmethod
   def step_capped(angle: float, v_ego: float) -> bool:
