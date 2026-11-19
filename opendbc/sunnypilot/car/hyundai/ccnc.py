@@ -254,9 +254,12 @@ class CcncCarController:
 
   def dash_states(self, CS, CC):
     """(lat_active, lat_paused, cruise_shown) for the dash: what each axis is really doing, independent of the other. A steering fault is not a
-    pause (wheel hidden, not grey), and a faulted ACC shows no cruise at all."""
+    pause (wheel hidden, not grey), and a faulted ACC shows no cruise at all. Green only while an ACTIVE 0xCB goes out: a driver takeover, or a
+    cycle where nothing steers (gain 0, a request the panda would reject), is a grey wheel."""
     lat_active = self.mads.lat_active if self.mads.enable_mads else CC.enabled
     paused = self.mads.enable_mads and self.mads.paused
     if not lat_active and (CS.out.steerFaultTemporary or CS.out.steerFaultPermanent):
       paused = False
+    if CC.latActive and (self.takeover.paused or self.lat_unsent):
+      lat_active, paused = False, True
     return lat_active, paused, bool(CC.enabled and not CS.out.accFaulted)

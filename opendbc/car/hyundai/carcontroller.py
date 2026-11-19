@@ -1,5 +1,7 @@
+import math
+
 import numpy as np
-from opendbc.car.vehicle_model import VehicleModel
+from opendbc.car.vehicle_model import VehicleModel, calc_slip_factor
 from opendbc.car.common.filter_simple import FirstOrderFilter
 
 from opendbc.can import CANPacker
@@ -9,7 +11,9 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR
+from opendbc.car.hyundai.panda_angle import PandaAngleCheck
 from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
+from opendbc.car.hyundai.takeover import TakeoverFilter, STEP_CAP_DEG
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController
@@ -127,9 +131,16 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     self.VM = VehicleModel(CP)
     self.BASELINE_VM = VehicleModel(get_baseline_safety_cp())
     self.apply_angle_last = 0
+    self.lat_unsent = False  # latActive, but no ACTIVE 0xCB goes out this cycle (gain 0, driver takeover, or a request the panda would reject)
+    self.panda_check = PandaAngleCheck(calc_slip_factor(self.VM), CP.steerRatio, CP.wheelbase)
 
-    # GV70 steer feel (HyundaiSteerFeel)
+    # GV70 steering takeover (HyundaiTakeover*), steer feel (HyundaiSteerFeel) and curve hold (HyundaiCurveHold)
     self.steer_feel_blend, self.steer_feel_all_speeds = steer_feel_blend(CP, CP_SP)
+    gv70_angle = CP.carFingerprint == CAR.GENESIS_GV70_2ND_GEN and self.lfa_alt_steering
+    self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
+                                   CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
+                                   1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD),
+                                   self.params.ANGLE_LIMITS.STEER_ANGLE_MAX)
 
     self.accel_last = 0
     self.apply_torque_last = 0
@@ -151,6 +162,7 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     hud_control = CC.hudControl
 
     # steering torque
+    lat_active = CC.latActive  # not while the driver has taken over, see takeover.py
     if not self.CP_SP.flags & HyundaiFlagsSP.CANFD_ANGLE_STEERING:
       self.angle_limit_counter, apply_steer_req = common_fault_avoidance(abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive,
                                                                          self.angle_limit_counter, MAX_ANGLE_FRAMES,
@@ -161,39 +173,55 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     # angle control
     else:
       v_ego_raw = CS.out.vEgoRaw
+      self.panda_check.add_speed(v_ego_raw)
       desired_angle = float(np.clip(actuators.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
 
       self.angle_filter.update_alpha(float(np.interp(CS.out.vEgo, [5, 10, 20], [0.2, 0.1, 0.0])))
       desired_angle = self.angle_filter.update(desired_angle)
 
-      apply_angle = apply_steer_angle_limits_vm(desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, CC.latActive, self.params, self.VM)
+      paused = self.takeover.update(CS.out.steeringTorque, CS.out.steeringPressed, CS.out.steerFaultTemporary, CS.out.vEgo,
+                                    CS.out.steeringAngleDeg, desired_angle, CC.latActive)
+      lat_active = CC.latActive and not paused
 
-      # if we are not the baseline model, we use the baseline model for further limits to prevent a panda block since it is hardcoded for baseline model.
-      # if self.CP.carFingerprint != ANGLE_SAFETY_BASELINE_MODEL:
-      #   apply_angle = apply_steer_angle_limits_vm(apply_angle or desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, CC.latActive,
-      #                                             self.params, self.BASELINE_VM)
+      apply_angle = apply_steer_angle_limits_vm(desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, lat_active, self.params, self.VM)
 
-      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last,
-                                                   self.steer_feel_blend, self.steer_feel_all_speeds)
-      apply_steer_req = CC.latActive and apply_torque != 0
+      # the panda checks against the platform's own angle model (hyundai_canfd_angle_models.h), the same vehicle model as above: no further baseline limits
 
-      # Failsafe if we detected we'd violate safety
+      # the low-speed, large-angle guard region (takeover.step_capped): the request is moved to the nearest point of the intersection of the guard band,
+      # the resume window, the 1 deg step cap and what the panda accepts at the largest recent speed + 1 m/s (takeover.limit); inactive at the measured
+      # angle if that is empty. Outside the region, after the resume blend, only the lead band runs (below 6 m/s with wheel or request past 90 deg: the
+      # request is moved toward the wheel +- 10 deg, keeping the incoming request or one step from last, takeover.lead_band); otherwise the road-proven path.
+      in_region = self.takeover.enabled and self.takeover.step_capped(CS.out.steeringAngleDeg, CS.out.vEgo)
+      if lat_active and apply_angle is not None:
+        backstop = self.panda_check.window(self.apply_angle_last, STEP_CAP_DEG) if in_region else (-math.inf, math.inf)
+        apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo, backstop)
+      self.takeover.note_unsendable(lat_active and apply_angle is None and in_region)
+
+      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,
+                                                   self.steer_feel_blend, self.steer_feel_all_speeds, self.takeover.hold_state)
+      apply_steer_req = lat_active and apply_torque != 0 and apply_angle is not None
+
+      # Failsafe if we detected we'd violate safety. The measured angle is clipped to +-STEER_ANGLE_MAX on purpose: the panda (lateral.h
+      # steer_angle_cmd_checks_vm, max_angle of the LFA_ALT limits) clamps the allowed INACTIVE band to [clamp(measured) -+ 1], so an INACTIVE request at a
+      # wheel beyond the EPS limit (175 deg on LFA_ALT; route 3a 1:28.3-1:29.7 was 362-409 deg on the old 360 deg limit) is only accepted at the limit.
+      # Pinned by test_inactive_beyond_the_eps_limit_is_clipped_because_the_panda_demands_it.
       if apply_angle is None:
         apply_torque = 0
-        apply_angle = CS.out.steeringAngleDeg
+        apply_angle = float(np.clip(CS.out.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
         apply_steer_req = False
 
       # After we've used the last angle wherever we needed it, we now update it.
       self.apply_angle_last = apply_angle
 
-      if not CC.latActive:
+      if not lat_active:
         self.apply_angle_last = float(np.clip(CS.out.steeringAngleDeg, -self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.STEER_ANGLE_MAX))
         self.angle_filter.x = self.apply_angle_last
 
-    if not CC.latActive:
+    if not lat_active:
       apply_torque = 0
 
     self.apply_torque_last = apply_torque
+    self.lat_unsent = CC.latActive and not apply_steer_req  # latActive, but no ACTIVE frame goes out (gain 0, taken over, or a frame the panda would reject)
 
     # accel + longitudinal
     accel = float(np.clip(actuators.accel, CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX))
