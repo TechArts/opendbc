@@ -110,7 +110,8 @@ static const uint32_t HYUNDAI_CANFD_HB_LKA_STALE_US = 500000U;          // no ca
 static bool hyundai_canfd_hb_cam_icon_zero = false;    // camera 0x161 LFA_ICON is 0 now
 static uint32_t hyundai_canfd_hb_cam_icon_zero_ts = 0U;  // since when
 static uint32_t hyundai_canfd_hb_cam_icon_ts = 0U;     // when the last camera 0x161 arrived (stale or missing: no window)
-static bool hyundai_canfd_hb_cam_lka_seen = false;     // a camera 0x12A with LKA_SysIndReq 3 was seen since init
+static bool hyundai_canfd_hb_cam_icon_settled = false;  // the icon has been 0 for HYUNDAI_CANFD_HB_LKA_ICON_SETTLE_US: latched, never compared across a timer wrap
+static bool hyundai_canfd_hb_cam_lka_seen = false;     // a camera 0x12A with LKA_SysIndReq 3 less than HYUNDAI_CANFD_HB_LKA_HOLD_US ago (cleared when it expires)
 static uint32_t hyundai_canfd_hb_cam_lka_ts = 0U;      // the last one
 static const uint32_t HYUNDAI_CANFD_HB_OP_IDLE_US = 200000U;            // openpilot sent no accepted ACTIVE 0xCB for this long = it is not steering
 static bool hyundai_canfd_hb_op_steer_seen = false;    // openpilot sent an accepted ACTIVE 0xCB less than HYUNDAI_CANFD_HB_OP_IDLE_US ago (cleared when it expires)
@@ -160,6 +161,8 @@ static bool hyundai_canfd_handback_mdps_ok(bool ours) {
 }
 
 // the camera's own lane-keeping signals on bus 2: 0x161 LFA_ICON (224|4) and 0x12A LKA_SysIndReq (38|3)
+// Every mark is either latched (settled) or cleared when it expires (icon, hold, openpilot steering), so no elapsed time is compared once it is older
+// than the unsigned 32 bit microsecond timer can tell (2^32 us, ~71.6 min): an old event never looks recent again
 static void hyundai_canfd_handback_camera_lka(const CANPacket_t *msg) {
   const uint32_t now = microsecond_timer_get();
   if (msg->addr == 0x161U) {
@@ -167,6 +170,13 @@ static void hyundai_canfd_handback_camera_lka(const CANPacket_t *msg) {
     const bool was_zero = hyundai_canfd_hb_cam_icon_zero && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_ts) <= HYUNDAI_CANFD_HB_LKA_STALE_US);
     if (zero && !was_zero) {
       hyundai_canfd_hb_cam_icon_zero_ts = now;
+      hyundai_canfd_hb_cam_icon_settled = false;
+    }
+    if (zero && !hyundai_canfd_hb_cam_icon_settled && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_zero_ts) >= HYUNDAI_CANFD_HB_LKA_ICON_SETTLE_US)) {
+      hyundai_canfd_hb_cam_icon_settled = true;
+    }
+    if (!zero) {
+      hyundai_canfd_hb_cam_icon_settled = false;
     }
     hyundai_canfd_hb_cam_icon_ts = now;
     hyundai_canfd_hb_cam_icon_zero = zero;
@@ -185,13 +195,17 @@ static void hyundai_canfd_handback_camera_lka(const CANPacket_t *msg) {
 static bool hyundai_canfd_handback_camera_lka_open(void) {
   const uint32_t now = microsecond_timer_get();
   if (hyundai_canfd_hb_op_steer_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_op_steer_ts) >= HYUNDAI_CANFD_HB_OP_IDLE_US)) {
-    hyundai_canfd_hb_op_steer_seen = false;  // expired: an old timestamp never looks recent again after the timer wraps
+    hyundai_canfd_hb_op_steer_seen = false;  // expired
+  }
+  if (hyundai_canfd_hb_cam_icon_zero && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_ts) > HYUNDAI_CANFD_HB_LKA_STALE_US)) {
+    hyundai_canfd_hb_cam_icon_zero = false;  // no camera 0x161 for that long: the icon state and its settle time are gone
+    hyundai_canfd_hb_cam_icon_settled = false;
+  }
+  if (hyundai_canfd_hb_cam_lka_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_lka_ts) > HYUNDAI_CANFD_HB_LKA_HOLD_US)) {
+    hyundai_canfd_hb_cam_lka_seen = false;  // the lane-departure hold is over
   }
   const bool op_steering = (controls_allowed || controls_allowed_lateral) && hyundai_canfd_hb_op_steer_seen;
-  return !op_steering &&
-         hyundai_canfd_hb_cam_icon_zero && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_ts) <= HYUNDAI_CANFD_HB_LKA_STALE_US) &&
-         (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_icon_zero_ts) >= HYUNDAI_CANFD_HB_LKA_ICON_SETTLE_US) &&
-         hyundai_canfd_hb_cam_lka_seen && (safety_get_ts_elapsed(now, hyundai_canfd_hb_cam_lka_ts) <= HYUNDAI_CANFD_HB_LKA_HOLD_US);
+  return !op_steering && hyundai_canfd_hb_cam_icon_zero && hyundai_canfd_hb_cam_icon_settled && hyundai_canfd_hb_cam_lka_seen;
 }
 
 static void hyundai_canfd_handback_lat_to_ours(void) {
@@ -630,6 +644,7 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   hyundai_canfd_hb_cam_icon_ts = 0U;
   hyundai_canfd_hb_cam_icon_zero = false;
   hyundai_canfd_hb_cam_icon_zero_ts = 0U;
+  hyundai_canfd_hb_cam_icon_settled = false;
   hyundai_canfd_hb_cam_lka_seen = false;
   hyundai_canfd_hb_cam_lka_ts = 0U;
   hyundai_canfd_hb_op_steer_seen = false;

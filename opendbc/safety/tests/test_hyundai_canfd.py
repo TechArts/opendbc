@@ -2079,6 +2079,33 @@ class TestHyundaiCanfdCameraHandback(unittest.TestCase):
     self.assertFalse(self.safety.safety_tx_hook(libsafety_py.make_CANPacket(0xEA, 0, b"\x00" * 24)))  # wrong bus
     self.assertFalse(self.safety.safety_tx_hook(libsafety_py.make_CANPacket(0xCB, 2, b"\x00" * 24)))  # wrong bus
 
+  WRAP = 2 ** 32  # the panda's microsecond timer is unsigned 32 bit: ~71.6 min
+
+  def _steady_icon_through_the_wrap(self, ind3, after=0):
+    """camera 0x161 (icon 0) every 0.4 s for more than a timer wrap, 0x12A LKA_SysIndReq 3 whenever ind3(t) says so; every 0.4 s the forward decision of
+    the camera's 0xCB is asked (the 0xCB path runs at 100 Hz on the car). Returns that decision at the first step `after` us past the wrap."""
+    self._init()
+    t = 0
+    while True:
+      self.safety.set_timer(t % self.WRAP)
+      self._cam_icon(0)
+      if ind3(t):
+        self._cam_ind(3)
+      decision = self._cb_fwd()
+      if t >= self.WRAP + after:
+        return decision
+      t += 400_000
+
+  def test_settled_icon_survives_the_timer_wrap(self):
+    """R1 P1 4: the settle time (icon 0 for 1.5 s) was compared as an elapsed time from the first zero icon: ~71.6 min of steady zero icon later it
+    wrapped and closed the nudge window for 1.5 s. It is latched now. A lane departure right after the wrap opens the window."""
+    self.assertTrue(self._steady_icon_through_the_wrap(lambda t: t >= self.WRAP))
+
+  def test_lane_departure_hold_does_not_revive_after_a_timer_wrap(self):
+    """R1 P2 5: one LKA_SysIndReq 3 at 2.0 s, then none: its hold (0.5 s) was only compared as an elapsed time, so 2^32 us later the old event looked
+    recent again and opened the window. It is cleared when the hold expires."""
+    self.assertFalse(self._steady_icon_through_the_wrap(lambda t: 2_000_000 <= t < 2_400_000, after=2_000_000))
+
 
 class TestHyundaiCanfdCameraHandbackLong(TestHyundaiCanfdCameraHandback):
   """The same with openpilot longitudinal: 0x1A0 stays upstream's static block, the lateral hand-back does not depend on it."""

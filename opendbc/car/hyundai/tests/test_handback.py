@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from opendbc.can import CANParser
+from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, gen_empty_fingerprint, structs
 from opendbc.car.hyundai import handback
 from opendbc.car.hyundai.handback import CameraHandback, CounterFollower, LkaWindow, LKA_ICON_SETTLE_FRAMES, LKA_HOLD_FRAMES, LAT_IDLE_FRAMES, \
@@ -10,6 +10,7 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.tests.gv70 import DBC_NAME, dbc_defaults, gv70_controller
 from opendbc.car.hyundai.values import CAR
+from opendbc.sunnypilot.car.hyundai.carstate_ext import CAMERA_STALE_FRAMES
 from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController
 from opendbc.sunnypilot.car.hyundai.values import HyundaiSafetyFlagsSP
 
@@ -118,6 +119,38 @@ class TestCarStateCameraLka(unittest.TestCase):
     self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (None, None))
     for t in (10_000_000, 20_000_000):  # the first update registers the messages
       parsers[Bus.cam].update([(t, [(0x12A, f12a, 2), (0x161, f161, 2)])])
+      cs.update(parsers)
+    self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (2, 3))
+
+  def test_signals_of_a_camera_that_stopped_are_not_passed_on(self):
+    """R1 P1 3: the parser keeps the last value of a message that stopped (its receive time only says 'ever received'). A stale LKA_SysIndReq 3 / icon 0
+    kept the controller silent for the camera while the panda (0.5 s expiry) already blocked it again: nobody steered. They go None after 0.3 s."""
+    packer = CANPacker(DBC_NAME)  # frames with running counters and checksums, like the camera's: the parser drops repeats of one frame
+
+    def frames():
+      return [packer.make_can_msg("LFA", 2, {"LKA_SysIndReq": 3}), packer.make_can_msg("CCNC_0x161", 2, {"LFA_ICON": 2})]
+    cp, cp_sp, _, cs = gv70_controller()
+    parsers = cs.get_can_parsers(cp, cp_sp)
+    t = 0
+    for _ in range(10):
+      t += 10_000_000
+      parsers[Bus.cam].update([(t, frames())])
+      cs.update(parsers)
+    self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (2, 3))
+    seen = []
+    for _ in range(40):  # the camera's frames stop, the car state keeps updating every 10 ms
+      t += 10_000_000
+      parsers[Bus.cam].update([(t, [])])
+      cs.update(parsers)
+      seen.append((cs.cam_lfa_icon, cs.cam_lka_ind))
+    # the parser stamps a message a few updates late, which only makes the window end earlier: fresh right after the last frame, stale for good by
+    # CAMERA_STALE_FRAMES updates after it
+    self.assertEqual(seen[0], (2, 3))
+    self.assertEqual(seen[CAMERA_STALE_FRAMES:], [(None, None)] * (40 - CAMERA_STALE_FRAMES))
+    self.assertLess(CAMERA_STALE_FRAMES * 10_000, 500_000)  # strictly inside the panda's 0.5 s
+    for _ in range(8):  # and back when it resumes
+      t += 10_000_000
+      parsers[Bus.cam].update([(t, frames())])
       cs.update(parsers)
     self.assertEqual((cs.cam_lfa_icon, cs.cam_lka_ind), (2, 3))
 
