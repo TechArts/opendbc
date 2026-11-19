@@ -28,6 +28,9 @@ CONVERGE_FREE_DEG = 12.0
 # on the frame the region starts. The widest narrowing per frame (7 deg / 40 deg x the wheel's deg per frame) stays below the resume rate.
 CONVERGE_TAPER_ANGLE = 40.0  # deg
 CONVERGE_TAPER_SPEED = 3.0  # m/s
+# the taper ends this far before the region, so the rate-limited band (self.band) has reached CONVERGE_DEG when it starts
+CONVERGE_MARGIN_ANGLE = 10.0  # deg
+CONVERGE_MARGIN_SPEED = 0.5  # m/s
 WHEEL_RATE_FRAMES = 5  # frames the wheel's angular speed is measured over
 
 # low-speed guard: both short EPS faults had a request 19-29 deg ahead of the wheel at 174-182 deg and 3-4 m/s
@@ -212,7 +215,7 @@ class TakeoverFilter:
 
     if self.resuming:
       self.resume_frames = max(0, self.resume_frames - 1)
-      if self.resume_frames == 0 and abs(desired - angle) <= self.band:
+      if self.resume_frames == 0 and abs(desired - angle) <= (CONVERGE_DEG if in_region else self.band):
         self.resuming = False
     return self.paused
 
@@ -227,7 +230,8 @@ class TakeoverFilter:
   def converge_deg(cls, angle: float, v_ego: float) -> float:
     """Resume window (wheel +- this): CONVERGE_DEG in the guard region (step_capped), CONVERGE_FREE_DEG away from it by either the wheel angle or the
     speed, linear in between: the region needs both a large angle and a low speed, so the nearer of the two margins sets the width."""
-    far = max((STEP_CAP_ANGLE - abs(angle)) / CONVERGE_TAPER_ANGLE, (v_ego - STEP_CAP_SPEED) / CONVERGE_TAPER_SPEED)
+    far = max((STEP_CAP_ANGLE - CONVERGE_MARGIN_ANGLE - abs(angle)) / CONVERGE_TAPER_ANGLE,
+              (v_ego - STEP_CAP_SPEED - CONVERGE_MARGIN_SPEED) / CONVERGE_TAPER_SPEED)
     return CONVERGE_DEG + (CONVERGE_FREE_DEG - CONVERGE_DEG) * min(max(far, 0.0), 1.0)
 
   @staticmethod
@@ -236,7 +240,7 @@ class TakeoverFilter:
 
   def window(self, last: float, angle: float, v_ego: float) -> tuple[float, float]:
     """Inside the guard region: the intersection (lo, hi), empty when lo > hi, of every constraint on the request: the guard band (wheel +-10 deg,
-    |request| <= guard_max_angle), the resume window (wheel +-CONVERGE_DEG and last +-resume rate) and the step cap (last +-STEP_CAP_DEG).
+    |request| <= guard_max_angle), the resume window (wheel +-CONVERGE_DEG, always, and last +-resume rate) and the step cap (last +-STEP_CAP_DEG).
 
     The step cap holds whatever the source of the change (guard clips, resume, tracking). Proof that the panda accepts it whatever its speed history is
     (lateral.h, steer_angle_cmd_checks_vm): the step limit is max_angle_delta = jerk / v^2 * k / 100 Hz with v = min of the panda's last six
@@ -250,7 +254,7 @@ class TakeoverFilter:
       cap = self.guard_max_angle(angle)
       lo, hi = max(lo, angle - GUARD_MAX_ERROR, -cap), min(hi, angle + GUARD_MAX_ERROR, cap)
     if self.resuming:
-      lo, hi = max(lo, angle - self.band, last - self.resume_rate), min(hi, angle + self.band, last + self.resume_rate)
+      lo, hi = max(lo, angle - CONVERGE_DEG, last - self.resume_rate), min(hi, angle + CONVERGE_DEG, last + self.resume_rate)  # hard, whatever self.band
     return lo, hi
 
   @staticmethod
@@ -268,11 +272,17 @@ class TakeoverFilter:
     """See _limit. An empty window while resuming near or in the guard region (resume window narrower than CONVERGE_FREE_DEG) sends inactive and latches the
     pause like a takeover: no ACTIVE frame follows before the hands-off hold, and none inside the region at all (the release needs the wheel out of it)."""
     out = self._limit(request, last, angle, v_ego, backstop)
-    if out is None and self.enabled and self.resuming and self.converge_deg(angle, v_ego) < CONVERGE_FREE_DEG:
+    if out is None:
+      self.latch_empty(angle, v_ego)
+    return out
+
+  def latch_empty(self, angle: float, v_ego: float):
+    """No ACTIVE request exists this frame (the controller sends inactive): while resuming near or in the region that is a takeover-like pause. The
+    controller calls it for the vehicle-model limiter's None too."""
+    if self.enabled and self.resuming and (self.step_capped(angle, v_ego) or self.converge_deg(angle, v_ego) < CONVERGE_FREE_DEG):
       self.paused = True
       self.resuming = False
       self.release_frames = 0
-    return out
 
   def _limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
     """Applies the low-speed cap, the lead band and the resume blend to a request that already passed the vehicle-model limits.

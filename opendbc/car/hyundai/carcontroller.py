@@ -220,6 +220,8 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
       # the guard band, the resume window and a 1 deg step cap come on top (takeover.window); outside it, below 6 m/s with wheel or request past 90 deg,
       # the request is moved toward the wheel +- 10 deg (takeover.lead_band).
       in_region = self.takeover.enabled and self.takeover.step_capped(CS.out.steeringAngleDeg, CS.out.vEgo)
+      if lat_active and apply_angle is None:
+        self.takeover.latch_empty(CS.out.steeringAngleDeg, CS.out.vEgo)  # the vehicle model leaves no request: a resume near the guard region pauses
       if lat_active and apply_angle is not None:
         apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo,
                                           self.request_window(v_ego_raw, self.apply_angle_last, in_region))
