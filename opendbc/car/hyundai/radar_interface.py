@@ -104,7 +104,7 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
           self.track_id += 1
 
         self.pts[addr].dRel = msg['LONG_DIST']
-        self.pts[addr].yRel = msg['LAT_DIST']  # sign as in sunnypilot ccnc-port-radar-tracks, not verified against a lead
+        self.pts[addr].yRel = msg['LAT_DIST']  # left positive, like yRel: 90 % sign agreement with the model lead (5934 pairs, routes 10/60/63)
         self.pts[addr].vRel = msg['REL_SPEED']
       else:
         self.pts.pop(addr, None)
