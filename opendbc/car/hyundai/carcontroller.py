@@ -6,7 +6,7 @@ from opendbc.car.common.filter_simple import FirstOrderFilter
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL, make_tester_present_msg, structs, rate_limit
-from opendbc.car.lateral import apply_driver_steer_torque_limits, common_fault_avoidance, apply_steer_angle_limits_vm
+from opendbc.car.lateral import apply_driver_steer_torque_limits, common_fault_avoidance, apply_steer_angle_limits_vm, get_max_angle_delta_vm, get_max_angle_vm
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
@@ -146,7 +146,7 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     self.takeover = TakeoverFilter(CP_SP.hyundaiTakeoverTorque if gv70_angle else 0, CP_SP.hyundaiTakeoverReleaseTorque,
                                    CP_SP.hyundaiTakeoverHoldMs, CP_SP.hyundaiResumeAngleRateX10,
                                    1.0 / (CP.steerRatio * CP.wheelbase * 180.0 / math.pi), bool(CP_SP.flags & HyundaiFlagsSP.CURVE_HOLD),
-                                   self.params.ANGLE_LIMITS.STEER_ANGLE_MAX)
+                                   self.params.ANGLE_LIMITS.STEER_ANGLE_MAX, self.params.ANGLE_LIMITS.MAX_ANGLE_RATE)
 
     self.accel_last = 0
     self.apply_torque_last = 0
@@ -155,6 +155,19 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     self.cancel_counter = 0
 
     self.apply_angle_last = 0
+
+  def request_window(self, v_ego_raw, last, in_region):
+    """The angles an ACTIVE request may take after `last`: inside the upstream vehicle model's jerk and lateral accel limits, the EPS limits (rate per frame,
+    angle) and what the panda mirror accepts (with a 1 deg step cap inside the guard region). None when the panda mirror has no angle at all."""
+    v = max(v_ego_raw, 1.0)
+    limits = self.params.ANGLE_LIMITS
+    delta = min(get_max_angle_delta_vm(v, self.VM, self.params), limits.MAX_ANGLE_RATE)
+    max_angle = min(get_max_angle_vm(v, self.VM, self.params), limits.STEER_ANGLE_MAX)
+    lo, hi = max(last - delta, -max_angle), min(last + delta, max_angle)
+    panda = self.panda_check.window(last, STEP_CAP_DEG if in_region else 1e9)
+    if panda is None:
+      return None
+    return max(lo, panda[0]), min(hi, panda[1])
 
   def update(self, CC, CC_SP, CS, now_nanos):
     EsccCarController.update(self, CS)
@@ -193,14 +206,15 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
 
       # the panda checks against the platform's own angle model (hyundai_canfd_angle_models.h), the same vehicle model as above: no further baseline limits
 
-      # the low-speed, large-angle guard region (takeover.step_capped): the request is moved to the nearest point of the intersection of the guard band,
-      # the resume window, the 1 deg step cap and what the panda accepts at the largest recent speed + 1 m/s (takeover.limit); inactive at the measured
-      # angle if that is empty. Outside the region, after the resume blend, only the lead band runs (below 6 m/s with wheel or request past 90 deg: the
-      # request is moved toward the wheel +- 10 deg, keeping the incoming request or one step from last, takeover.lead_band); otherwise the road-proven path.
+      # takeover.limit runs on every frame inside request_window(): what the upstream vehicle model (jerk, lateral accel), the EPS (rate, 175 deg) and the
+      # panda mirror (at the largest recent speed + 1 m/s) all accept after the last request. The resume blend and the lead band can only move the request
+      # inside it, and an empty intersection sends inactive at the measured angle. Inside the low-speed, large-angle guard region (takeover.step_capped)
+      # the guard band, the resume window and a 1 deg step cap come on top (takeover.window); outside it, below 6 m/s with wheel or request past 90 deg,
+      # the request is moved toward the wheel +- 10 deg (takeover.lead_band).
       in_region = self.takeover.enabled and self.takeover.step_capped(CS.out.steeringAngleDeg, CS.out.vEgo)
       if lat_active and apply_angle is not None:
-        backstop = self.panda_check.window(self.apply_angle_last, STEP_CAP_DEG) if in_region else (-math.inf, math.inf)
-        apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo, backstop)
+        apply_angle = self.takeover.limit(apply_angle, self.apply_angle_last, CS.out.steeringAngleDeg, CS.out.vEgo,
+                                          self.request_window(v_ego_raw, self.apply_angle_last, in_region))
       self.takeover.note_unsendable(lat_active and apply_angle is None and in_region)
 
       apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, lat_active, self.apply_torque_last,

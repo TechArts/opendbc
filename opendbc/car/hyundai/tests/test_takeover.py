@@ -1016,6 +1016,56 @@ class TestBlockedResumeRoute39(unittest.TestCase):
           wheel += max(-1.0, min(1.0, req - wheel))
         self.assertAlmostEqual(wheel, model, delta=1.0)
 
+  def test_resume_outside_the_guard_region_stays_inside_the_vehicle_model_window(self):
+    """R1 P1: 30 m/s, the model asks 20 deg more than the wheel, the wheel moves 0.8 deg per frame (under the 1 deg 'fast' threshold) while lateral resumes.
+    The convergence clip (wheel +- 5) used to undo the vehicle model's 0.2 deg step: the request ran ahead, the panda rejected it, reset its reference
+    to the measured angle and Python kept the rejected request. Every frame must be one accepted 0xCB, the request must keep stepping within the model."""
+    counts = (round(30.0 * 3.6 / 0.03125),) * 4
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        for _ in range(100):
+          self._frame(False, 0.0, 0.0, wheel_counts=counts)
+        n_active, prev = 0, None
+        for i in range(300):
+          wheel = sign * min(8.0, 0.8 * (i + 1))
+          cb, ok, active, icon, req = self._frame(True, wheel, wheel + sign * 20.0, wheel_counts=counts)
+          self.assertEqual((len(cb), ok), (1, [True]), f"frame {i}: wheel {wheel:.1f}")
+          if active[0] and prev is not None:
+            self.assertLessEqual(abs(req - prev), 0.3, f"frame {i}")
+          prev = req if active[0] else None
+          n_active += active[0]
+        self.assertGreater(n_active, 100)
+
+  def test_eps_angle_limit_holds_in_every_window_up_to_six_m_s(self):
+    """R1 P1: the 175 deg cap used to apply only in the guard band (below 5 m/s); at 5.5 m/s, wheel 186, last 175 the step window returned 176 and the
+    request could ratchet outward. Filter level, then closed loop against the panda."""
+    f = TakeoverFilter(150, 100, 500, 10, max_angle=EPS_ANGLE_MAX)
+    for sign in (1, -1):
+      for v in (3.0, 5.0, 5.5, 5.99):
+        self.assertLessEqual(abs(f.limit(sign * 190.0, sign * 175.0, sign * 186.0, v) or 0.0), EPS_ANGLE_MAX, f"v {v}")
+      f.resuming = True
+      self.assertLessEqual(abs(f.limit(sign * 190.0, sign * 175.0, sign * 186.0, 5.5) or 0.0), EPS_ANGLE_MAX)
+      f.resuming = False
+    for sign in (1, -1):
+      with self.subTest(sign=sign):
+        self.setUp()
+        counts = self._warm(sign * 170.0, 5.5)
+        for i in range(60):
+          cb, ok, active, icon, req = self._frame(True, sign * 186.0, sign * 190.0, wheel_counts=counts)
+          self.assertEqual((len(cb), ok), (1, [True]), f"frame {i}")
+          self.assertLessEqual(abs(req), EPS_ANGLE_MAX, f"frame {i}")
+
+  def test_resume_rate_never_exceeds_the_eps_rate(self):
+    """R1 P1: HyundaiResumeAngleRate above 22 (2.2 deg per frame) must not let the resume step past what the EPS takes."""
+    self.assertEqual(TakeoverFilter(150, 100, 500, 50, max_rate=2.2).resume_rate, 2.2)
+    self.assertEqual(TakeoverFilter(150, 100, 500, 10, max_rate=2.2).resume_rate, 1.0)
+
+    def tweak(cp_sp):
+      cp_sp.hyundaiTakeoverTorque, cp_sp.hyundaiTakeoverReleaseTorque, cp_sp.hyundaiTakeoverHoldMs, cp_sp.hyundaiResumeAngleRateX10 = 150, 100, 500, 90
+    _, _, cc, _ = gv70_controller(tweak_sp=tweak)
+    self.assertEqual(cc.takeover.resume_rate, cc.params.ANGLE_LIMITS.MAX_ANGLE_RATE)
+
 
 class TestNudgeResumeRoute55(unittest.TestCase):
   """Route 55 3:16.9-3:19.0 (T24), closed loop against the real panda (libsafety, CAMERA_HANDBACK): 14.3 m/s, openpilot steering with lateral

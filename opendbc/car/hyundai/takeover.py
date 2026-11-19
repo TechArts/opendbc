@@ -59,15 +59,16 @@ BEYOND_DEG = 3.0  # ... and the wheel at least this far past the model's angle i
 
 class TakeoverFilter:
   def __init__(self, enter_torque: int, release_torque: int, hold_ms: int, resume_rate_x10: int,
-               angle_to_lat_accel: float = 0.0, curve_hold: bool = False, max_angle: float = math.inf):
+               angle_to_lat_accel: float = 0.0, curve_hold: bool = False, max_angle: float = math.inf, max_rate: float = math.inf):
     """Units are those of the params: torque units, ms, deg per frame x 10. enter_torque 0 turns the filter off.
     angle_to_lat_accel is 1 / (steerRatio * wheelbase * 180 / pi) in (m/s^2 per (m/s)^2 per deg); curve_hold turns on the curve-aware rules.
-    max_angle is the largest angle the EPS accepts as a request (STEER_ANGLE_MAX, 175 deg on LFA_ALT)."""
+    max_angle is the largest angle the EPS accepts as a request (STEER_ANGLE_MAX, 175 deg on LFA_ALT), max_rate the largest step per frame it takes
+    (LFA_ALT 2.2 deg): the resume rate never exceeds it, whatever HyundaiResumeAngleRate says."""
     self.enter_torque = enter_torque
     self.max_angle = max_angle
     self.release_torque = release_torque
     self.hold_frames = int(hold_ms / 1000.0 / DT_CTRL)
-    self.resume_rate = resume_rate_x10 / 10.0
+    self.resume_rate = min(resume_rate_x10 / 10.0, max_rate)
     self.paused = False
     self.resuming = False
     self.grab_frames = 0
@@ -215,7 +216,7 @@ class TakeoverFilter:
     (26 CAN counts in the GV70 angle model, 23 in the baseline model it replaced; PandaAngleCheck.limits_can(7.0), checked against libsafety)
     > STEP_CAP_DEG = 1 deg, and it only grows below. The panda reads the
     previous frame we sent, which is `last` (the measured angle after an inactive frame)."""
-    lo, hi = last - STEP_CAP_DEG, last + STEP_CAP_DEG
+    lo, hi = max(last - STEP_CAP_DEG, -self.max_angle), min(last + STEP_CAP_DEG, self.max_angle)
     if self.guard_active(angle, v_ego):
       cap = self.guard_max_angle(angle)
       lo, hi = max(lo, angle - GUARD_MAX_ERROR, -cap), min(hi, angle + GUARD_MAX_ERROR, cap)
@@ -237,25 +238,35 @@ class TakeoverFilter:
   def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
     """Applies the low-speed cap, the lead band and the resume blend to a request that already passed the vehicle-model limits.
 
-    Outside the guard region (step_capped false): the resume blend, then the lead band within what may be sent: anything between last and that
-    request (the vehicle-model and resume limits approved it), or a step from last of the resume rate while resuming, else STEP_CAP_DEG (accepted by
-    the panda below 6 m/s, see window()). Nothing changes at LEAD_SPEED and above or within LEAD_ANGLE. Inside: the request moved to the nearest
-    point of window() intersected with `backstop` (the panda backstop's window from the controller, None when it has none), then the lead band within
-    that. None: the intersection is empty (a wheel that moves against the band, a step the panda would not accept): send inactive at the measured
-    angle, the next frame starts from there. The lead band never makes it empty."""
+    `backstop` is the window the controller computes for every frame from what the upstream vehicle model (jerk and lateral accel), the EPS rate limit
+    and the panda's own check accept after `last`; the result is always inside it and inside +-max_angle (the 175 deg EPS limit), whatever the region.
+    Outside the guard region (step_capped false): the resume blend (wheel +-CONVERGE_DEG, last +- the resume rate), then the lead band within what may
+    be sent: anything between last and that request, or a step from last of the resume rate while resuming, else STEP_CAP_DEG (accepted by the panda
+    below 6 m/s, see window()). Nothing changes at LEAD_SPEED and above or within LEAD_ANGLE. Inside: the request moved to the nearest point of window()
+    intersected with `backstop`, then the lead band within that. None: the intersection is empty (a wheel that moves against the band, a step the panda or
+    the vehicle model would not accept, the resume window out of reach): send inactive at the measured angle, the next frame starts from there. The lead
+    band never makes it empty."""
     if not self.enabled:
       return request
+    if backstop is None:
+      return None
+    lo, hi = max(backstop[0], -self.max_angle), min(backstop[1], self.max_angle)
     if not self.step_capped(angle, v_ego):
       step = STEP_CAP_DEG
       if self.resuming:
-        request = float(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG))
-        request = float(np.clip(request, last - self.resume_rate, last + self.resume_rate))  # last, so the step cap holds whatever the wheel does
+        # the step from last (resume rate, inside the vehicle-model / EPS / panda window) is hard whatever the wheel does; the convergence to the wheel
+        # only moves the request inside it
+        lo, hi = max(lo, last - self.resume_rate), min(hi, last + self.resume_rate)
         step = self.resume_rate
-      return self.lead_band(request, min(request, last - step), max(request, last + step), angle, v_ego)
-    if backstop is None:
-      return None
-    lo, hi = self.window(last, angle, v_ego)
-    lo, hi = max(lo, backstop[0]), min(hi, backstop[1])
+        if lo > hi:
+          return None
+        request = float(np.clip(np.clip(request, angle - CONVERGE_DEG, angle + CONVERGE_DEG), lo, hi))
+      lo, hi = max(lo, min(request, last - step)), min(hi, max(request, last + step))
+      if lo > hi:
+        return None
+      return self.lead_band(request, lo, hi, angle, v_ego)
+    wlo, whi = self.window(last, angle, v_ego)
+    lo, hi = max(lo, wlo), min(hi, whi)
     if lo > hi:
       return None
     return self.lead_band(request, lo, hi, angle, v_ego)
