@@ -136,6 +136,33 @@ class TestCameraMain(unittest.TestCase):
     self.assertFalse(self._step(False, pressed=True))
     self.assertFalse(self.cs.camera_main)
 
+  def test_press_then_cancel_then_late_camera_rise_engages_nothing(self):
+    self._step(False, pressed=True)
+    self.assertFalse(self.cs.update_camera_main(False, False, cancel_pressed=True))
+    self.assertFalse(self._step(True))  # the late answer
+    self.assertFalse(self.cs.main_qualified)
+
+  def test_cancel_with_main_press_does_not_pair(self):
+    self.assertFalse(self.cs.update_camera_main(True, True, cancel_pressed=True))
+
+  def test_pairing_is_single_use(self):
+    self.assertTrue(self._step(True, pressed=True))
+    self.assertFalse(self._step(False))
+    self.assertFalse(self._step(True))  # fall and rise inside the window: the old press is spent
+    self.assertFalse(self.cs.main_qualified)
+
+  def test_camera_first_pairing_is_single_use(self):
+    self.assertFalse(self._step(True))
+    self.assertTrue(self._step(True, pressed=True))
+    self.assertFalse(self._step(False))
+    self.assertFalse(self._step(True))
+
+  def test_camera_only_rise_is_not_a_qualified_main(self):
+    self._step(True, frames=5)
+    self.assertFalse(self.cs.main_qualified)
+    set_release = [structs.CarState.ButtonEvent(type=ButtonType.decelCruise, pressed=False)]
+    self.assertFalse(self.cs.update_button_enable(set_release))
+
   def test_unknown_camera_state_keeps_last(self):
     self._step(True, pressed=True)
     self.assertFalse(self._step(None, frames=5))
@@ -143,10 +170,10 @@ class TestCameraMain(unittest.TestCase):
 
   def test_set_res_needs_camera_main(self):
     set_release = [structs.CarState.ButtonEvent(type=ButtonType.decelCruise, pressed=False)]
-    self.cs.main_available = True
+    self.cs.main_qualified = True
     self.assertTrue(self.cs.update_button_enable(set_release))
     self.assertFalse(self.cs.update_button_enable([structs.CarState.ButtonEvent(type=ButtonType.accelCruise, pressed=True)]))
-    self.cs.main_available = False
+    self.cs.main_qualified = False
     self.assertFalse(self.cs.update_button_enable(set_release))
     self.cs.main_button_enable = True  # an engage request still goes through
     self.assertTrue(self.cs.update_button_enable([]))

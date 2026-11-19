@@ -905,7 +905,7 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.assertFalse(self.safety.get_controls_allowed())
     self.safety.set_timer(100_000_000)
     self._camera_main(True)  # much later, no press near it
-    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_acc_main_on())  # raw camera availability is not a driver-qualified main
     self.assertFalse(self.safety.get_controls_allowed())
 
   def test_camera_reacts_before_press_is_seen(self):
@@ -919,7 +919,8 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
   def test_camera_main_without_press_does_not_arm(self):
     self._init()
     self._camera_main(True)
-    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
     self.assertFalse(self.safety.get_controls_allowed())
     self.safety.set_timer(2_000_000)
     self._button(main=1)  # a press long after: nothing to pair with
@@ -1262,6 +1263,63 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
 
   def test_hold_without_fault_still_resumes(self):
     self.assertTrue(self._hold_resume_released(lambda: None))
+
+  def test_camera_only_rise_grants_neither_lateral_nor_long(self):
+    # an unsolicited camera MAIN rise (no driver press) is availability only: MADS must not see a main rising edge
+    self._init()
+    self.safety.set_mads_params(True, False, False)
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(5_000_000)
+    self._tap(self.SET)  # SET/RES do not arm on a camera main nobody asked for
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_press_then_cancel_before_the_camera_answers(self):
+    self._init()
+    self.safety.set_mads_params(True, False, False)
+    self._button(main=1)
+    self._button(main=0)
+    self._button(self.CANCEL)
+    self._button(0)
+    self.safety.set_timer(200_000)
+    self._camera_main(True)  # the late answer
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_acc_main_on())
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_cancel_together_with_main_press_does_not_arm_a_late_answer(self):
+    self._init()
+    self._button(self.CANCEL, main=1)
+    self._button(0)
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_camera_first_pairing_is_single_use(self):
+    self._init()
+    self._camera_main(True)
+    self.safety.set_timer(100_000)
+    self._button(main=1)  # pairs with the camera's rise
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._button(main=0)
+    self._camera_main(False)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_timer(200_000)
+    self._camera_main(True)  # fall and rise inside the window: the same press must not engage again
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_acc_main_on())
+
+  def test_press_first_pairing_is_single_use(self):
+    self._init()
+    self._button(main=1)
+    self._button(main=0)
+    self._camera_main(True)
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._camera_main(False)
+    self.safety.set_timer(200_000)
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
 
 
 if __name__ == "__main__":

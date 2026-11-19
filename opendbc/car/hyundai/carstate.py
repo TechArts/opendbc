@@ -42,6 +42,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     self.long_main_button_engage = bool(CP.openpilotLongitudinalControl and CP_SP.safetyParam & HyundaiSafetyFlagsSP.MAIN_BUTTON_ENGAGE)
     self.main_button_enable = False
     self.main_available = False
+    self.main_qualified = False
     self.camera_main = False
     self.main_press_age = self.camera_rise_age = MAIN_PRESS_FRAMES + 1
 
@@ -87,21 +88,33 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     # Main button also can trigger an engagement on these cars
     return any(btn in ENABLE_BUTTONS for btn in self.cruise_buttons) or any(self.main_buttons)
 
-  def update_camera_main(self, camera_main: bool | None, main_pressed: bool) -> bool:
-    """The camera's own MainMode_ACC (readable even while the panda blocks its SCC_CONTROL) is the car's main cruise state, the single source
-    of truth shared with the panda. Returns the engage request: a rising edge of it with a main press within MAIN_PRESS_FRAMES (either
-    order). A press the camera ignores (e.g. brake held at low speed) or a camera change without a press engages nothing."""
+  def update_camera_main(self, camera_main: bool | None, main_pressed: bool, cancel_pressed: bool = False) -> bool:
+    """The camera's own MainMode_ACC (readable even while the panda blocks its SCC_CONTROL) is the car's availability of main cruise. Returns the
+    engage request, mirroring the panda: a rising edge of it with a main press within MAIN_PRESS_FRAMES (either order), single use. A press the
+    camera ignores (e.g. brake held at low speed), a camera change without a press, and a pairing pending when CANCEL is pressed engage nothing.
+    main_qualified is the driver-qualified main state (the panda's acc_main_on): SET/RES only enable while it holds."""
     if camera_main is None:
       camera_main = self.camera_main  # not seen yet: keep the last state
     rising = camera_main and not self.camera_main
+    falling = self.camera_main and not camera_main
     self.camera_main = camera_main
-    self.main_press_age = 0 if main_pressed else min(self.main_press_age + 1, MAIN_PRESS_FRAMES + 1)
+    self.main_press_age = 0 if (main_pressed and not cancel_pressed) else min(self.main_press_age + 1, MAIN_PRESS_FRAMES + 1)
     self.camera_rise_age = 0 if rising else min(self.camera_rise_age + 1, MAIN_PRESS_FRAMES + 1)
-    return camera_main and ((rising and self.main_press_age <= MAIN_PRESS_FRAMES) or (main_pressed and self.camera_rise_age <= MAIN_PRESS_FRAMES))
+    if cancel_pressed or falling:
+      self.main_press_age = self.camera_rise_age = MAIN_PRESS_FRAMES + 1
+    if falling:
+      self.main_qualified = False
+
+    engage = camera_main and ((rising and self.main_press_age <= MAIN_PRESS_FRAMES) or
+                              (main_pressed and not cancel_pressed and self.camera_rise_age <= MAIN_PRESS_FRAMES))
+    if engage:
+      self.main_qualified = True
+      self.main_press_age = self.camera_rise_age = MAIN_PRESS_FRAMES + 1  # single use
+    return engage
 
   def update_button_enable(self, buttonEvents: list[structs.CarState.ButtonEvent]):
-    # an engage request is the camera's main rising with a main press. SET/RES enable only while the camera's main is on
-    if self.long_main_button_engage and not self.main_available:
+    # an engage request is the camera's main rising with a main press. SET/RES enable only while the driver-qualified main holds
+    if self.long_main_button_engage and not self.main_qualified:
       return self.main_button_enable
     return self.main_button_enable or super().update_button_enable(buttonEvents)
 
@@ -346,7 +359,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       cp_scc = cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp
       scc_main = cp_scc.vl["SCC_CONTROL"]["MainMode_ACC"]  # also registers the message with a dynamic parser: ts_nanos only has it afterwards
       camera_main = scc_main == 1 if cp_scc.ts_nanos["SCC_CONTROL"]["MainMode_ACC"] else None
-      self.main_button_enable = self.update_camera_main(camera_main, main_pressed)
+      cancel_pressed = any(be.type == ButtonType.cancel and be.pressed for be in ret.buttonEvents)
+      self.main_button_enable = self.update_camera_main(camera_main, main_pressed, cancel_pressed)
       self.main_cruise_enabled = self.camera_main
       ret.cruiseState.available = self.camera_main
     elif self.CP.openpilotLongitudinalControl:

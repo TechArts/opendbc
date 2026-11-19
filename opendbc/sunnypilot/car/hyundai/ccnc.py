@@ -12,7 +12,7 @@ from opendbc.car.common.filter_simple import FirstOrderFilter
 from opendbc.car.crc import CRC8J1850, mk_crc8_fun
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons
 from opendbc.sunnypilot.car.hyundai.lfa_alt import mdps_aci_lv2_for_camera
-from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 
 cruise_buttons_checksum = mk_crc8_fun(CRC8J1850, init_crc=0x97, xor_out=0x97)  # mk_crc8_fun xors init with xor_out: register starts at 0
 
@@ -150,6 +150,15 @@ def create_ccnc_buttons(packer, CAN, cruise_buttons_msg, main_btn):
   return packer.make_can_msg("CRUISE_BUTTONS", CAN.CAM, values)
 
 
+def create_ccnc_buttons_genuine(packer, CAN, cruise_buttons_msg):
+  """The driver's own CRUISE_BUTTONS frame (the physical one is blocked by the panda), so the camera sees the real MAIN press and reacts to it."""
+  values = dict(cruise_buttons_msg)
+  dat = packer.make_can_msg("CRUISE_BUTTONS", CAN.CAM, values)[1]
+  values["_CHECKSUM"] = cruise_buttons_checksum(dat[1:])
+
+  return packer.make_can_msg("CRUISE_BUTTONS", CAN.CAM, values)
+
+
 def create_ccnc_alt_buttons(packer, CAN, cruise_buttons_msg, cnt, btn):
   values = cruise_buttons_msg.copy()
 
@@ -170,6 +179,7 @@ class CcncCarController:
     self.lead_distance_filter = FirstOrderFilter(TARGET_DISTANCE_MAX, LEAD_FILTER_RC, 5 * DT_CTRL, initialized=False)
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
+    self.main_button_engage = bool(CP_SP.safetyParam & HyundaiSafetyFlagsSP.MAIN_BUTTON_ENGAGE)
 
   def create_alt_button_msgs(self, CS, CC):
     can_sends = []
@@ -216,8 +226,11 @@ class CcncCarController:
       self.lead_distance_bars_last = CC.hudControl.leadDistanceBars
 
       if self.frame % 2 == 0 and self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC:
-        press_main = CS.cruise_info["MainMode_ACC"] and self.frame % (2 * MAIN_PRESS_FRAMES) < MAIN_PRESS_FRAMES
-        can_sends.append(create_ccnc_buttons(self.packer, self.CAN, CS.cruise_buttons_msg, press_main))
+        if self.main_button_engage:
+          can_sends.append(create_ccnc_buttons_genuine(self.packer, self.CAN, CS.cruise_buttons_msg))
+        else:
+          press_main = CS.cruise_info["MainMode_ACC"] and self.frame % (2 * MAIN_PRESS_FRAMES) < MAIN_PRESS_FRAMES
+          can_sends.append(create_ccnc_buttons(self.packer, self.CAN, CS.cruise_buttons_msg, press_main))
 
       if self.frame % 5 == 0:
         if not self.lead_visible:

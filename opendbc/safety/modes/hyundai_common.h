@@ -86,6 +86,8 @@ static bool main_press_valid;
 static uint32_t main_press_ts;
 static bool camera_main_rise_valid;
 static uint32_t camera_main_rise_ts;
+static bool camera_main_raw;  // the camera's MainMode_ACC as received; acc_main_on is the driver-qualified state
+static void hyundai_common_main_pair(void);
 
 // main-button engage: the pause key (CANCEL) is a pause/resume toggle like the stock cruise. A press that starts with controls off and main on
 // resumes controls on its release (like RES); a press that starts with controls on only exits them
@@ -122,6 +124,7 @@ void hyundai_common_init(uint16_t param) {
   main_press_valid = false;
   camera_main_rise_valid = false;
   cancel_resume_armed = false;
+  camera_main_raw = false;
   acc_main_on_prev = false;
   acc_main_on_tx = false;
   acc_main_on_mismatches = 0U;
@@ -187,6 +190,9 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
         cancel_resume_armed = !controls_allowed && acc_main_on;  // decided once, at the start of the press
       }
       controls_allowed = false;
+      // a pending engage pairing does not survive a CANCEL: a late camera response must not engage without a driver action
+      main_press_valid = false;
+      camera_main_rise_valid = false;
     }
 
     // main-button engage: a pause-key press that started with controls off resumes them on its release, if main is still on and the brake is
@@ -199,13 +205,12 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
     }
 
     // main-button engage: the press only marks the engage request, the camera's main state does the rest (hyundai_common_camera_main_update)
-    if (main_button && !main_button_prev && hyundai_long_main_button_engage) {
+    if (main_button && !main_button_prev && hyundai_long_main_button_engage && (cruise_button != HYUNDAI_BTN_CANCEL)) {
       const uint32_t now = microsecond_timer_get();
       main_press_valid = true;
       main_press_ts = now;
-      if (acc_main_on && camera_main_rise_valid && (safety_get_ts_elapsed(now, camera_main_rise_ts) <= HYUNDAI_MAIN_PRESS_WINDOW_US)) {
-        controls_allowed = true;  // the camera reacted before this press was seen
-        camera_main_rise_valid = false;
+      if (camera_main_raw && camera_main_rise_valid && (safety_get_ts_elapsed(now, camera_main_rise_ts) <= HYUNDAI_MAIN_PRESS_WINDOW_US)) {
+        hyundai_common_main_pair();  // the camera reacted before this press was seen
       }
     }
 
@@ -219,12 +224,20 @@ void hyundai_common_cruise_buttons_check(const int cruise_button, const bool mai
   }
 }
 
-// main-button engage: acc_main_on follows the camera's MainMode_ACC
+// main-button engage: the camera's raw MainMode_ACC is only an availability input. acc_main_on (what MADS and the SET/RES / pause-key rules see)
+// is the driver-qualified main state: it turns on when a camera main rise pairs with a driver main press and off when the camera's main falls
+static void hyundai_common_main_pair(void) {
+  acc_main_on = true;
+  controls_allowed = true;
+  main_press_valid = false;  // single use: neither token can pair again
+  camera_main_rise_valid = false;
+}
+
 void hyundai_common_camera_main_update(const bool camera_main) {
   const uint32_t now = microsecond_timer_get();
-  const bool rising = camera_main && !acc_main_on;
-  const bool falling = !camera_main && acc_main_on;
-  acc_main_on = camera_main;
+  const bool rising = camera_main && !camera_main_raw;
+  const bool falling = !camera_main && camera_main_raw;
+  camera_main_raw = camera_main;
 
   if (rising || falling) {
     hyundai_common_cancel_resume_disarm();  // main changed during a pause-key hold
@@ -234,13 +247,13 @@ void hyundai_common_camera_main_update(const bool camera_main) {
     camera_main_rise_valid = true;
     camera_main_rise_ts = now;
     if (main_press_valid && (safety_get_ts_elapsed(now, main_press_ts) <= HYUNDAI_MAIN_PRESS_WINDOW_US)) {
-      controls_allowed = true;
-      main_press_valid = false;
-      camera_main_rise_valid = false;
+      hyundai_common_main_pair();
     }
   }
   if (falling) {
+    acc_main_on = false;
     controls_allowed = false;  // lateral stays with MADS (main off keeps lateral)
+    main_press_valid = false;
     camera_main_rise_valid = false;
   }
 }
