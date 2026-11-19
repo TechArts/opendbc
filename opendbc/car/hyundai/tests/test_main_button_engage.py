@@ -80,8 +80,34 @@ class TestMainButtonEngage(unittest.TestCase):
 
   def test_camera_main_without_press_does_not_engage(self):
     _, ret, engage = self._update(True, camera_main=1, main_btn=0)
-    assert ret.cruiseState.available
+    assert not ret.cruiseState.available  # raw camera availability is not the panda's driver-qualified main
     assert not engage
+
+  def test_unpaired_camera_rise_then_pause_release_gives_no_enable(self):
+    cp, cp_sp = _cp(CAR.GENESIS_GV70_2ND_GEN, True)
+    cs = CarState(cp, cp_sp)
+    parsers = cs.get_can_parsers(cp, cp_sp)
+    packer = CANPacker(DBC[CAR.GENESIS_GV70_2ND_GEN][Bus.pt])
+    can = CanBus(cp)
+
+    def frame(i, camera_main, main_btn, cruise_btn):
+      ts = (i + 1) * 10_000_000
+      parsers[Bus.pt].update([(ts, [packer.make_can_msg("CRUISE_BUTTONS", can.ECAN, {"ADAPTIVE_CRUISE_MAIN_BTN": main_btn, "CRUISE_BUTTONS": cruise_btn})])])
+      parsers[Bus.cam].update([(ts, [packer.make_can_msg("SCC_CONTROL", can.CAM, {"MainMode_ACC": camera_main})])])
+      ret, _ = cs.update(parsers)
+      return ret, cs.update_button_enable(ret.buttonEvents)
+
+    for i in range(3):
+      ret, enable = frame(i, 1, 0, 0)  # the camera's main rises by itself
+    assert not ret.cruiseState.available
+    ret, enable = frame(3, 1, 0, 4)  # pause key down
+    assert not ret.cruiseState.available
+    ret, enable = frame(4, 1, 0, 0)  # and released
+    assert not ret.cruiseState.available and not enable
+
+  def test_paired_press_publishes_available(self):
+    _, ret, engage = self._update(True, camera_main=1, main_btn=1)
+    assert engage and ret.cruiseState.available
 
   def test_stock_long_unaffected(self):
     _, _, engage = self._update(False, camera_main=1, main_btn=1)

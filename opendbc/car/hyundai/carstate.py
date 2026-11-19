@@ -362,7 +362,7 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       cancel_pressed = any(be.type == ButtonType.cancel and be.pressed for be in ret.buttonEvents)
       self.main_button_enable = self.update_camera_main(camera_main, main_pressed, cancel_pressed)
       self.main_cruise_enabled = self.camera_main
-      ret.cruiseState.available = self.camera_main
+      ret.cruiseState.available = self.main_qualified  # the panda's acc_main_on: every consumer sees the panda's view
     elif self.CP.openpilotLongitudinalControl:
       ret.cruiseState.available = self.get_main_cruise(ret)
     self.main_available = bool(ret.cruiseState.available)
