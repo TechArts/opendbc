@@ -82,3 +82,7 @@ class HyundaiFlagsSP(IntFlag):
   CCNC = 2 ** 11
   CANFD_LFA_ALT_STEER = 2 ** 13  # angle steering straight to the MDPS on LFA_ALT, no ADAS ECU in between
   CANFD_ANGLE_STEERING = 2 ** 14
+  STEER_FEEL_HALFWAY = 2 ** 15  # GV70 LFA_ALT: steering gain halfway between the generic curve and the stock camera's
+  STEER_FEEL_STOCK = 2 ** 16  # GV70 LFA_ALT: steering gain follows the stock camera's curve
+  STEER_FEEL_ALL_SPEEDS = 2 ** 17  # GV70 LFA_ALT: apply the steer feel curve at every speed, not only above 6 m/s
+  CURVE_HOLD = 2 ** 18  # GV70 LFA_ALT: curve-aware takeover (along-turn torque is not a grab) and a gain floor in curves

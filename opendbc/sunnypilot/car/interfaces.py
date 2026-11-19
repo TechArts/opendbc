@@ -131,6 +131,26 @@ def _initialize_custom_longitudinal_tuning(CI, CP: structs.CarParams, CP_SP: str
     if hyundai_longitudinal_tuning == LongitudinalTuningType.PREDICTIVE:
       CP_SP.flags |= HyundaiFlagsSP.LONG_TUNING_PREDICTIVE.value
 
+    # GV70 LFA_ALT steering feel (experimental): 0 generic curve, 1 halfway to stock, 2 stock camera curve above 6 m/s,
+    # 3 stock camera curve at every speed
+    hyundai_steer_feel = int(params_dict.get("HyundaiSteerFeel", 0))
+    if hyundai_steer_feel == 1:
+      CP_SP.flags |= HyundaiFlagsSP.STEER_FEEL_HALFWAY.value
+    elif hyundai_steer_feel == 2:
+      CP_SP.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK.value
+    elif hyundai_steer_feel == 3:
+      CP_SP.flags |= HyundaiFlagsSP.STEER_FEEL_STOCK.value | HyundaiFlagsSP.STEER_FEEL_ALL_SPEEDS.value
+
+    # GV70 curve-aware takeover and holding gain floor (0 off, 1 on); needs HyundaiTakeoverTorque > 0
+    if int(params_dict.get("HyundaiCurveHold", 0)) == 1:
+      CP_SP.flags |= HyundaiFlagsSP.CURVE_HOLD.value
+
+    # GV70 steering takeover filter (integer units: torque, ms, deg per frame x 10); HyundaiTakeoverTorque 0 turns it off
+    CP_SP.hyundaiTakeoverTorque = int(params_dict.get("HyundaiTakeoverTorque", 150))
+    CP_SP.hyundaiTakeoverReleaseTorque = int(params_dict.get("HyundaiTakeoverReleaseTorque", 100))
+    CP_SP.hyundaiTakeoverHoldMs = int(params_dict.get("HyundaiTakeoverHold", 500))
+    CP_SP.hyundaiResumeAngleRateX10 = int(params_dict.get("HyundaiResumeAngleRate", 10))
+
   _ = CI.get_longitudinal_tuning_sp(CP, CP_SP)
 
 

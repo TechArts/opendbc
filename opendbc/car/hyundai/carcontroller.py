@@ -9,6 +9,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR
+from opendbc.car.hyundai.steer_feel import apply_steer_feel, steer_feel_blend
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController
@@ -45,7 +46,8 @@ def get_baseline_safety_cp():
   return CarInterface.get_non_essential_params(ANGLE_SAFETY_BASELINE_MODEL)
 
 
-def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain):
+def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain, stock_blend=0.0, all_speeds=False, curve_hold=None):
+  """stock_blend, all_speeds, curve_hold: GV70 steer feel and curve hold, see steer_feel.py."""
   if lat_active:
     ceiling = np.interp(v_ego, [0.5, 1.5], [1.0, 0.85])
     shelf = np.interp(v_ego, [2, 11], [0.45, 0.6])
@@ -55,6 +57,7 @@ def compute_torque_reduction_gain(steering_torque, v_ego, lat_active, last_gain)
     bp3 = np.interp(v_ego, [2, 11], [175, 275])
     bp4 = np.interp(v_ego, [2, 22], [400, 700])
     target = np.interp(abs(steering_torque), [bp1, bp2, bp3, bp4], [ceiling, shelf, shelf, floor])
+    target = apply_steer_feel(target, ceiling, steering_torque, v_ego, stock_blend, all_speeds, curve_hold)
 
   else:
     target = 0.0
@@ -125,6 +128,9 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
     self.BASELINE_VM = VehicleModel(get_baseline_safety_cp())
     self.apply_angle_last = 0
 
+    # GV70 steer feel (HyundaiSteerFeel)
+    self.steer_feel_blend, self.steer_feel_all_speeds = steer_feel_blend(CP, CP_SP)
+
     self.accel_last = 0
     self.apply_torque_last = 0
     self.car_fingerprint = CP.carFingerprint
@@ -167,7 +173,8 @@ class CarController(CarControllerBase, CcncCarController, EsccCarController, Lea
       #   apply_angle = apply_steer_angle_limits_vm(apply_angle or desired_angle, self.apply_angle_last, v_ego_raw, CS.out.steeringAngleDeg, CC.latActive,
       #                                             self.params, self.BASELINE_VM)
 
-      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last)
+      apply_torque = compute_torque_reduction_gain(CS.out.steeringTorque, v_ego_raw, CC.latActive, self.apply_torque_last,
+                                                   self.steer_feel_blend, self.steer_feel_all_speeds)
       apply_steer_req = CC.latActive and apply_torque != 0
 
       # Failsafe if we detected we'd violate safety
