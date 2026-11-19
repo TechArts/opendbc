@@ -691,13 +691,62 @@ class TestBlockedResumeRoute39(unittest.TestCase):
         self.assertTrue(any(abs(w) > 140.0 for _, w, _, _ in out) and out[-1][0])
 
   def test_resume_crossing_into_the_region_on_the_speed_keeps_steering(self):
-    """Wheel 150 deg, resuming at 8 m/s (outside the region), the car slows through 6 m/s: both signs, slow and fast braking."""
+    """Wheel 150 deg, resuming at 7 m/s (outside the region, inside the lateral acceleration cap), the car slows through 6 m/s:
+    both signs, slow and fast braking."""
     for sign in (1, -1):
       for decel in (0.005, 0.02, 0.05):
         self.setUp()
-        out = self._resume_into_the_region(sign, lambda i, sign=sign: sign * (150.0 + 0.02 * i), lambda i, decel=decel: max(8.0 - decel * i, 4.0), sign * 160.0,
-                                          sign * 150.0, 8.0, frames=600)
+        out = self._resume_into_the_region(sign, lambda i, sign=sign: sign * (150.0 + 0.02 * i), lambda i, decel=decel: max(7.0 - decel * i, 4.0), sign * 160.0,
+                                          sign * 150.0, 7.0, frames=600)
         self.assertTrue(any(v < 6.0 for _, _, v, _ in out) and out[-1][0])
+
+  def test_resume_braking_and_unwinding_into_the_region_keeps_steering(self):
+    """R1 re-review: wheel 174 - 0.9 deg per frame, speed 7 - 0.05 m/s per frame, model 175: the band edge used to retreat 1.017 deg per frame, faster
+    than the 1 deg resume rate, the request fell outside the narrowing band and the region's window was empty at 6 m/s (inactive, gain reset)."""
+    for sign in (1, -1):
+      for decel in (0.03, 0.05, 0.06):
+        self.setUp()
+        self._resume_into_the_region(sign, lambda i, sign=sign: sign * max(174.0 - 0.9 * i, 100.0), lambda i, decel=decel: max(7.0 - decel * i, 3.0),
+                                     sign * 175.0, sign * 174.0, 7.0, frames=150)
+
+  def test_forced_inactive_while_resuming_near_the_region_latches_the_pause(self):
+    """An empty window while resuming near the region is a takeover-like pause: inactive for at least the hold, no ACTIVE inside the region."""
+    f = TakeoverFilter(150, 100, 500, 10)
+    f.resuming = True
+    self.assertIsNone(f.limit(160.0, 190.0, 150.0, 5.5, backstop=(0.0, 175.0)))  # last 190 is outside the window of any request
+    self.assertTrue(f.paused and not f.resuming)
+    g = TakeoverFilter(150, 100, 500, 10)
+    g.resuming = True
+    self.assertIsNone(g.limit(160.0, 190.0, 50.0, 12.0, backstop=(0.0, 175.0)))  # far from the region: unchanged, no latch
+    self.assertFalse(g.paused)
+
+  def test_random_trajectories_near_the_region_never_reenter_ungated(self):
+    """Random wheel (at most 0.95 deg per frame) and speed (up to 0.06 m/s per frame) near the boundary, resuming, through libsafety: every cycle one
+    accepted 0xCB; an inactive cycle after ACTIVE near the region (past 135 deg, under 6.5 m/s) is followed by at least the hold (500 ms) of inactive, and no
+    ACTIVE start inside the region."""
+    import random
+    for seed in range(40):
+      rng = random.Random(500 + seed)
+      self.setUp()
+      sign = rng.choice((1, -1))
+      wheel, v = rng.uniform(140.0, 178.0), rng.uniform(5.5, 7.0)
+      drift_w, drift_v = rng.uniform(-0.9, 0.3), rng.uniform(-0.06, 0.01)  # a trajectory that tends toward the region, plus noise
+      for _ in range(100):
+        self._frame(False, sign * wheel, sign * wheel, v)
+      prev_active, inactive_run, started = False, 10 ** 6, False
+      for i in range(300):
+        wheel = min(max(wheel + min(max(drift_w + rng.uniform(-0.05, 0.05), -0.95), 0.95), 100.0), 178.0)
+        v = min(max(v + drift_v + rng.uniform(-0.005, 0.005), 3.0), 9.0)
+        model = wheel + rng.uniform(-8.0, 8.0)
+        cb, ok, active, _, _ = self._frame(True, sign * wheel, sign * min(model, 175.0), v)
+        self.assertEqual((len(cb), ok), (1, [True]), f"seed {seed} frame {i}")
+        if active[0] and not prev_active:
+          self.assertFalse(wheel > 140.0 and v < 6.0, f"seed {seed} frame {i}: ACTIVE started inside the region")
+          if started and wheel > 135.0 and v < 6.5:  # near the region (the lateral acceleration cap does not bind below 7 m/s)
+            self.assertGreaterEqual(inactive_run, GUARD_FRAMES, f"seed {seed} frame {i}: ACTIVE again after {inactive_run} inactive frames")
+        started = started or active[0]
+        inactive_run = 0 if active[0] else inactive_run + 1
+        prev_active = active[0]
 
   def test_resume_with_a_slowly_unwinding_wheel(self):
     out = self._replay(lambda i: self.WHEEL + 0.5 * i)
@@ -907,6 +956,8 @@ class TestBlockedResumeRoute39(unittest.TestCase):
     self.assertEqual(f.limit(195.0, 189.64, 199.6, 4.9, backstop=(180.0, 190.2)), 190.2)  # nearest point of the intersection
     f.resuming = True
     self.assertIsNone(f.limit(195.0, 189.64, 199.6, 4.9, backstop=(180.0, 200.0)))  # resume window (last +- 0.5) and wheel +- 5 do not meet
+    self.assertTrue(f.paused and not f.resuming)  # an empty window while resuming in the region latches the pause
+    f.paused, f.resuming = False, True
     self.assertEqual(f.limit(195.0, 189.64, 190.0, 4.9, backstop=(180.0, 200.0)), 190.0)  # the guard's cap |request| <= |wheel| binds, inside the 0.5 window
     self.assertEqual(f.limit(180.0, 189.64, 190.0, 4.9, backstop=(180.0, 200.0)), 189.14)  # the 0.5 resume step, tighter than the 1 deg cap
     self.assertIsNone(f.limit(195.0, 189.64, 199.6, 4.9, backstop=None))

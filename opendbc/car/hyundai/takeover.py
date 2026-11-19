@@ -88,6 +88,7 @@ class TakeoverFilter:
     self.strict_calm_frames = 0
     self.bind_frames = 0
     self.lat_active_last = False
+    self.band = CONVERGE_DEG  # the resume window now (wheel +- this): converge_deg, narrowing no faster than the request can follow, see update()
     self.unsendable_frames = 0  # consecutive frames lateral was on without a sendable ACTIVE request, from the controller
     self.angle_hist: deque[float] = deque(maxlen=WHEEL_RATE_FRAMES + 1)
     self.k = angle_to_lat_accel
@@ -141,7 +142,8 @@ class TakeoverFilter:
     if self.strict and self.strict_calm_frames >= self.hold_frames and self.fault_frames == 0:
       self.strict = False
     in_region = self.step_capped(angle, v_ego)
-    if not self.lat_active_last:
+    started = not self.lat_active_last
+    if started:
       # lateral just came back (engage, blinker pause, MADS pause, fault): blend in like after a takeover, never snap to the model. Inside the guard
       # region it does not start at all (see the release below): it starts paused, so the controller sends inactive at the measured angle
       self.resuming = True
@@ -151,6 +153,17 @@ class TakeoverFilter:
         self.resuming = False
         self.release_frames = 0
     self.lat_active_last = True
+
+    # the resume window follows converge_deg, but its edge never retreats faster than the request can follow: the request moves at most the resume
+    # rate per frame while the wheel (the band's centre) moves too, so the width narrows by at most the resume rate less the wheel's rate (a hard edge
+    # that retreated faster left the request outside the band and the guard region's window empty: wheel 174 - 0.9 deg per frame, 7 - 0.05 m/s per
+    # frame). Widening is immediate. The same band applies inside the region (window()), so it never jumps at the region's edge.
+    target = self.converge_deg(angle, v_ego)
+    if self.resuming and not started:
+      step_wheel = abs(angle - self.angle_hist[-2]) if len(self.angle_hist) > 1 else 0.0
+      self.band = target if target >= self.band else max(target, self.band - max(0.0, self.resume_rate - max(wheel_rate, step_wheel)))
+    else:
+      self.band = target
 
     binds = self.guard_active(angle, v_ego) and (abs(desired - angle) > GUARD_MAX_ERROR or abs(desired) > self.guard_max_angle(angle))
     self.bind_frames = self.bind_frames + 1 if binds else 0
@@ -199,7 +212,7 @@ class TakeoverFilter:
 
     if self.resuming:
       self.resume_frames = max(0, self.resume_frames - 1)
-      if self.resume_frames == 0 and abs(desired - angle) <= self.converge_deg(angle, v_ego):
+      if self.resume_frames == 0 and abs(desired - angle) <= self.band:
         self.resuming = False
     return self.paused
 
@@ -237,7 +250,7 @@ class TakeoverFilter:
       cap = self.guard_max_angle(angle)
       lo, hi = max(lo, angle - GUARD_MAX_ERROR, -cap), min(hi, angle + GUARD_MAX_ERROR, cap)
     if self.resuming:
-      lo, hi = max(lo, angle - CONVERGE_DEG, last - self.resume_rate), min(hi, angle + CONVERGE_DEG, last + self.resume_rate)
+      lo, hi = max(lo, angle - self.band, last - self.resume_rate), min(hi, angle + self.band, last + self.resume_rate)
     return lo, hi
 
   @staticmethod
@@ -252,6 +265,16 @@ class TakeoverFilter:
     return float(np.clip(limited, band_lo, band_hi))
 
   def limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
+    """See _limit. An empty window while resuming near or in the guard region (resume window narrower than CONVERGE_FREE_DEG) sends inactive and latches the
+    pause like a takeover: no ACTIVE frame follows before the hands-off hold, and none inside the region at all (the release needs the wheel out of it)."""
+    out = self._limit(request, last, angle, v_ego, backstop)
+    if out is None and self.enabled and self.resuming and self.converge_deg(angle, v_ego) < CONVERGE_FREE_DEG:
+      self.paused = True
+      self.resuming = False
+      self.release_frames = 0
+    return out
+
+  def _limit(self, request: float, last: float, angle: float, v_ego: float, backstop: tuple[float, float] | None = (-math.inf, math.inf)) -> float | None:
     """Applies the low-speed cap, the lead band and the resume blend to a request that already passed the vehicle-model limits.
 
     `backstop` is the window the controller computes for every frame from what the upstream vehicle model (jerk and lateral accel), the EPS rate limit
@@ -276,8 +299,7 @@ class TakeoverFilter:
         step = self.resume_rate
         if lo > hi:
           return None
-        converge = self.converge_deg(angle, v_ego)
-        request = float(np.clip(np.clip(request, angle - converge, angle + converge), lo, hi))
+        request = float(np.clip(np.clip(request, angle - self.band, angle + self.band), lo, hi))
       lo, hi = max(lo, min(request, last - step)), min(hi, max(request, last + step))
       if lo > hi:
         return None
