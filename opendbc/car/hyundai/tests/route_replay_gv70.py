@@ -35,6 +35,7 @@ CEREAL = os.environ.get("GV70_REPLAY_CEREAL", os.path.expanduser(
 SAFETY_HYUNDAI_CANFD = 28  # opendbc/safety/declarations.h; importing the schema from structs would load a second capnp schema
 EPS_ANGLE_MAX, GUARD_BAND = 175.0, 10.0  # LFA_ALT: the EPS faults on a request beyond it; takeover.GUARD_MAX_ERROR
 GAP_MS_ALERT = 25.0  # a cycle is 10 ms: more than this without a 0xCB at the car is a gap worth listing
+CAN_LEAD_US = 20000  # a CAN batch's logMonoTime may run ahead of the controller's; more than two cycles is a logging artefact, not time
 
 CACHE = os.environ.get("GV70_REPLAY_CACHE", os.path.expanduser("~/dev/comma/out/replay-cache"))
 
@@ -196,6 +197,8 @@ def replay(prefix, t_a, t_b, pad=40.0, warm=100, to_panda=True, tx_filter=None):
   rec = SimpleNamespace(cb_ours=[], cb_cam=[], cb_car=[], rej=[], cyc=[], tx_rejected=Counter(), tx_total=Counter(), ev=[])
   live = False
   pending, cc_sp_src, cycle, timer = [], None, 0, 0  # timer: the panda's clock never runs backwards; logMonoTime of events of different processes does
+  cc_us = None  # the last controller cycle's time: a CAN batch may move the clock at most CAN_LEAD_US past it (route 60 19:14.5: one batch
+  #               stamped 0.65 s ahead froze the clock for 0.7 s, and the panda's 250 ms frame count rejected ~50 good frames)
   for seg in range(first, last + 1):
     for kind, ns, val in load_segment(prefix, seg):
       t = ns / 1e9 - t0
@@ -211,7 +214,7 @@ def replay(prefix, t_a, t_b, pad=40.0, warm=100, to_panda=True, tx_filter=None):
       if kind == 'ccsp':
         cc_sp_src = val
       elif kind == 'can':
-        timer = max(timer, ns // 1000)
+        timer = max(timer, ns // 1000 if cc_us is None else min(ns // 1000, cc_us + CAN_LEAD_US))
         S.set_timer(timer & 0xFFFFFFFF)
         frames = []
         for addr, src, dat in val:
@@ -226,7 +229,8 @@ def replay(prefix, t_a, t_b, pad=40.0, warm=100, to_panda=True, tx_filter=None):
             rec.ev.append((t, 'cam', 'pass' if fwd != -1 else 'block'))
         pending.append((ns, frames))
       elif kind == 'cc':
-        timer = max(timer, ns // 1000)
+        cc_us = ns // 1000
+        timer = max(timer, cc_us)
         S.set_timer(timer & 0xFFFFFFFF)
         CI.update(pending)
         pending = []
