@@ -15,6 +15,7 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyF
 
 
 CAMERA_STALE_FRAMES = 30  # 0.3 s of CarState updates: strictly inside the panda's 0.5 s (HYUNDAI_CANFD_HB_LKA_STALE_US / _HOLD_US)
+CAMERA_SIGN_STOP = 8  # CCNC_0x162 SIGNS: the camera sees a stop sign ahead (route logs: on 41-73 m before the stop, ~4-9 s)
 
 
 class CarStateExt:
@@ -127,3 +128,8 @@ class CarStateExt:
       self.cruise_buttons_msg = copy.copy(cp.vl[self.cruise_btns_msg_canfd])
 
     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_factor
+
+    # the camera's traffic-sign flag, only while 0x162 keeps arriving (the parser keeps the last value of a stopped message)
+    ret_sp.cameraStopSign = bool(self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG and
+                                 self._camera_fresh("CCNC_0x162", cp_cam.ts_nanos["CCNC_0x162"]["COUNTER"]) and
+                                 self.msg_162["SIGNS"] == CAMERA_SIGN_STOP)

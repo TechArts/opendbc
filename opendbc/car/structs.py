@@ -176,3 +176,4 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  cameraStopSign: bool = auto_field()
