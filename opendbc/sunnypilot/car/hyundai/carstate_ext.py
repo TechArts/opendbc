@@ -16,8 +16,7 @@ from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyF
 
 
 CAMERA_STALE_FRAMES = 30  # 0.3 s of CarState updates: strictly inside the panda's 0.5 s (HYUNDAI_CANFD_HB_LKA_STALE_US / _HOLD_US)
-NAV_SPEED_UNIT_KPH = 1  # HU_Navi_ISLW_PE Navi_ISLW_SpdUnit (observed: 2 = mph on a US car; 1 = kph by symmetry, unconfirmed). Other units are invalid
-NAV_SPEED_UNIT_MPH = 2
+NAV_SPEED_UNIT_MPH = 2  # HU_Navi_ISLW_PE Navi_ISLW_SpdUnit: only 2 = mph (US car) is observed; every other unit is invalid until seen
 NAV_STALE_FRAMES = 300  # 3 s of CarState updates: the head unit's send rate is not measured, so be lenient (the limit only drives a map-source fallback)
 NAV_SPEED_NONE = (0, 255)  # Navi_ISLW_SpdLimit sentinels: no limit
 CAMERA_SIGN_STOP = 8  # CCNC_0x162 SIGNS: the camera sees a stop sign ahead (route logs: on 41-73 m before the stop, ~4-9 s)
@@ -48,7 +47,7 @@ class CarStateExt:
     return ts_nanos != 0 and (age == 0 if new_only else age <= stale_frames)
 
   def update_nav_speed_limit(self, cp) -> float:
-    """The head unit's navigation speed limit in m/s while HU_Navi_ISLW_PE keeps arriving (0 = none, stale, unknown unit or 0/255)."""
+    """The head unit's navigation speed limit in m/s while HU_Navi_ISLW_PE keeps arriving (0 = none, stale, a unit other than mph, or 0/255)."""
     if not (self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG):
       return 0.0
     msg = cp.vl["HU_Navi_ISLW_PE"]
@@ -61,8 +60,6 @@ class CarStateExt:
       return 0.0
     if unit == NAV_SPEED_UNIT_MPH:
       return limit * CV.MPH_TO_MS
-    if unit == NAV_SPEED_UNIT_KPH:
-      return limit * CV.KPH_TO_MS
     return 0.0
 
   def update_speed_limit(self, cp, cp_cam) -> float:
