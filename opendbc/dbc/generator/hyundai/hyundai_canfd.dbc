@@ -740,6 +740,10 @@ BO_ 1151 HVAC_TOUCH_BUTTONS: 8 XXX
  SG_ RECIRC_BUTTON : 48|1@0+ (1,0) [0|1] "" XXX
  SG_ HEAT_BUTTON : 52|1@0+ (1,0) [0|1] "" XXX
 
+BO_ 1187 HU_Navi_ISLW_PE: 8 XXX
+ SG_ Navi_ISLW_SpdUnit : 6|2@1+ (1,0) [0|3] "" XXX
+ SG_ Navi_ISLW_SpdLimit : 8|8@1+ (1,0) [0|255] "" XXX
+
 BO_ 1240 CLUSTER_INFO: 8 XXX
  SG_ DISTANCE_UNIT : 0|1@1+ (1,0) [0|1] "" XXX
 
