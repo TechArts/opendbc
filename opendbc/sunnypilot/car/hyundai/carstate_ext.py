@@ -9,12 +9,17 @@ import copy
 from enum import StrEnum
 
 from opendbc.car import Bus, structs
+from opendbc.car.common.conversions import Conversions as CV
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags, CAR
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP, HyundaiSafetyFlagsSP
 
 
 CAMERA_STALE_FRAMES = 30  # 0.3 s of CarState updates: strictly inside the panda's 0.5 s (HYUNDAI_CANFD_HB_LKA_STALE_US / _HOLD_US)
+NAV_SPEED_UNIT_KPH = 1  # HU_Navi_ISLW_PE Navi_ISLW_SpdUnit (observed: 2 = mph on a US car; 1 = kph by symmetry, unconfirmed). Other units are invalid
+NAV_SPEED_UNIT_MPH = 2
+NAV_STALE_FRAMES = 300  # 3 s of CarState updates: the head unit's send rate is not measured, so be lenient (the limit only drives a map-source fallback)
+NAV_SPEED_NONE = (0, 255)  # Navi_ISLW_SpdLimit sentinels: no limit
 CAMERA_SIGN_STOP = 8  # CCNC_0x162 SIGNS: the camera sees a stop sign ahead (route logs: on 41-73 m before the stop, ~4-9 s)
 
 
@@ -33,14 +38,32 @@ class CarStateExt:
     self.cam_lka_ind = None
     self._camera_seen: dict[str, tuple[int, int]] = {}  # camera message -> (receive time, updates since it last changed)
 
-  def _camera_fresh(self, name: str, ts_nanos: int, new_only: bool = False) -> bool:
+  def _camera_fresh(self, name: str, ts_nanos: int, new_only: bool = False, stale_frames: int = CAMERA_STALE_FRAMES) -> bool:
     """True while a camera message keeps arriving: its receive time moved within the last CAMERA_STALE_FRAMES updates (never received: False). The
     panda lets the lane-keeping window expire after 0.5 s without 0x161 / 0x12A, so ours must be over strictly before. new_only: True only in the update
     where the message arrived (an event, for a signal whose hold LkaWindow counts itself: a cached value must not restart that hold)."""
-    last_ts, age = self._camera_seen.get(name, (0, CAMERA_STALE_FRAMES + 1))
-    age = 0 if ts_nanos != last_ts else min(age + 1, CAMERA_STALE_FRAMES + 1)
+    last_ts, age = self._camera_seen.get(name, (0, stale_frames + 1))
+    age = 0 if ts_nanos != last_ts else min(age + 1, stale_frames + 1)
     self._camera_seen[name] = (ts_nanos, age)
-    return ts_nanos != 0 and (age == 0 if new_only else age <= CAMERA_STALE_FRAMES)
+    return ts_nanos != 0 and (age == 0 if new_only else age <= stale_frames)
+
+  def update_nav_speed_limit(self, cp) -> float:
+    """The head unit's navigation speed limit in m/s while HU_Navi_ISLW_PE keeps arriving (0 = none, stale, unknown unit or 0/255)."""
+    if not (self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG):
+      return 0.0
+    msg = cp.vl["HU_Navi_ISLW_PE"]
+    if not self._camera_fresh("HU_Navi_ISLW_PE", cp.ts_nanos["HU_Navi_ISLW_PE"]["Navi_ISLW_SpdLimit"],
+                              stale_frames=NAV_STALE_FRAMES):
+      return 0.0
+    limit = msg["Navi_ISLW_SpdLimit"]
+    unit = msg["Navi_ISLW_SpdUnit"]
+    if limit in NAV_SPEED_NONE:
+      return 0.0
+    if unit == NAV_SPEED_UNIT_MPH:
+      return limit * CV.MPH_TO_MS
+    if unit == NAV_SPEED_UNIT_KPH:
+      return limit * CV.KPH_TO_MS
+    return 0.0
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -133,3 +156,4 @@ class CarStateExt:
     ret_sp.cameraStopSign = bool(self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG and
                                  self._camera_fresh("CCNC_0x162", cp_cam.ts_nanos["CCNC_0x162"]["COUNTER"]) and
                                  self.msg_162["SIGNS"] == CAMERA_SIGN_STOP)
+    ret_sp.navSpeedLimit = self.update_nav_speed_limit(cp)

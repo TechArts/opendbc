@@ -177,3 +177,4 @@ class CarControlSP:
 class CarStateSP:
   speedLimit: float = auto_field()
   cameraStopSign: bool = auto_field()
+  navSpeedLimit: float = auto_field()
