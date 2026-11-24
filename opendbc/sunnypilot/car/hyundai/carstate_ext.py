@@ -32,6 +32,7 @@ class CarStateExt:
     self.aBasis = 0.0
     self.msg_161 = {}
     self.msg_162 = {}
+    self.msg_1b5 = {}  # the camera's lane positions (FR_CMR_03_50ms): the dash's lane lines move with them during a lane change
     self.mdps = {}
     self.cruise_buttons_msg = {}
     self.lfa_alt = {}
@@ -141,6 +142,8 @@ class CarStateExt:
     if self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
       self.msg_161 = copy.copy(cp_cam.vl["CCNC_0x161"])
       self.msg_162 = copy.copy(cp_cam.vl["CCNC_0x162"])
+      fresh_1b5 = self._camera_fresh("FR_CMR_03_50ms", cp_cam.ts_nanos["FR_CMR_03_50ms"]["FR_CMR_AlvCnt3Val"])
+      self.msg_1b5 = copy.copy(cp_cam.vl["FR_CMR_03_50ms"]) if fresh_1b5 else {}  # stale or never sent: the dash keeps the camera's positions
       # never copy before the real MDPS has arrived: the copy is re-sent to the camera, which must not get default values
       if cp.ts_nanos["MDPS"]["COUNTER"]:
         self.mdps = copy.copy(cp.vl["MDPS"])
