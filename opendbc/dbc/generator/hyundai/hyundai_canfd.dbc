@@ -723,6 +723,12 @@ BO_ 1043 BLINKERS: 8 XXX
  SG_ RIGHT_LAMP_ALT : 61|1@0+ (1,0) [0|1] "" XXX
  SG_ USE_ALT_LAMP : 62|1@0+ (1,0) [0|1] "" XXX
 
+BO_ 1096 SWRC_01_200ms: 8 XXX
+ SG_ SWRC_Crc1Val : 0|8@1+ (1,0) [0|255] "" XXX
+ SG_ Audio_CustomSw3Sta : 8|4@1+ (1,0) [0|15] "" XXX
+ SG_ SWRC_AlvCnt1Val : 12|4@1+ (1,0) [0|15] "" XXX
+ SG_ Audio_CustomSwSta : 44|4@1+ (1,0) [0|15] "" XXX
+
 BO_ 1144 DRIVE_MODE: 8 XXX
  SG_ DRIVE_MODE : 0|16@1+ (1,-61611) [0|61611] "" XXX
  SG_ DRIVE_MODE2 : 28|3@1+ (1,0) [1|3] "" XXX

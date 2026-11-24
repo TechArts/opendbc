@@ -20,6 +20,8 @@ NAV_SPEED_UNIT_MPH = 2  # HU_Navi_ISLW_PE Navi_ISLW_SpdUnit: only 2 = mph (US ca
 NAV_STALE_FRAMES = 300  # 3 s of CarState updates: the head unit's send rate is not measured, so be lenient (the limit only drives a map-source fallback)
 NAV_SPEED_NONE = (0, 255)  # Navi_ISLW_SpdLimit sentinels: no limit
 CAMERA_SIGN_STOP = 8  # CCNC_0x162 SIGNS: the camera sees a stop sign ahead (route logs: on 41-73 m before the stop, ~4-9 s)
+SWRC_STALE_FRAMES = 50  # 0.5 s of CarState updates: SWRC_01 arrives at ~5 Hz and on every change (route 87), so 0.5 s is > 2 periods
+CUSTOM_BUTTON_PRESSED = 1  # SWRC_01 Audio_CustomSw3Sta while the programmable wheel button is held (route 87: only 0 and 1 seen)
 
 
 class CarStateExt:
@@ -61,6 +63,15 @@ class CarStateExt:
     if unit == NAV_SPEED_UNIT_MPH:
       return limit * CV.MPH_TO_MS
     return 0.0
+
+  def update_custom_button(self, cp) -> bool:
+    """The programmable steering-wheel button (SWRC_01 Audio_CustomSw3Sta) is held, while SWRC_01 keeps arriving (stale: released, so a lost
+    message can never look like a long press)."""
+    if not (self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG):
+      return False
+    if not self._camera_fresh("SWRC_01_200ms", cp.ts_nanos["SWRC_01_200ms"]["Audio_CustomSw3Sta"], stale_frames=SWRC_STALE_FRAMES):
+      return False
+    return cp.vl["SWRC_01_200ms"]["Audio_CustomSw3Sta"] == CUSTOM_BUTTON_PRESSED
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -154,3 +165,4 @@ class CarStateExt:
                                  self._camera_fresh("CCNC_0x162", cp_cam.ts_nanos["CCNC_0x162"]["COUNTER"]) and
                                  self.msg_162["SIGNS"] == CAMERA_SIGN_STOP)
     ret_sp.navSpeedLimit = self.update_nav_speed_limit(cp)
+    ret_sp.customButton = self.update_custom_button(cp)

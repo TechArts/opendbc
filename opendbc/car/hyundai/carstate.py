@@ -381,8 +381,9 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
-    # the head unit's navigation speed limit is optional (not on every car, not always sent): NaN = no alive or frequency check, never in canValid
-    msgs += [("HU_Navi_ISLW_PE", math.nan)]
+    # the head unit's navigation speed limit and the steering-wheel remote (SWRC_01, the programmable wheel button) are optional (not on every car,
+    # not always sent): NaN = no alive or frequency check, never in canValid
+    msgs += [("HU_Navi_ISLW_PE", math.nan), ("SWRC_01_200ms", math.nan)]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
