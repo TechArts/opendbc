@@ -22,6 +22,7 @@ NAV_SPEED_NONE = (0, 255)  # Navi_ISLW_SpdLimit sentinels: no limit
 CAMERA_SIGN_STOP = 8  # CCNC_0x162 SIGNS: the camera sees a stop sign ahead (route logs: on 41-73 m before the stop, ~4-9 s)
 SWRC_STALE_FRAMES = 50  # 0.5 s of CarState updates: SWRC_01 arrives at ~5 Hz and on every change (route 87), so 0.5 s is > 2 periods
 CUSTOM_BUTTON_PRESSED = 1  # SWRC_01 Audio_CustomSw3Sta while the programmable wheel button is held (route 87: only 0 and 1 seen)
+ISLA_SIGN_SCHOOL_CROSSING = 1  # FR_CMR_02_100ms ISLA_AddtnlSign "School Crossing" (routes 74-8d: 1.5 % of moving time; ISLA_SchoolZone never set)
 
 
 class CarStateExt:
@@ -73,6 +74,17 @@ class CarStateExt:
     if not self._camera_fresh("SWRC_01_200ms", cp.ts_nanos["SWRC_01_200ms"]["Audio_CustomSw3Sta"], stale_frames=SWRC_STALE_FRAMES):
       return False
     return cp.vl["SWRC_01_200ms"]["Audio_CustomSw3Sta"] == CUSTOM_BUTTON_PRESSED
+
+  def update_school_sign(self, cp, cp_cam) -> bool:
+    """The camera reports a "School Crossing" sign (FR_CMR_02_100ms ISLA_AddtnlSign == 1) while the message keeps arriving: one input of the
+    speed-limit vote's school-zone rule (openpilot speed_limit/vote.py)."""
+    if not (self.CP.flags & HyundaiFlags.CANFD and self.CP_SP.flags & HyundaiFlagsSP.SPEED_LIMIT_AVAILABLE and
+            self.CP_SP.flags & HyundaiFlagsSP.CCNC):
+      return False
+    bus = cp if self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG else cp_cam
+    if not self._camera_fresh("FR_CMR_02_100ms", bus.ts_nanos["FR_CMR_02_100ms"]["ISLA_AddtnlSign"]):
+      return False
+    return bus.vl["FR_CMR_02_100ms"]["ISLA_AddtnlSign"] == ISLA_SIGN_SCHOOL_CROSSING
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -169,3 +181,4 @@ class CarStateExt:
                                  self.msg_162["SIGNS"] == CAMERA_SIGN_STOP)
     ret_sp.navSpeedLimit = self.update_nav_speed_limit(cp)
     ret_sp.customButton = self.update_custom_button(cp)
+    ret_sp.speedLimitSchoolSign = self.update_school_sign(cp, cp_cam)

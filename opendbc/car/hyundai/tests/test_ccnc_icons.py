@@ -7,7 +7,7 @@ from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR, DBC
-from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController, create_ccnc_0x161, lane_line_positions
+from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController, create_ccnc_0x161, lane_line_positions, MAIN_FWD_MAX_FRAMES
 from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.sunnypilot.car.hyundai.mads import MadsDataSP
 
@@ -242,6 +242,35 @@ class TestHandbackDash(unittest.TestCase):
     self.cs.msg_161.update({"SETSPEED": 2, "SETSPEED_HUD": 2, "SETSPEED_SPEED": 33})
     out, _ = self._out(send_lat=False)  # the camera's nudge steers, the cruise icon is still openpilot's: main on, standby
     self.assertEqual((out["SETSPEED"], out["SETSPEED_HUD"]), (1, 1))
+
+
+class TestMainForward(unittest.TestCase):
+  """The camera's CRUISE_BUTTONS copy (main-button engage): a held MAIN reaches the camera for at most MAIN_FWD_MAX_FRAMES, so a long MAIN
+  (openpilot's speed-limit follow) is a short press for the camera and never its own limiter mode; a short MAIN passes unchanged."""
+  setUp = TestHandbackDash.setUp
+
+  def _camera_main(self, held_frames, total_frames):
+    self.cc.send_lat = True
+    buttons = _defaults("CRUISE_BUTTONS")
+    seen = []
+    for i in range(total_frames):
+      self.cc.frame = i
+      self.cs.cruise_buttons_msg = dict(buttons, ADAPTIVE_CRUISE_MAIN_BTN=1 if i < held_frames else 0)
+      msgs = CcncCarController.update(self.cc, self.cs, structs.CarControl())
+      for m in msgs:
+        if m[0] == 0x1CF and m[2] == self.cc.CAN.CAM:
+          parser = CANParser(DBC_NAME, [("CRUISE_BUTTONS", 0)], m[2])
+          parser.update([(0, [m])])
+          seen.append((i, parser.vl["CRUISE_BUTTONS"]["ADAPTIVE_CRUISE_MAIN_BTN"]))
+    return [i for i, v in seen if v]
+
+  def test_short_main_passes_unchanged(self):
+    self.assertEqual(self._camera_main(12, 40), [0, 2, 4, 6, 8, 10])
+
+  def test_long_main_is_cut_to_a_short_press(self):
+    pressed = self._camera_main(80, 120)
+    self.assertTrue(pressed and pressed[0] == 0)
+    self.assertLessEqual(max(pressed), MAIN_FWD_MAX_FRAMES)
 
 
 if __name__ == "__main__":

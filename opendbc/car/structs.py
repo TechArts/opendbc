@@ -179,3 +179,4 @@ class CarStateSP:
   cameraStopSign: bool = auto_field()
   navSpeedLimit: float = auto_field()
   customButton: bool = auto_field()
+  speedLimitSchoolSign: bool = auto_field()
