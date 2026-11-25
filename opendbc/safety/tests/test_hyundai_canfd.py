@@ -911,6 +911,7 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
   def test_long_main_bit_is_no_press_without_main_button_engage(self):
     self._init(param_sp=self.BASE_SP)
     self._button(long_main=1)
+    self.assertFalse(self.safety.get_acc_main_on())  # with the flag off bit 21 is no MAIN, so it does not toggle main (review R1 2026-11-25)
     self._camera_main(True)
     self.assertFalse(self.safety.get_controls_allowed())
 
