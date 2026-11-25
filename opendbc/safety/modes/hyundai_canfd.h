@@ -298,7 +298,8 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     int cruise_button = 0;
     if (msg_matches(msg, 0x1cfU, pt_bus)) {
       cruise_button = msg->data[2] & 0x7U;
-      main_button = GET_BIT(msg, 19U);
+      // a long MAIN sends only NORMAL_CRUISE_MAIN_BTN (bit 21, GV70 CCNC): with main-button engage it is the same driver MAIN press
+      main_button = GET_BIT(msg, 19U) || (hyundai_long_main_button_engage && GET_BIT(msg, 21U));
       mads_button_press = GET_BIT(msg, 23U) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
     } else {
       cruise_button = (msg->data[4] >> 4) & 0x7U;

@@ -862,8 +862,9 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.safety.set_timer(0)
     self.cam = False
 
-  def _button(self, buttons=0, main=0):
-    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main}))
+  def _button(self, buttons=0, main=0, long_main=0):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRUISE_BUTTONS", 0, {"CRUISE_BUTTONS": buttons, "ADAPTIVE_CRUISE_MAIN_BTN": main,
+                                                                                      "NORMAL_CRUISE_MAIN_BTN": long_main}))
 
   def _brake(self, pressed):
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("TCS", 0, {"DriverBraking": pressed}))
@@ -897,6 +898,21 @@ class TestHyundaiCanfdLongMainButtonEngage(unittest.TestCase):
     self.assertTrue(self.safety.get_controls_allowed())
     self._button(main=0)
     self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_long_main_press_engages(self):
+    # route 94: a long MAIN sends only NORMAL_CRUISE_MAIN_BTN; with main-button engage it is the driver's MAIN press
+    self._init()
+    self._button(long_main=1)
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._camera_main(True)
+    self.assertTrue(self.safety.get_acc_main_on())
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_long_main_bit_is_no_press_without_main_button_engage(self):
+    self._init(param_sp=self.BASE_SP)
+    self._button(long_main=1)
+    self._camera_main(True)
+    self.assertFalse(self.safety.get_controls_allowed())
 
   def test_camera_ignores_press(self):
     self._init()

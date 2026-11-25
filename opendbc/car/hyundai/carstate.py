@@ -339,7 +339,10 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
     prev_main_buttons = self.main_buttons[-1]
     prev_lda_button = self.lda_button
     self.cruise_buttons.extend(cp.vl_all[self.cruise_btns_msg_canfd]["CRUISE_BUTTONS"])
-    self.main_buttons.extend(cp.vl_all[self.cruise_btns_msg_canfd]["ADAPTIVE_CRUISE_MAIN_BTN"])
+    main_btn = cp.vl_all[self.cruise_btns_msg_canfd]["ADAPTIVE_CRUISE_MAIN_BTN"]
+    if self.long_main_button_engage:  # a long MAIN sends only NORMAL_CRUISE_MAIN_BTN (GV70 CCNC): still the MAIN button, it engages as a short one
+      main_btn = [a or n for a, n in zip(main_btn, cp.vl_all[self.cruise_btns_msg_canfd]["NORMAL_CRUISE_MAIN_BTN"], strict=True)]
+    self.main_buttons.extend(main_btn)
     self.lda_button = cp.vl[self.cruise_btns_msg_canfd]["LDA_BTN"]
     self.buttons_counter = cp.vl[self.cruise_btns_msg_canfd]["COUNTER"]
     ret.accFaulted = cp.vl["TCS"]["ACCEnable"] != 0  # 0 ACC CONTROL ENABLED, 1-3 ACC CONTROL DISABLED

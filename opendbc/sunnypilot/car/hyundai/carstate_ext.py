@@ -182,3 +182,5 @@ class CarStateExt:
     ret_sp.navSpeedLimit = self.update_nav_speed_limit(cp)
     ret_sp.customButton = self.update_custom_button(cp)
     ret_sp.speedLimitSchoolSign = self.update_school_sign(cp, cp_cam)
+    # GV70 CCNC: a long MAIN is its own bit, held until the release; a short MAIN is a ~0.11 s ADAPTIVE_CRUISE_MAIN_BTN pulse (routes 94-9f)
+    ret_sp.mainCruiseLong = bool(self.cruise_buttons_msg.get("NORMAL_CRUISE_MAIN_BTN", 0))

@@ -18,7 +18,6 @@ cruise_buttons_checksum = mk_crc8_fun(CRC8J1850, init_crc=0x97, xor_out=0x97)  #
 
 CANCEL_BUTTON_DELAY_FRAMES = 10  # 100 ms
 MAIN_PRESS_FRAMES = 12  # 120 ms
-MAIN_FWD_MAX_FRAMES = 20  # 200 ms: the longest MAIN the camera sees (it reacts 30-60 ms after the press; route logs 84-8d, presses 0.12 s)
 OVERRIDE_BLINK_FRAMES = 100
 OVERRIDE_BLINK_ON_FRAMES = 60
 STOP_DISTANCE_BP = [0.0, 5.0]  # m/s
@@ -227,13 +226,15 @@ def create_ccnc_buttons(packer, CAN, cruise_buttons_msg, main_btn):
   return packer.make_can_msg("CRUISE_BUTTONS", CAN.CAM, values)
 
 
-def create_ccnc_buttons_genuine(packer, CAN, cruise_buttons_msg, main_released=False):
+def create_ccnc_buttons_genuine(packer, CAN, cruise_buttons_msg, long_main_frames=0):
   """The driver's own CRUISE_BUTTONS frame (the physical one is blocked by the panda), so the camera sees the real MAIN press and reacts to it.
-  main_released: MAIN is still held but the camera gets it released, so a long MAIN (openpilot's speed-limit follow) reaches the camera as a
-  short press and never as its own limiter mode."""
+  long_main_frames: frames NORMAL_CRUISE_MAIN_BTN (the car's long MAIN) has been held. The camera never gets it, so it never enters its own
+  limiter (Manual Speed Limit Assist); for its first MAIN_PRESS_FRAMES it gets a short MAIN instead, which turns its cruise main on or off as a
+  short press does. openpilot reads the long MAIN itself (speed-limit follow)."""
   values = dict(cruise_buttons_msg)
-  if main_released:
-    values["ADAPTIVE_CRUISE_MAIN_BTN"] = 0
+  values["NORMAL_CRUISE_MAIN_BTN"] = 0
+  if 0 < long_main_frames <= MAIN_PRESS_FRAMES:
+    values["ADAPTIVE_CRUISE_MAIN_BTN"] = 1
   dat = packer.make_can_msg("CRUISE_BUTTONS", CAN.CAM, values)[1]
   values["_CHECKSUM"] = cruise_buttons_checksum(dat[1:])
 
@@ -263,7 +264,7 @@ class CcncCarController:
     self.lead_distance_bars_last = None
     self.distance_bar_frame = 0
     self.main_button_engage = bool(CP_SP.safetyParam & HyundaiSafetyFlagsSP.MAIN_BUTTON_ENGAGE)
-    self.main_held_frames = 0
+    self.long_main_frames = 0
 
   def create_alt_button_msgs(self, CS, CC):
     can_sends = []
@@ -310,10 +311,10 @@ class CcncCarController:
       self.lead_distance_bars_last = CC.hudControl.leadDistanceBars
 
       if self.main_button_engage:
-        self.main_held_frames = self.main_held_frames + 1 if CS.cruise_buttons_msg.get("ADAPTIVE_CRUISE_MAIN_BTN") else 0
+        self.long_main_frames = self.long_main_frames + 1 if CS.cruise_buttons_msg.get("NORMAL_CRUISE_MAIN_BTN") else 0
       if self.frame % 2 == 0 and self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC:
         if self.main_button_engage:
-          can_sends.append(create_ccnc_buttons_genuine(self.packer, self.CAN, CS.cruise_buttons_msg, self.main_held_frames > MAIN_FWD_MAX_FRAMES))
+          can_sends.append(create_ccnc_buttons_genuine(self.packer, self.CAN, CS.cruise_buttons_msg, self.long_main_frames))
         else:
           press_main = CS.cruise_info["MainMode_ACC"] and self.frame % (2 * MAIN_PRESS_FRAMES) < MAIN_PRESS_FRAMES
           can_sends.append(create_ccnc_buttons(self.packer, self.CAN, CS.cruise_buttons_msg, press_main))

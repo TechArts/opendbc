@@ -56,7 +56,7 @@ class TestMainButtonEngage(unittest.TestCase):
     assert self._carstate().long_main_button_engage
     assert not self._carstate(alpha_long=False).long_main_button_engage
 
-  def _update(self, alpha_long, camera_main, main_btn):
+  def _update(self, alpha_long, camera_main, main_btn, long_btn=0):
     cp, cp_sp = _cp(CAR.GENESIS_GV70_2ND_GEN, alpha_long)
     cs = CarState(cp, cp_sp)
     parsers = cs.get_can_parsers(cp, cp_sp)
@@ -65,11 +65,28 @@ class TestMainButtonEngage(unittest.TestCase):
     ret, engage = None, False
     for i in range(3):
       ts = (i + 1) * 10_000_000
-      parsers[Bus.pt].update([(ts, [packer.make_can_msg("CRUISE_BUTTONS", can.ECAN, {"ADAPTIVE_CRUISE_MAIN_BTN": main_btn})])])
+      parsers[Bus.pt].update([(ts, [packer.make_can_msg("CRUISE_BUTTONS", can.ECAN, {"ADAPTIVE_CRUISE_MAIN_BTN": main_btn,
+                                                                                      "NORMAL_CRUISE_MAIN_BTN": long_btn})])])
       parsers[Bus.cam].update([(ts, [packer.make_can_msg("SCC_CONTROL", can.CAM, {"MainMode_ACC": camera_main})])])
-      ret, _ = cs.update(parsers)
+      ret, ret_sp = cs.update(parsers)
+      self.ret_sp = ret_sp
+      if i == 0:
+        self.first_events = [(be.type, be.pressed) for be in ret.buttonEvents]
       engage = engage or cs.main_button_enable
     return cs, ret, engage
+
+  def test_long_main_is_a_main_press(self):
+    # route 94: a long MAIN sends only NORMAL_CRUISE_MAIN_BTN; it must engage as MAIN does and reach card as carStateSP.mainCruiseLong
+    _, ret, engage = self._update(True, camera_main=1, main_btn=0, long_btn=1)
+    assert (ButtonType.mainCruise, True) in self.first_events
+    assert engage and ret.cruiseState.available
+    assert self.ret_sp.mainCruiseLong
+    self._update(True, camera_main=1, main_btn=1)
+    assert not self.ret_sp.mainCruiseLong
+
+  def test_long_main_bit_ignored_without_main_button_engage(self):
+    self._update(False, camera_main=0, main_btn=0, long_btn=1)
+    assert ButtonType.mainCruise not in [t for t, _ in self.first_events]
 
   def test_camera_main_is_the_cruise_available_state(self):
     cs, ret, engage = self._update(True, camera_main=1, main_btn=1)
