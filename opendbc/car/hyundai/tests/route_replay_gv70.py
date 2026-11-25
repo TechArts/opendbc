@@ -2,9 +2,9 @@
 parser and to the panda's rx hook (libsafety), the recorded carControl (latActive, desired angle, ...) goes to the real CarController, and what the
 controller sends goes through the panda's tx hook; the camera's 0xCB goes through the panda's forward hook. Nothing of the old controller is replayed.
 
-  PYTHONPATH=$PWD ~/dev/comma/opendbc/.venv/bin/python -m opendbc.car.hyundai.tests.route_replay_gv70 \\
+  PYTHONPATH=$PWD ~/workspace/comma/opendbc/.venv/bin/python -m opendbc.car.hyundai.tests.route_replay_gv70 \\
       <route dir prefix> <route time a> <route time b> [--pad S] [--warm N]
-  e.g. ... ~/dev/comma/routes/00000055--9a3f24b784 3:16.9 3:19.0
+  e.g. ... ~/workspace/comma/routes/00000055--9a3f24b784 3:16.9 3:19.0
 
 Route time is logMonoTime - the first carState of the route (the analysis tools' clock); times are mm:ss or seconds. Whole segments from (a - pad) to (b + 5 s)
 are read, frames only from the moment the recorded panda was in hyundaiCanfd (its bus 2 carries stock frames before); the first --warm cycles run with
@@ -37,7 +37,7 @@ EPS_ANGLE_MAX, GUARD_BAND = 175.0, 10.0  # LFA_ALT: the EPS faults on a request 
 GAP_MS_ALERT = 25.0  # a cycle is 10 ms: more than this without a 0xCB at the car is a gap worth listing
 CAN_LEAD_US = 20000  # a CAN batch's logMonoTime may run ahead of the controller's; more than two cycles is a logging artefact, not time
 
-CACHE = os.environ.get("GV70_REPLAY_CACHE", os.path.expanduser("~/dev/comma/out/replay-cache"))
+CACHE = os.environ.get("GV70_REPLAY_CACHE", os.path.expanduser("~/workspace/comma/out/replay-cache"))
 
 
 class _CI:

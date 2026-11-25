@@ -7,7 +7,7 @@ from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR, DBC
-from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController, create_ccnc_0x161, lane_line_positions
+from opendbc.sunnypilot.car.hyundai.ccnc import CcncCarController, create_ccnc_0x161, create_ccnc_0x162, lane_line_positions
 from opendbc.car.hyundai.handback import CameraHandback
 from opendbc.sunnypilot.car.hyundai.mads import MadsDataSP
 
@@ -96,6 +96,28 @@ def _ccnc_0x161(lat_active=False, paused=False, passthrough_lat=False, camera_lf
   parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], msg[2])
   parser.update([(0, [msg])])
   return parser.vl["CCNC_0x161"]
+
+class TestCameraFaults(unittest.TestCase):
+  """F4: the camera's FAULT_* (0x162) and its alert (0x161) reach the dash whatever openpilot does, so a real fault is never hidden by our copies."""
+  FAULTS = {"FAULT_SCC": 1, "FAULT_LFA": 2, "FAULT_LSS": 1, "FAULT_FCA": 1}
+
+  def _162(self, enabled, lead_visible):
+    can = CanBus(None, gen_empty_fingerprint())
+    msg = create_ccnc_0x162(CANPacker(DBC_NAME), can, dict(_defaults("CCNC_0x162"), **self.FAULTS), enabled, True, True, False, lead_visible, 30.0)
+    parser = CANParser(DBC_NAME, [("CCNC_0x162", 0)], msg[2])
+    parser.update([(0, [msg])])
+    return parser.vl["CCNC_0x162"]
+
+  def test_faults_pass_through(self):
+    for enabled in (False, True):
+      for lead_visible in (False, True):
+        out = self._162(enabled, lead_visible)
+        self.assertEqual({k: out[k] for k in self.FAULTS}, self.FAULTS, (enabled, lead_visible))
+
+  def test_camera_alert_passes_through(self):
+    for kw in ({}, {"lat_active": True}, {"paused": True}, {"passthrough_lat": True}):
+      out = _ccnc_0x161(msg_161=dict(_defaults("CCNC_0x161"), ALERTS_1=3), out=structs.CarState(vEgo=25.0), **kw)
+      self.assertEqual(out["ALERTS_1"], 3, kw)
 
 
 class TestLaneChangeDash(unittest.TestCase):
