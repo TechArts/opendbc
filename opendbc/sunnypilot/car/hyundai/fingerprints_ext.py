@@ -235,6 +235,14 @@ FW_VERSIONS_EXT = {
       b'\xf1\x00NQ5__               1.00 1.04 99110CH100          ',
     ],
   },
+  CAR.GENESIS_GV70_2ND_GEN: {
+    (Ecu.fwdCamera, 0x7c4, None): [
+      b'\xf1\x00JK  MFC  AT USA LHD 1.00 1.11 99211-IY500 241125',
+    ],
+    (Ecu.fwdRadar, 0x7d0, None): [
+      b'\xf1\x00JK__ RDR -----      1.00 1.01 99110-AR600         ',
+    ],
+  },
   CAR.GENESIS_GV70_ELECTRIFIED_2ND_GEN: {
     (Ecu.fwdCamera, 0x7c4, None): [
       b'\xf1\x00JK  MFC  AT USA LHD 1.00 1.03 99211-DS600 241125',

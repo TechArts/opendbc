@@ -27,6 +27,7 @@ enum {
   HYUNDAI_ANGLE_MODEL_KIA_SORENTO_HEV_4TH_LFA2, // 8
   HYUNDAI_ANGLE_MODEL_GENESIS_GV70_E_2ND_GEN,    // 9
   HYUNDAI_ANGLE_MODEL_HYUNDAI_AZERA_HEV_7TH,     // 10
+  HYUNDAI_ANGLE_MODEL_GENESIS_GV70_2ND_GEN,      // 11
 
   HYUNDAI_ANGLE_MODEL_COUNT,  // must be last — used for bounds checking
 };
@@ -126,6 +127,13 @@ static const AngleSteeringParams *hyundai_get_angle_params(uint8_t model_id) {
       .slip_factor = -0.0005793721359940619,
       .steer_ratio = 13.5,
       .wheelbase = 2.895,
+    },
+
+    // [11] GENESIS_GV70_2ND_GEN — wb=2.875, sr=15.2
+    [HYUNDAI_ANGLE_MODEL_GENESIS_GV70_2ND_GEN] = {
+      .slip_factor = -0.0005834025618289021,
+      .steer_ratio = 15.2,
+      .wheelbase = 2.875,
     },
   };
   // const AngleSteeringParams *result_model;
