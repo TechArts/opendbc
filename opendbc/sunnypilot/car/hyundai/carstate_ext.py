@@ -13,6 +13,8 @@ from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags, CAR
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
 
+LANE_POSITIONS_STALE_FRAMES = 30  # carState updates (0.3 s) without a new FR_CMR_03_50ms before the dash stops using its lane positions
+
 
 class CarStateExt:
   def __init__(self, CP, CP_SP):
@@ -24,6 +26,9 @@ class CarStateExt:
     self.msg_162 = {}
     self.mdps = {}
     self.cruise_buttons_msg = {}
+    self.msg_1b5 = {}  # the camera's lane positions (FR_CMR_03_50ms) for the dash's lane-change picture, empty while stale or never received
+    self.msg_1b5_ts_nanos = 0
+    self.msg_1b5_age = LANE_POSITIONS_STALE_FRAMES + 1
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -96,6 +101,12 @@ class CarStateExt:
       self.mdps = copy.copy(cp.vl["MDPS"])
       self.cruise_info = copy.copy(cp_cam.vl["SCC_CONTROL"])
       self.cruise_buttons_msg = copy.copy(cp.vl["CRUISE_BUTTONS"])
+
+      ts_nanos = cp_cam.ts_nanos["FR_CMR_03_50ms"]["Info_LftLnPosVal"]
+      self.msg_1b5_age = 0 if ts_nanos != self.msg_1b5_ts_nanos else min(self.msg_1b5_age + 1, LANE_POSITIONS_STALE_FRAMES + 1)
+      self.msg_1b5_ts_nanos = ts_nanos
+      fresh = ts_nanos != 0 and self.msg_1b5_age <= LANE_POSITIONS_STALE_FRAMES
+      self.msg_1b5 = copy.copy(cp_cam.vl["FR_CMR_03_50ms"]) if fresh else {}
 
     if self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS and self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
       self.cruise_buttons_msg = copy.copy(cp.vl[self.cruise_btns_msg_canfd])

@@ -325,7 +325,8 @@ class CarState(CarStateBase, EsccCarStateBase, MadsCarState, CarStateExt):
       ]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
+      # the camera's lane positions only feed the dash's lane-change picture: optional, never in canValid
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [("FR_CMR_03_50ms", math.nan)], CanBus(CP).CAM),
     }
 
   def get_can_parsers(self, CP, CP_SP):

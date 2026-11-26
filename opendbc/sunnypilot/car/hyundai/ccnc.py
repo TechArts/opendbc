@@ -6,7 +6,7 @@ See the LICENSE.md file in the root directory for more details.
 """
 
 import numpy as np
-from opendbc.car import DT_CTRL
+from opendbc.car import DT_CTRL, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.common.filter_simple import FirstOrderFilter
 from opendbc.car.crc import CRC8J1850, mk_crc8_fun
@@ -24,6 +24,81 @@ STOP_DISTANCE_V = [3.5, 6.0]  # m
 T_FOLLOW = {1: 1.25, 2: 1.45, 3: 1.75}  # s
 TARGET_DISTANCE_MAX = 204.6  # m
 LEAD_FILTER_RC = 0.5  # s
+LANE_CHANGE_SPEED_MIN = 8.9408  # m/s (20 mph): below it openpilot does not change lanes, so the lane-change icons stay hidden
+
+# CCNC_0x161 value tables (hyundai_canfd.dbc VAL_ 353)
+LANELINE_GRAY, LANELINE_HIDDEN, LANELINE_WHITE, LANELINE_ORANGE, LANELINE_GREEN = 0, 1, 2, 4, 6
+LCA_HIDDEN, LCA_GRAY, LCA_GREEN, LCA_WHITE = 0, 1, 2, 4
+LCA_ARROW_SHOWN = 2  # the lane-change arrow value seen on the car; the value table lists 1 = VISIBLE
+LANE_POSITION_CENTER = 15  # LANELINE_*_POSITION: 0..30 across the lane picture, 15 + 15 = centered
+# steering angle / 4.5 (-15..15) -> LANELINE_CURVATURE (14..0 left, 31, 15..30 right; 15 straight)
+LANELINE_CURVATURE = {i: (31 if i == -1 else 13 - abs(i + 15)) if i < 0 else 15 + i for i in range(-15, 16)}
+
+
+def lane_line_positions(msg_1b5) -> tuple[int, int]:
+  """The dash lane-line positions (left, right, summing to 30) from the camera's lane distances (FR_CMR_03_50ms): the lines slide across the
+  picture while the car crosses a lane. Same mapping as royjr's ccnc-port."""
+  left_raw, right_raw = msg_1b5["Info_LftLnPosVal"], msg_1b5["Info_RtLnPosVal"]
+  scale_per_m = LANE_POSITION_CENTER / 1.7
+  left = abs(int(round(LANE_POSITION_CENTER + (left_raw - 1.7) * scale_per_m)))
+  right = abs(int(round(LANE_POSITION_CENTER + (right_raw - 1.7) * scale_per_m)))
+  if msg_1b5["Info_LftLnQualSta"] not in (2, 3):
+    left = 0
+  if msg_1b5["Info_RtLnQualSta"] not in (2, 3):
+    right = 0
+  if left_raw == -2.0248375:
+    left = 30 - right
+  if right_raw == 2.0248375:
+    right = 30 - left
+  if left_raw == right_raw == 0:
+    left = right = LANE_POSITION_CENTER
+  elif left_raw == 0:
+    left = 30 - right
+  elif right_raw == 0:
+    right = 30 - left
+  left, right = (min(max(v, 0), 30) for v in (left, right))  # a lane over ~3.4 m away, or a "30 - other" branch, must stay inside the picture
+  total = left + right
+  if total == 0:
+    return LANE_POSITION_CENTER, LANE_POSITION_CENTER
+  left = round(left / total * 30)
+  return left, 30 - left
+
+
+def lateral_dash(lat_active, hud_control, out, msg_1b5) -> dict:
+  """The 0x161 lateral fields while openpilot steers (lat_active) or pauses (grey wheel). Steering: one green wheel and the green center line;
+  lane lines white as on the stock car, orange on a lane departure. A lane change (blinker on while steering at >= 20 mph, where openpilot
+  changes lanes): both lines green and sliding across the picture with the camera's lane positions, the blinker side's lane-change icon green
+  with its arrow. Lane-change icons otherwise white at >= 20 mph, hidden below; grey when the blind-spot sensor sees a car on that side. LKA
+  icon hidden (the wheel says it all)."""
+  lane_change_speed = out.vEgo >= LANE_CHANGE_SPEED_MIN
+  lane_change = lat_active and lane_change_speed and (out.leftBlinker or out.rightBlinker)
+
+  def line(visible, depart):
+    if not visible:
+      return LANELINE_HIDDEN
+    return LANELINE_ORANGE if depart else LANELINE_GREEN if lane_change else LANELINE_WHITE
+
+  def lca(side_blinker, side_blindspot):
+    if not (lat_active and lane_change_speed):
+      return LCA_HIDDEN
+    return LCA_GRAY if side_blindspot else LCA_GREEN if side_blinker else LCA_WHITE
+
+  values = {
+    "LFA_ICON": 2 if lat_active else 1,
+    "LKA_ICON": 0,
+    "CENTERLINE": 1 if lat_active else 0,
+    "LANELINE_LEFT": line(hud_control.leftLaneVisible, hud_control.leftLaneDepart),
+    "LANELINE_RIGHT": line(hud_control.rightLaneVisible, hud_control.rightLaneDepart),
+    "LANELINE_CURVATURE": (LANELINE_CURVATURE.get(max(-15, min(int(out.steeringAngleDeg / 4.5), 15)), 14)
+                           if lat_active and not lane_change else LANE_POSITION_CENTER),
+    "LCA_LEFT_ICON": lca(out.leftBlinker, out.leftBlindspot),
+    "LCA_RIGHT_ICON": lca(out.rightBlinker, out.rightBlindspot),
+    "LCA_LEFT_ARROW": LCA_ARROW_SHOWN if lane_change and out.leftBlinker else 0,
+    "LCA_RIGHT_ARROW": LCA_ARROW_SHOWN if lane_change and out.rightBlinker else 0,
+  }
+  if lane_change and msg_1b5:
+    values["LANELINE_LEFT_POSITION"], values["LANELINE_RIGHT_POSITION"] = lane_line_positions(msg_1b5)
+  return values
 
 
 def create_ccnc_mdps(packer, CAN, mdps):
@@ -38,19 +113,16 @@ def create_ccnc_mdps(packer, CAN, mdps):
 
 
 def create_ccnc_0x161(packer, CAN, frame, msg_161, enabled, lat_active, paused, long_enabled, main_cruise_enabled, gas_override,
-                      hud_control, set_speed, v_ego, lead_visible, show_distance_bars):
+                      hud_control, set_speed, v_ego, lead_visible, show_distance_bars, out=None, msg_1b5=None):
+  """out: CarState (blinkers, blind spots, speed, steering angle) for the lane-change picture; msg_1b5: the camera's lane positions."""
   values = msg_161.copy()
 
-  values.update({
-    "LKA_ICON": 4 if lat_active else 3,
-    "LFA_ICON": 2 if lat_active else 1 if paused else 0,
-    "LANELINE_LEFT": 6 if lat_active else 0,
-    "LANELINE_RIGHT": 6 if lat_active else 0,
-    "CENTERLINE": 1 if lat_active else 0,
-    "LCA_LEFT_ICON": 2 if lat_active else 0,
-    "LCA_RIGHT_ICON": 2 if lat_active else 0,
-    "DAW_ICON": 0,
-  })
+  if lat_active or paused:
+    values.update(lateral_dash(lat_active, hud_control, out if out is not None else structs.CarState(), msg_1b5))
+  else:
+    values.update({"LKA_ICON": 3, "LFA_ICON": 0, "LANELINE_LEFT": LANELINE_GRAY, "LANELINE_RIGHT": LANELINE_GRAY, "CENTERLINE": 0,
+                   "LCA_LEFT_ICON": LCA_HIDDEN, "LCA_RIGHT_ICON": LCA_HIDDEN})
+  values["DAW_ICON"] = 0
 
   # suppress consider taking a break and its chime
   if values["ALERTS_2"] == 5:
@@ -80,7 +152,6 @@ def create_ccnc_0x161(packer, CAN, frame, msg_161, enabled, lat_active, paused, 
       "DISTANCE_SPACING": spacing_state,
       "DISTANCE_LEAD": (2 if long_active else 1 if main_cruise_enabled else 0) if lead_visible else 0,
       "DISTANCE_CAR": 2 if enabled else 1 if main_cruise_enabled else 0,
-      "HDA_ICON": hud_state,
       "SLA_ICON": 0,
       "NAV_ICON": 0,
       "TARGET": spacing_state,
@@ -190,16 +261,24 @@ class CcncCarController:
           self.lead_distance_filter.update(self.lead_distance)
 
     if self.frame % 5 == 0:
-      lat_active = self.mads.lat_active if self.mads.enable_mads else CC.enabled
-      paused = self.mads.enable_mads and self.mads.paused
+      lat_active, paused, long_enabled_icons = self.dash_states(CS, CC)
       set_speed = self._get_set_speed(CS.out.vCruiseCluster, CS.is_metric)
 
-      can_sends.append(create_ccnc_0x161(self.packer, self.CAN, self.frame, CS.msg_161, CC.enabled, lat_active, paused,
+      can_sends.append(create_ccnc_0x161(self.packer, self.CAN, self.frame, CS.msg_161, long_enabled_icons, lat_active, paused,
                                          self.CP.openpilotLongitudinalControl, CS.main_cruise_enabled, CC.cruiseControl.override,
                                          CC.hudControl, set_speed, CS.out.vEgo, self.lead_visible,
-                                         self.frame - self.distance_bar_frame < 400))
-      can_sends.append(create_ccnc_0x162(self.packer, self.CAN, CS.msg_162, CC.enabled, self.CP.openpilotLongitudinalControl,
+                                         self.frame - self.distance_bar_frame < 400, CS.out, CS.msg_1b5))
+      can_sends.append(create_ccnc_0x162(self.packer, self.CAN, CS.msg_162, long_enabled_icons, self.CP.openpilotLongitudinalControl,
                                          CS.main_cruise_enabled, CC.cruiseControl.override, self.lead_visible,
                                          self.lead_distance_filter.x))
 
     return can_sends
+
+  def dash_states(self, CS, CC):
+    """(lat_active, lat_paused, cruise_shown) for the dash: what each axis is really doing, independent of the other. A steering fault is not
+    a pause (wheel hidden, not grey), and a faulted ACC shows no engaged cruise."""
+    lat_active = self.mads.lat_active if self.mads.enable_mads else CC.enabled
+    paused = self.mads.enable_mads and self.mads.paused
+    if not lat_active and (CS.out.steerFaultTemporary or CS.out.steerFaultPermanent):
+      paused = False
+    return lat_active, paused, bool(CC.enabled and not CS.out.accFaulted)
