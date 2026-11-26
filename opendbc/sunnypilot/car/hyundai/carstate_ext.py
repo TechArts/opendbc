@@ -9,9 +9,14 @@ import copy
 from enum import StrEnum
 
 from opendbc.car import Bus, structs
+from opendbc.car.common.conversions import Conversions as CV
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai.values import HyundaiFlags, CAR
 from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+
+NAV_SPEED_UNIT_MPH = 2  # Navi_ISLW_SpdUnit: only mph has been seen (US car); other units are ignored until verified
+NAV_SPEED_NONE = (0, 255)  # Navi_ISLW_SpdLimit: no limit
+NAV_STALE_FRAMES = 300  # carState updates (3 s) without a new HU_Navi_ISLW_PE frame before its limit is dropped
 
 
 class CarStateExt:
@@ -24,6 +29,24 @@ class CarStateExt:
     self.msg_162 = {}
     self.mdps = {}
     self.cruise_buttons_msg = {}
+    self.nav_ts_nanos = 0
+    self.nav_age = NAV_STALE_FRAMES + 1
+
+  def update_nav_speed_limit(self, cp) -> float:
+    """The head unit's navigation speed limit (HU_Navi_ISLW_PE) in m/s; 0 when none, stale or not in mph."""
+    if not (self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG):
+      return 0.
+
+    ts_nanos = cp.ts_nanos["HU_Navi_ISLW_PE"]["Navi_ISLW_SpdLimit"]
+    self.nav_age = 0 if ts_nanos != self.nav_ts_nanos else min(self.nav_age + 1, NAV_STALE_FRAMES + 1)
+    self.nav_ts_nanos = ts_nanos
+    if ts_nanos == 0 or self.nav_age > NAV_STALE_FRAMES:
+      return 0.
+
+    msg = cp.vl["HU_Navi_ISLW_PE"]
+    if msg["Navi_ISLW_SpdLimit"] in NAV_SPEED_NONE or msg["Navi_ISLW_SpdUnit"] != NAV_SPEED_UNIT_MPH:
+      return 0.
+    return msg["Navi_ISLW_SpdLimit"] * CV.MPH_TO_MS
 
   def update_speed_limit(self, cp, cp_cam) -> float:
     speed_limit = 0
@@ -101,3 +124,4 @@ class CarStateExt:
       self.cruise_buttons_msg = copy.copy(cp.vl[self.cruise_btns_msg_canfd])
 
     ret_sp.speedLimit = self.update_speed_limit(cp, cp_cam) * speed_factor
+    ret_sp.navSpeedLimit = self.update_nav_speed_limit(cp)
