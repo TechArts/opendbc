@@ -94,7 +94,10 @@ class CarStateExt:
     if self.CP_SP.flags & HyundaiFlagsSP.CCNC and not self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
       self.msg_161 = copy.copy(cp_cam.vl["CCNC_0x161"])
       self.msg_162 = copy.copy(cp_cam.vl["CCNC_0x162"])
-      self.mdps = copy.copy(cp.vl["MDPS"])
+      # on LFA_ALT the panda forwards the real MDPS until openpilot's first copy, so never copy before it has arrived:
+      # the copy would replace the real frame with default values. The other CCNC modes block the real one statically.
+      if cp.ts_nanos["MDPS"]["COUNTER"] or not self.CP_SP.flags & HyundaiFlagsSP.CANFD_LFA_ALT_STEER:
+        self.mdps = copy.copy(cp.vl["MDPS"])
       self.cruise_info = copy.copy(cp_cam.vl["SCC_CONTROL"])
       self.cruise_buttons_msg = copy.copy(cp.vl["CRUISE_BUTTONS"])
       if self.CP_SP.flags & HyundaiFlagsSP.CANFD_LFA_ALT_STEER:
