@@ -813,6 +813,42 @@ class TestHyundaiCanfdLFASteeringCCNC(TestHyundaiCanfdLFASteeringBase):
     for msg, bus in (("CCNC_0x161", 0), ("CCNC_0x162", 0), ("MDPS", 2)):
       self.assertTrue(self._tx(self.packer.make_can_msg_safety(msg, bus, {})))
 
+  # GV70 (sunnypilot mads.py): MADS acts on the release of an LFA press under 2.0 s and ignores longer ones. The safety has no
+  # press timing: it grants lateral on the press-down and withdraws it only through the heartbeat mismatch.
+  def _hold_lfa(self, frames=210):
+    for _ in range(frames):
+      self._rx(self._lkas_button_msg(True))
+      self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self._rx(self._lkas_button_msg(False))
+
+  def _lateral_torque_allowed(self):
+    self._set_prev_torque(0)
+    return self._tx(self._torque_cmd_msg(self.MAX_RATE_UP))
+
+  def test_long_lfa_press_ignored_by_openpilot_is_withdrawn_by_heartbeat(self):
+    self.safety.set_mads_params(True, False, False)
+    self.safety.set_heartbeat_engaged_mads(False)  # openpilot ignored the long press and stays off
+    self._hold_lfa()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    for _ in range(2):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.mads_heartbeat_engaged_check()
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.assertFalse(self._lateral_torque_allowed())
+
+  def test_long_lfa_press_while_engaged_keeps_lateral(self):
+    self.safety.set_mads_params(True, False, False)
+    self._rx(self._lkas_button_msg(True))
+    self._rx(self._lkas_button_msg(False))
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.safety.set_heartbeat_engaged_mads(True)  # openpilot ignored the long press and stays on
+    self._hold_lfa()
+    for _ in range(4):
+      self.safety.mads_heartbeat_engaged_check()
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+    self.assertTrue(self._lateral_torque_allowed())
+
 
 @parameterized_class(CAMERA_SCC_COMBOS)
 class TestHyundaiCanfdLFASteeringCCNCLong(TestHyundaiCanfdLFASteeringLongBase, TestHyundaiCanfdLFASteeringCCNC):
